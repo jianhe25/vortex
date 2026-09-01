@@ -5,7 +5,6 @@ use std::iter;
 use std::mem;
 use std::mem::MaybeUninit;
 
-use fastlanes::FoR;
 use itertools::Itertools;
 use num_traits::AsPrimitive;
 use num_traits::PrimInt;
@@ -33,6 +32,8 @@ use crate::BitPacked;
 use crate::BitPackedArrayExt;
 use crate::FL_CHUNK_SIZE;
 use crate::FoRArray;
+use crate::bitpacking::kernels::BitPackedPhysical;
+use crate::bitpacking::kernels::UnforPackFn;
 use crate::r#for::array::FoRArrayExt;
 use crate::r#for::array::FoRArraySlotsExt;
 use crate::unpack_iter::for_each_packed_chunk;
@@ -72,7 +73,7 @@ pub(crate) fn fused_decompress(
     })
 }
 
-fn fused_decompress_typed<T: PhysicalPType<Physical = T> + UnsignedPType + FoR + WrappingAdd>(
+fn fused_decompress_typed<T: PhysicalPType<Physical = T> + UnsignedPType + BitPackedPhysical + WrappingAdd>(
     for_: &FoRArray,
     bp: ArrayView<'_, BitPacked>,
     ctx: &mut ExecutionCtx,
@@ -228,7 +229,7 @@ fn fused_decompress_many_refs(
 }
 
 fn fused_decompress_many_refs_typed<
-    T: PhysicalPType<Physical = T> + UnsignedPType + FoR + WrappingAdd,
+    T: PhysicalPType<Physical = T> + UnsignedPType + BitPackedPhysical + WrappingAdd,
 >(
     for_: &FoRArray,
     bp: ArrayView<'_, BitPacked>,
@@ -243,7 +244,7 @@ fn fused_decompress_many_refs_typed<
 ///
 /// `chunk_reference` maps the index of a chunk, counted from the first chunk of `bp`, to its
 /// reference.
-fn fused_unpack<T: PhysicalPType<Physical = T> + UnsignedPType + FoR + WrappingAdd>(
+fn fused_unpack<T: PhysicalPType<Physical = T> + UnsignedPType + BitPackedPhysical + WrappingAdd>(
     for_: &FoRArray,
     bp: ArrayView<'_, BitPacked>,
     chunk_reference: impl Fn(usize) -> T,
@@ -280,13 +281,14 @@ fn fused_unpack<T: PhysicalPType<Physical = T> + UnsignedPType + FoR + WrappingA
 ///
 /// Full chunks unpack straight into `output`. A partial first or last chunk unpacks into a scratch
 /// chunk, and only its values in `output` are copied over.
-fn unpack_chunks<T: PhysicalPType<Physical = T> + UnsignedPType + FoR>(
+fn unpack_chunks<T: PhysicalPType<Physical = T> + UnsignedPType + BitPackedPhysical>(
     bp: ArrayView<'_, BitPacked>,
     chunk_reference: impl Fn(usize) -> T,
     output: &mut [MaybeUninit<T>],
 ) -> VortexResult<()> {
     let offset = usize::from(bp.offset());
     let bit_width = bp.bit_width() as usize;
+    let unfor_pack = bp.kernels::<T>().unfor_pack;
     let mut scratch = [const { MaybeUninit::<T>::uninit() }; FL_CHUNK_SIZE];
     for_each_packed_chunk::<T, _>(
         bp.packed_slice::<T>(),
@@ -299,38 +301,33 @@ fn unpack_chunks<T: PhysicalPType<Physical = T> + UnsignedPType + FoR>(
             let skip = offset.saturating_sub(range.start);
             let dst = &mut output[range.start + skip - offset..range.end - offset];
             if dst.len() == FL_CHUNK_SIZE {
-                // SAFETY: `packed` holds one chunk at `bit_width` and `dst` has room for a chunk.
-                unsafe { unfor_pack_into(bit_width, packed, reference, dst) };
+                // SAFETY: `dst` has room for a chunk.
+                unsafe { unfor_pack_into(unfor_pack, packed, reference, dst) };
             } else {
                 // SAFETY: as above, with `scratch` as the destination.
-                unsafe { unfor_pack_into(bit_width, packed, reference, &mut scratch) };
+                unsafe { unfor_pack_into(unfor_pack, packed, reference, &mut scratch) };
                 dst.copy_from_slice(&scratch[skip..range.len()]);
             }
         },
     )
 }
 
-/// Unpack one chunk into `dst` and add `reference` to every value.
+/// Unpack one chunk into `dst` with `unfor_pack` and add `reference` to every value.
 ///
 /// # Safety
 ///
-/// `packed` must hold one chunk at `bit_width`, and `dst` must have room for a full chunk.
+/// `dst` must have room for a full chunk.
 #[inline]
-unsafe fn unfor_pack_into<T: FoR>(
-    bit_width: usize,
+unsafe fn unfor_pack_into<T>(
+    unfor_pack: UnforPackFn<T>,
     packed: &[T],
     reference: T,
     dst: &mut [MaybeUninit<T>],
 ) {
-    // SAFETY: the caller guarantees the sizes, and the unpack initializes every value of `dst`.
-    unsafe {
-        T::unchecked_unfor_pack(
-            bit_width,
-            packed,
-            reference,
-            mem::transmute::<&mut [MaybeUninit<T>], &mut [T]>(dst),
-        );
-    }
+    // SAFETY: the caller guarantees the size, and the unpack initializes every value of `dst`.
+    unfor_pack(packed, reference, unsafe {
+        mem::transmute::<&mut [MaybeUninit<T>], &mut [T]>(dst)
+    });
 }
 
 /// Write each patch value plus the reference of the chunk it falls in.
