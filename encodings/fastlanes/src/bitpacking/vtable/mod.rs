@@ -230,7 +230,7 @@ impl BitPacked {
             s.push(validity_to_child(&validity, len));
             s
         };
-        let data = BitPackedData::try_new(packed, patches, bit_width, offset)?;
+        let data = BitPackedData::try_new(packed, patches, ptype, bit_width, offset)?;
         Array::try_from_parts(ArrayParts::new(BitPacked, dtype, len, data).with_slots(slots))
     }
 
