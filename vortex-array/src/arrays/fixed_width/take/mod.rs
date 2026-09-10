@@ -16,6 +16,7 @@ use vortex_buffer::Buffer;
 use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
 use vortex_mask::Mask;
 
 use self::records::take_byte_records;
@@ -39,6 +40,7 @@ use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::UnsignedPType;
 use crate::dtype::half::f16;
+use crate::dtype::i256;
 use crate::match_each_unsigned_integer_ptype;
 use crate::scalar::Scalar;
 
@@ -98,10 +100,19 @@ pub(crate) fn take<V: FixedWidthArray>(
     indices: &ArrayRef,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ArrayRef>> {
-    if let Some(piecewise_indices) = indices.as_opt::<PiecewiseSequence>()
-        && let Some(taken) = take_contiguous_ranges(array, piecewise_indices, indices, ctx)?
-    {
-        return Ok(Some(taken));
+    if let Some(piecewise_indices) = indices.as_opt::<PiecewiseSequence>() {
+        let taken = match V::byte_width(array) {
+            1 => take_contiguous_ranges::<V, u8>(array, piecewise_indices, indices, ctx)?,
+            2 => take_contiguous_ranges::<V, u16>(array, piecewise_indices, indices, ctx)?,
+            4 => take_contiguous_ranges::<V, u32>(array, piecewise_indices, indices, ctx)?,
+            8 => take_contiguous_ranges::<V, u64>(array, piecewise_indices, indices, ctx)?,
+            16 => take_contiguous_ranges::<V, u128>(array, piecewise_indices, indices, ctx)?,
+            32 => take_contiguous_ranges::<V, i256>(array, piecewise_indices, indices, ctx)?,
+            _ => None,
+        };
+        if taken.is_some() {
+            return Ok(taken);
+        }
     }
 
     let DType::Primitive(ptype, nullability) = indices.dtype() else {
@@ -137,7 +148,7 @@ pub(crate) fn take<V: FixedWidthArray>(
         .take(&indices.clone().into_array())?
         .and(indices_validity)?;
 
-    let source = V::values(array);
+    let source = V::values::<u8>(array);
     let values = match_each_unsigned_integer_ptype!(indices.ptype(), |I| {
         take_byte_records(
             &source,
@@ -152,7 +163,9 @@ pub(crate) fn take<V: FixedWidthArray>(
     ))
 }
 
-fn take_contiguous_ranges<V: FixedWidthArray>(
+// Avoid duplicating the starts/lengths dispatch in every record-width arm of `take`.
+#[inline(never)]
+fn take_contiguous_ranges<V: FixedWidthArray, T: Copy>(
     array: ArrayView<'_, V>,
     indices: ArrayView<'_, PiecewiseSequence>,
     indices_ref: &ArrayRef,
@@ -162,8 +175,11 @@ fn take_contiguous_ranges<V: FixedWidthArray>(
         return Ok(None);
     };
 
-    let values = V::values(array);
-    let byte_width = V::byte_width(array);
+    let values = V::values::<T>(array);
+    vortex_ensure!(
+        values.len() == array.len(),
+        "Fixed-width values buffer length does not match record count"
+    );
     let output_len = indices_ref.len();
     let taken = match lengths {
         Columnar::Constant(lengths) => {
@@ -171,8 +187,6 @@ fn take_contiguous_ranges<V: FixedWidthArray>(
             match_each_unsigned_integer_ptype!(starts.ptype(), |S| {
                 take_slices_constant_length(
                     &values,
-                    byte_width,
-                    array.len(),
                     starts.as_slice::<S>(),
                     length,
                     output_len,
@@ -186,8 +200,6 @@ fn take_contiguous_ranges<V: FixedWidthArray>(
                 match_each_unsigned_integer_ptype!(lengths.ptype(), |L| {
                     take_slices(
                         &values,
-                        byte_width,
-                        array.len(),
                         starts.as_slice::<S>(),
                         lengths.as_slice::<L>(),
                         output_len,
@@ -199,6 +211,6 @@ fn take_contiguous_ranges<V: FixedWidthArray>(
     }?;
     let validity = array.validity()?.take(indices_ref)?;
     Ok(Some(
-        with_values(array, taken, output_len, validity)?.into_array(),
+        with_values(array, taken.into_byte_buffer(), output_len, validity)?.into_array(),
     ))
 }

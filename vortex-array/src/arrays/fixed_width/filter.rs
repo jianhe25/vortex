@@ -27,7 +27,7 @@ pub(crate) fn filter<V: FixedWidthArray>(
 ) -> Array<V> {
     let array = array.as_view();
     let values = filter_records(
-        V::values(array),
+        V::values::<u8>(array),
         V::byte_width(array),
         mask.as_ref(),
         allocator,
