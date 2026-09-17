@@ -4,6 +4,7 @@
 //! Encodings that enable zero-copy sharing of data with Arrow.
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
@@ -17,8 +18,10 @@ use crate::ArraySlots;
 use crate::Executable;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::child_to_validity;
+use crate::array::vtable::VTable as _;
 use crate::arrays::Bool;
 use crate::arrays::BoolArray;
 use crate::arrays::Decimal;
@@ -1230,25 +1233,39 @@ impl CanonicalView<'_> {
     }
 }
 
+/// The encoding ids of the canonical encodings, interned once.
+///
+/// [`AnyCanonical::matches`] is the executor's per-iteration predicate, so it compares these
+/// rather than asking each encoding in turn: `array.is::<V>()` is a virtual `as_any` call plus a
+/// `TypeId` comparison, and twelve of those per iteration dwarf a scan of twelve interned ids.
+static CANONICAL_IDS: LazyLock<[ArrayId; 12]> = LazyLock::new(|| {
+    [
+        Null.id(),
+        Bool.id(),
+        Primitive.id(),
+        Decimal.id(),
+        Struct.id(),
+        Union.id(),
+        ListView.id(),
+        Map.id(),
+        FixedSizeList.id(),
+        VarBinView.id(),
+        Variant.id(),
+        Extension.id(),
+    ]
+});
+
 /// A matcher for any canonical array type.
 pub struct AnyCanonical;
 impl Matcher for AnyCanonical {
     type Match<'a> = CanonicalView<'a>;
 
+    const IS_ANY_CANONICAL: bool = true;
+
     #[inline]
     fn matches(array: &ArrayRef) -> bool {
-        array.is::<Null>()
-            || array.is::<Bool>()
-            || array.is::<Primitive>()
-            || array.is::<Decimal>()
-            || array.is::<Struct>()
-            || array.is::<Union>()
-            || array.is::<ListView>()
-            || array.is::<Map>()
-            || array.is::<FixedSizeList>()
-            || array.is::<VarBinView>()
-            || array.is::<Variant>()
-            || array.is::<Extension>()
+        let id = array.encoding_id();
+        CANONICAL_IDS.contains(&id)
     }
 
     #[inline]

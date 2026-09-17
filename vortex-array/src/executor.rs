@@ -186,12 +186,24 @@ impl ArrayRef {
                 current_builder.is_some(),
             ));
 
-            let is_done = stack
-                .last()
-                .map_or(M::matches as DonePredicate, |frame| frame.done);
-
-            let done_target = is_done(&current_array);
-            let done_canonical = AnyCanonical::matches(&current_array);
+            let (done_target, done_canonical) = match stack.last() {
+                // At the root the target matcher decides. `execute::<Canonical>` arrives with
+                // `M = AnyCanonical`, which is also the loop's universal stop condition, so one
+                // scan answers both rather than scanning the encoding twice per iteration.
+                None => {
+                    let done_target = M::matches(&current_array);
+                    let done_canonical = if M::IS_ANY_CANONICAL {
+                        done_target
+                    } else {
+                        AnyCanonical::matches(&current_array)
+                    };
+                    (done_target, done_canonical)
+                }
+                Some(frame) => (
+                    (frame.done)(&current_array),
+                    AnyCanonical::matches(&current_array),
+                ),
+            };
             trace_op!(record_execute_until_done_check(done_target, done_canonical));
 
             if done_target || done_canonical {
@@ -267,7 +279,10 @@ impl ArrayRef {
             }
 
             let expected_len = current_array.len();
-            let expected_dtype = current_array.dtype().clone();
+            // `finalize_done` only reads the dtype back under debug assertions, and only the
+            // `Done` arm reads it at all. Cloning a nested dtype is a pair of refcount ops, so
+            // skip it on the `AppendChild` and `ExecuteSlot` iterations that discard it.
+            let expected_dtype = cfg!(debug_assertions).then(|| current_array.dtype().clone());
             let stats = current_array.statistics().to_array_stats();
             let encoding_id = current_array.encoding_id();
             trace_op!(record_execute_encoding(&current_array));
@@ -292,11 +307,15 @@ impl ArrayRef {
                 ExecutionStep::AppendChild(i) => {
                     if current_builder.is_none() {
                         trace_op!(record_builder_start(&array));
-                        current_builder = Some(builder_with_capacity_in(
-                            array.dtype(),
-                            array.len(),
-                            ctx.allocator(),
-                        ));
+                        let mut builder =
+                            builder_with_capacity_in(array.dtype(), array.len(), ctx.allocator());
+                        // The parent hands its children over one `AppendChild` at a time, so tell
+                        // the builder how many are coming. A nested builder keeps each appended
+                        // array as a chunk of its child, and without this every one of those chunk
+                        // lists grows incrementally: a 128-chunk array of 8-field structs pays 40
+                        // reallocations for what is eight reserves.
+                        builder.reserve_chunks(array.nchildren());
+                        current_builder = Some(builder);
                     }
                     let (parent, child) = unsafe { array.take_slot_unchecked(i) }?;
 
@@ -591,7 +610,7 @@ fn finalize_done(
     result: ArrayRef,
     mut builder: Option<Box<dyn ArrayBuilder>>,
     expected_len: usize,
-    expected_dtype: DType,
+    expected_dtype: Option<DType>,
     stats: ArrayStats,
     encoding_id: ArrayId,
 ) -> VortexResult<(ArrayRef, Option<Box<dyn ArrayBuilder>>)> {
@@ -601,7 +620,7 @@ fn finalize_done(
         result
     };
 
-    if cfg!(debug_assertions) {
+    if let Some(expected_dtype) = expected_dtype {
         vortex_ensure!(
             output.len() == expected_len,
             "Result length mismatch for {:?}",
@@ -777,6 +796,23 @@ impl ExecutionResult {
     pub fn done(result: impl IntoArray) -> Self {
         Self {
             array: result.into_array(),
+            step: ExecutionStep::Done,
+        }
+    }
+
+    /// Signal that execution is complete and the result is in the executor's active builder.
+    ///
+    /// The executor finishes that builder and discards the array carried here, so an encoding
+    /// that has already handed every value over via [`ExecutionStep::AppendChild`] should use
+    /// this rather than building a real empty array of its own dtype only for it to be dropped -
+    /// for a nested dtype that is a recursive construction of empty children.
+    ///
+    /// Only valid once at least one [`ExecutionStep::AppendChild`] has been returned, which is
+    /// what guarantees the builder exists. [`finalize_done`] debug-asserts the resulting dtype,
+    /// so a mistake here shows up as a dtype mismatch rather than silently wrong data.
+    pub fn done_into_builder() -> Self {
+        Self {
+            array: Canonical::empty(&DType::Null).into_array(),
             step: ExecutionStep::Done,
         }
     }
