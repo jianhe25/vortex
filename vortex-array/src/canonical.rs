@@ -1260,12 +1260,15 @@ pub struct AnyCanonical;
 impl Matcher for AnyCanonical {
     type Match<'a> = CanonicalView<'a>;
 
-    const IS_ANY_CANONICAL: bool = true;
-
     #[inline]
     fn matches(array: &ArrayRef) -> bool {
-        let id = array.encoding_id();
-        CANONICAL_IDS.contains(&id)
+        // The id scan only rejects. An encoding id does not identify a `VTable` type on its own -
+        // `ForeignArray`, `ScalarFn` and the Python vtable all return a per-instance `self.id`, and
+        // nothing stops one of those being registered under a canonical encoding's id - so a hit
+        // still has to go through the downcast that `try_match` performs. Otherwise `matches` could
+        // answer yes where `try_match` answers `None`, and `Canonical::execute` turns that
+        // disagreement into a panic.
+        CANONICAL_IDS.contains(&array.encoding_id()) && Self::try_match(array).is_some()
     }
 
     #[inline]

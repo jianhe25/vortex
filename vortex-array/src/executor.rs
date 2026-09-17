@@ -12,6 +12,7 @@
 //! See <https://docs.vortex.dev/developer-guide/internals/execution> for the full execution
 //! narrative, diagrams, and walkthroughs.
 
+use std::any::TypeId;
 use std::env::VarError;
 use std::fmt;
 use std::fmt::Display;
@@ -166,7 +167,15 @@ impl ArrayRef {
     /// parent rewrite would observe inconsistent state and could discard accumulated builder
     /// data.
     #[allow(clippy::cognitive_complexity)]
-    pub fn execute_until<M: Matcher>(self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    pub fn execute_until<M: Matcher + 'static>(
+        self,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        // Every iteration checks the target matcher and then `AnyCanonical`, the loop's universal
+        // "no further progress possible" stop condition. `execute::<Canonical>` passes
+        // `AnyCanonical` as the target too, which makes those the same call, and this folds to a
+        // constant per monomorphization so that case scans the encoding once rather than twice.
+        let target_is_any_canonical = TypeId::of::<M>() == TypeId::of::<AnyCanonical>();
         let mut current_array = self;
         let mut current_builder: Option<Box<dyn ArrayBuilder>> = None;
         let mut stack: Vec<StackFrame> = Vec::new();
@@ -192,7 +201,7 @@ impl ArrayRef {
                 // scan answers both rather than scanning the encoding twice per iteration.
                 None => {
                     let done_target = M::matches(&current_array);
-                    let done_canonical = if M::IS_ANY_CANONICAL {
+                    let done_canonical = if target_is_any_canonical {
                         done_target
                     } else {
                         AnyCanonical::matches(&current_array)
