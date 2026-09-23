@@ -8,7 +8,9 @@ root: vortex.onpair(utf8, len=16384) nbytes=139746
   dict_offsets: vortex.primitive(u16, len=1626) nbytes=3252
     metadata: ptype: u16
   codes: fastlanes.bitpacked(u16, len=63845) nbytes=88704
-    metadata: bit_width: 11, offset: 0
+    metadata: offset: 0
+    block_offsets: vortex.sequence(u64, len=64) nbytes=0
+      metadata: base: 0u64, multiplier: 1408i64
   codes_offsets: vortex.primitive(u16, len=16385) nbytes=32770
     metadata: ptype: u16
   uncompressed_lengths: vortex.sparse(u8, len=16384) nbytes=3154

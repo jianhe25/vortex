@@ -475,8 +475,8 @@ mod standalone {
             cuda_session: &CudaSession,
             cuda_ctx: &mut CudaExecutionCtx,
         ) -> Self {
-            assert_eq!(values_bp.bit_width(), 6);
-            assert_eq!(codes_bp.bit_width(), 6);
+            assert_eq!(values_bp.constant_bit_width(), Some(6));
+            assert_eq!(codes_bp.constant_bit_width(), Some(6));
 
             let values_packed = block_on(cuda_ctx.ensure_on_device(values_bp.packed().clone()))
                 .vortex_expect("values packed");

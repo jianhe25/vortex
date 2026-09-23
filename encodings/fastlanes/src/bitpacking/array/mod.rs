@@ -8,6 +8,7 @@ use std::mem::MaybeUninit;
 use fastlanes::BitPacking;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
+use vortex_array::IntoArray;
 use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
 use vortex_array::arrays::Primitive;
@@ -15,15 +16,18 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
+use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::patches::PatchSlotIndices;
 use vortex_array::patches::Patches;
 use vortex_array::patches::PatchesData;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::child_to_validity;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
+use vortex_sequence::Sequence;
 
 pub mod bitpack_compress;
 pub mod bitpack_decompress;
@@ -49,6 +53,12 @@ pub struct BitPackedSlots {
     /// The validity bitmap indicating which elements are non-null.
     #[slot(3)]
     pub validity_child: Option<ArrayRef>,
+    /// Non-nullable `u64` byte boundaries of the packed blocks, including one trailing boundary.
+    /// Block `i` is packed at `(block_offsets[i + 1] - block_offsets[i]) / 128` bits. When every
+    /// block has the same width, this is a [`SequenceArray`](vortex_sequence::SequenceArray) with
+    /// step `128 * bit_width`.
+    #[slot(4)]
+    pub block_offsets: ArrayRef,
 }
 
 pub(crate) const PATCH_SLOTS: PatchSlotIndices = PatchSlotIndices {
@@ -56,6 +66,91 @@ pub(crate) const PATCH_SLOTS: PatchSlotIndices = PatchSlotIndices {
     values: BitPackedSlots::PATCH_VALUES,
     chunk_offsets: BitPackedSlots::PATCH_CHUNK_OFFSETS,
 };
+
+/// Non-nullable byte boundaries for the packed chunks.
+pub(crate) const BLOCK_OFFSETS_DTYPE: DType =
+    DType::Primitive(PType::U64, Nullability::NonNullable);
+
+/// Byte boundaries for `num_chunks` chunks that are all packed at `bit_width`.
+pub(crate) fn uniform_block_offsets(bit_width: u8, num_chunks: usize) -> ArrayRef {
+    Sequence::try_new_typed(
+        0u64,
+        128 * u64::from(bit_width),
+        Nullability::NonNullable,
+        num_chunks + 1,
+    )
+    .vortex_expect("uniform block offsets fit in u64")
+    .into_array()
+}
+
+/// The bit width shared by every block, or `None` if `offsets` is not a sequence.
+pub(crate) fn constant_bit_width(offsets: &ArrayRef) -> Option<u8> {
+    let step = offsets
+        .as_opt::<Sequence>()?
+        .multiplier()
+        .cast::<u64>()
+        .ok()?;
+    u8::try_from(step / 128).ok()
+}
+
+/// The bit width shared by every block, for code paths that do not support per-block widths yet.
+pub(crate) fn uniform_bit_width(offsets: &ArrayRef) -> VortexResult<u8> {
+    constant_bit_width(offsets)
+        .ok_or_else(|| vortex_err!("BitPacked blocks with different bit widths are not supported"))
+}
+
+/// Check that `offsets` holds `num_blocks + 1` boundaries spanning `packed_len` bytes, each block a
+/// whole number of 128-byte rows of at most 64 bits.
+///
+/// Boundaries are only inspected when they are a sequence or materialized on the host.
+pub(crate) fn validate_block_offsets(
+    offsets: &ArrayRef,
+    num_blocks: usize,
+    packed_len: usize,
+) -> VortexResult<()> {
+    vortex_ensure!(
+        offsets.dtype() == &BLOCK_OFFSETS_DTYPE,
+        "Expected non-nullable u64 block offsets, got {}",
+        offsets.dtype()
+    );
+    vortex_ensure!(
+        offsets.len() == num_blocks + 1,
+        "Expected {} block boundaries, got {}",
+        num_blocks + 1,
+        offsets.len()
+    );
+    if let Some(sequence) = offsets.as_opt::<Sequence>() {
+        let step = sequence.multiplier().cast::<u64>()?;
+        vortex_ensure!(
+            step % 128 == 0 && step / 128 <= 64,
+            "Block offsets step {step} is not a supported bit width"
+        );
+        let span = step * num_blocks as u64;
+        vortex_ensure!(
+            span == packed_len as u64,
+            "Block offsets span {span} bytes, but the packed buffer has {packed_len}"
+        );
+    } else if let Some(primitive) = offsets.as_opt::<Primitive>()
+        && primitive.buffer_handle().is_on_host()
+    {
+        let boundaries = primitive.as_slice::<u64>();
+        for pair in boundaries.windows(2) {
+            let size = pair[1].checked_sub(pair[0]);
+            vortex_ensure!(
+                size.is_some_and(|size| size % 128 == 0 && size / 128 <= 64),
+                "Block boundaries {} and {} do not hold a supported bit width",
+                pair[0],
+                pair[1]
+            );
+        }
+        let span = boundaries[num_blocks] - boundaries[0];
+        vortex_ensure!(
+            span == packed_len as u64,
+            "Block offsets span {span} bytes, but the packed buffer has {packed_len}"
+        );
+    }
+    Ok(())
+}
 
 pub struct BitPackedDataParts {
     pub offset: u16,
@@ -71,7 +166,6 @@ pub struct BitPackedData {
     /// The offset within the first block (created with a slice).
     /// 0 <= offset < 1024
     pub(super) offset: u16,
-    pub(super) bit_width: u8,
     pub(super) packed: BufferHandle,
     /// Patch metadata for reconstructing Patches from slots.
     pub(super) patches_data: Option<PatchesData>,
@@ -79,7 +173,7 @@ pub struct BitPackedData {
 
 impl Display for BitPackedData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "bit_width: {}, offset: {}", self.bit_width, self.offset)
+        write!(f, "offset: {}", self.offset)
     }
 }
 
@@ -128,10 +222,8 @@ impl BitPackedData {
     pub fn try_new(
         packed: BufferHandle,
         patches: Option<Patches>,
-        bit_width: u8,
         offset: u16,
     ) -> VortexResult<Self> {
-        vortex_ensure!(bit_width <= 64, "Unsupported bit width {bit_width}");
         vortex_ensure!(
             offset < 1024,
             "Offset must be less than the full block i.e., 1024, got {offset}"
@@ -139,23 +231,18 @@ impl BitPackedData {
 
         Ok(Self {
             offset,
-            bit_width,
             packed,
             patches_data: patches.as_ref().map(PatchesData::from_patches),
         })
     }
 
     pub(crate) fn validate(
-        packed: &BufferHandle,
         ptype: PType,
         validity: &Validity,
         patches: Option<&Patches>,
-        bit_width: u8,
         length: usize,
-        offset: u16,
     ) -> VortexResult<()> {
         vortex_ensure!(ptype.is_int(), MismatchedTypes: "integer", ptype);
-        vortex_ensure!(bit_width <= 64, "Unsupported bit width {bit_width}");
 
         if let Some(validity_len) = validity.maybe_len() {
             vortex_ensure!(
@@ -168,16 +255,6 @@ impl BitPackedData {
         if let Some(patches) = patches {
             Self::validate_patches(patches, ptype, length)?;
         }
-
-        // Validate packed buffer
-        let expected_packed_len =
-            (length + offset as usize).div_ceil(1024) * (128 * bit_width as usize);
-        vortex_ensure!(
-            packed.len() == expected_packed_len,
-            "Expected {} packed bytes, got {}",
-            expected_packed_len,
-            packed.len()
-        );
 
         Ok(())
     }
@@ -228,6 +305,7 @@ impl BitPackedData {
     pub fn unpacked_chunks<'a, T: BitPackedIter>(
         &'a self,
         dtype: &DType,
+        bit_width: u8,
         len: usize,
         scratch: &'a mut [MaybeUninit<T>; FL_CHUNK_SIZE],
     ) -> VortexResult<BitUnpackedChunks<'a, T>> {
@@ -236,13 +314,7 @@ impl BitPackedData {
             self.ptype(dtype),
             "Requested type doesn't match the array ptype"
         );
-        BitUnpackedChunks::try_new(self, len, scratch)
-    }
-
-    /// Bit-width of the packed values
-    #[inline]
-    pub fn bit_width(&self) -> u8 {
-        self.bit_width
+        BitUnpackedChunks::try_new(self, bit_width, len, scratch)
     }
 
     #[inline]
@@ -272,14 +344,6 @@ impl BitPackedData {
             .map_err(|a| vortex_err!(InvalidArgument: "Bitpacking can only encode primitive arrays, got {}", a.encoding_id()))?;
         bitpack_encode(&parray, bit_width, None, ctx)
     }
-
-    /// Calculate the maximum value that **can** be contained by this array, given its bit-width.
-    ///
-    /// Note that this value need not actually be present in the array.
-    #[inline]
-    pub fn max_packed_value(&self) -> usize {
-        (1 << self.bit_width()) - 1
-    }
 }
 
 pub trait BitPackedArrayExt: BitPackedArraySlotsExt {
@@ -288,9 +352,20 @@ pub trait BitPackedArrayExt: BitPackedArraySlotsExt {
         BitPackedData::packed(self)
     }
 
+    /// The bit width shared by every block, or `None` if blocks are packed at different widths.
     #[inline]
-    fn bit_width(&self) -> u8 {
-        BitPackedData::bit_width(self)
+    fn constant_bit_width(&self) -> Option<u8> {
+        constant_bit_width(self.block_offsets())
+    }
+
+    /// Calculate the maximum value that **can** be contained by this array, given its constant
+    /// bit width.
+    ///
+    /// Note that this value need not actually be present in the array.
+    #[inline]
+    fn max_packed_value(&self) -> Option<usize> {
+        self.constant_bit_width()
+            .map(|bit_width| (1 << bit_width) - 1)
     }
 
     #[inline]
@@ -326,6 +401,7 @@ pub trait BitPackedArrayExt: BitPackedArraySlotsExt {
         BitPackedData::unpacked_chunks::<T>(
             self,
             self.as_ref().dtype(),
+            uniform_bit_width(self.block_offsets())?,
             self.as_ref().len(),
             scratch,
         )

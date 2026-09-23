@@ -22,7 +22,9 @@ use vortex_error::VortexResult;
 
 use crate::BitPacked;
 use crate::BitPackedArrayExt;
+use crate::BitPackedArraySlotsExt;
 use crate::FL_CHUNK_SIZE;
+use crate::bitpacking::array::uniform_bit_width;
 use crate::unpack_iter::BitPacked as BitPackedUnpack;
 use crate::unpack_iter::BitUnpackedChunks;
 
@@ -164,8 +166,8 @@ pub(crate) fn apply_patches_to_uninit_range<S: NativePType, T: NativePType, F: F
     Ok(())
 }
 
-pub fn unpack_single(array: ArrayView<'_, BitPacked>, index: usize) -> Scalar {
-    let bit_width = array.bit_width() as usize;
+pub fn unpack_single(array: ArrayView<'_, BitPacked>, index: usize) -> VortexResult<Scalar> {
+    let bit_width = uniform_bit_width(array.block_offsets())? as usize;
     let ptype = array.dtype().as_ptype();
     // let packed = array.packed().into_primitive()?;
     let index_in_encoded = index + array.offset() as usize;
@@ -176,7 +178,7 @@ pub fn unpack_single(array: ArrayView<'_, BitPacked>, index: usize) -> Scalar {
         }
     });
     // Cast to fix signedness and nullability
-    scalar.cast(array.dtype()).vortex_expect("cast failure")
+    Ok(scalar.cast(array.dtype()).vortex_expect("cast failure"))
 }
 
 /// # Safety
@@ -259,7 +261,7 @@ mod tests {
             .iter()
             .enumerate()
             .for_each(|(i, v)| {
-                let scalar: u16 = (&unpack_single(compressed.as_view(), i))
+                let scalar: u16 = (&unpack_single(compressed.as_view(), i).unwrap())
                     .try_into()
                     .unwrap();
                 assert_eq!(scalar, *v);

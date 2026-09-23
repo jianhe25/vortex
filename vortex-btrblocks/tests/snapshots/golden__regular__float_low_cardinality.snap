@@ -8,6 +8,8 @@ root: vortex.alp(f64, len=16384) nbytes=6208
   encoded: vortex.dict(i64, len=16384) nbytes=6208
     metadata: all_values_referenced: true
     codes: fastlanes.bitpacked(u8, len=16384) nbytes=6144
-      metadata: bit_width: 3, offset: 0
+      metadata: offset: 0
+      block_offsets: vortex.sequence(u64, len=17) nbytes=0
+        metadata: base: 0u64, multiplier: 384i64
     values: vortex.primitive(i64, len=8) nbytes=64
       metadata: ptype: i64

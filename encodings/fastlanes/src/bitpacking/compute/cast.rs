@@ -18,7 +18,9 @@ use vortex_error::VortexResult;
 
 use crate::bitpacking::BitPacked;
 use crate::bitpacking::array::BitPackedArrayExt;
+use crate::bitpacking::array::BitPackedArraySlotsExt;
 use crate::bitpacking::array::bitpack_decompress::unpack_map_into_builder;
+use crate::bitpacking::array::uniform_bit_width;
 
 /// Returns `true` if casting `src` to `tgt` is a widening integer cast for which every value a
 /// bit-packed array can hold is guaranteed to be representable in `tgt` (so no per-value bounds
@@ -44,7 +46,7 @@ fn build_with_validity(
             .patches()
             .map(|patches| patches.map_values(|values| values.cast(dtype.clone())))
             .transpose()?,
-        array.bit_width(),
+        uniform_bit_width(array.block_offsets())?,
         array.len(),
         array.offset(),
     )?
@@ -53,6 +55,10 @@ fn build_with_validity(
 
 impl CastReduce for BitPacked {
     fn cast(array: ArrayView<'_, Self>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
+        // Blocks packed at different widths fall back to decoding.
+        if array.constant_bit_width().is_none() {
+            return Ok(None);
+        }
         if !array.dtype().eq_ignore_nullability(dtype) {
             return Ok(None);
         }

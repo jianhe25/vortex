@@ -25,7 +25,9 @@ use super::chunked_indices;
 use super::take::UNPACK_CHUNK_THRESHOLD;
 use crate::BitPacked;
 use crate::BitPackedArrayExt;
+use crate::BitPackedArraySlotsExt;
 use crate::BitPackedData;
+use crate::bitpacking::array::uniform_bit_width;
 
 /// The threshold over which it is faster to fully unpack the entire [`BitPackedArray`](crate::BitPackedArray) and then
 /// filter the result than to unpack only specific bitpacked values into the output buffer.
@@ -49,6 +51,10 @@ impl FilterKernel for BitPacked {
         mask: &Mask,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
+        // Blocks packed at different widths fall back to decoding.
+        if array.constant_bit_width().is_none() {
+            return Ok(None);
+        }
         let values = match mask {
             Mask::AllTrue(_) | Mask::AllFalse(_) => {
                 return Ok(None);
@@ -110,7 +116,11 @@ fn filter_primitive_without_patches<U: UnsignedPType + BitPacking>(
     array: ArrayView<'_, BitPacked>,
     selection: &MaskValuesRef,
 ) -> VortexResult<(Buffer<U>, Validity)> {
-    let values = filter_with_indices(array.data(), selection.indices());
+    let values = filter_with_indices(
+        array.data(),
+        uniform_bit_width(array.block_offsets())?,
+        selection.indices(),
+    );
     let validity = array
         .validity()?
         .filter(&Mask::Values(MaskValuesRef::clone(selection)))?;
@@ -120,10 +130,11 @@ fn filter_primitive_without_patches<U: UnsignedPType + BitPacking>(
 
 fn filter_with_indices<T: NativePType + BitPacking>(
     array: &BitPackedData,
+    bit_width: u8,
     indices: &[usize],
 ) -> BufferMut<T> {
     let offset = array.offset() as usize;
-    let bit_width = array.bit_width() as usize;
+    let bit_width = bit_width as usize;
     let mut values = BufferMut::with_capacity(indices.len());
 
     // Some re-usable memory to store per-chunk indices.

@@ -103,13 +103,14 @@ pub type BitUnpackedChunks<'a, T> = UnpackedChunks<'a, T, BitPackingStrategy>;
 impl<'a, T: BitPacked> BitUnpackedChunks<'a, T> {
     pub fn try_new(
         array: &'a BitPackedData,
+        bit_width: u8,
         len: usize,
         scratch: &'a mut [MaybeUninit<T>; CHUNK_SIZE],
     ) -> VortexResult<Self> {
         Self::try_new_with_strategy(
             BitPackingStrategy,
             array.packed_slice::<T::Physical>(),
-            array.bit_width() as usize,
+            bit_width as usize,
             array.offset() as usize,
             len,
             scratch,

@@ -48,6 +48,8 @@ use vortex_error::VortexResult;
 use super::stream_predicate::stream_predicate;
 use crate::BitPacked;
 use crate::BitPackedArrayExt;
+use crate::BitPackedArraySlotsExt;
+use crate::bitpacking::array::uniform_bit_width;
 use crate::unpack_iter::BitPacked as BitPackedIter;
 use crate::unpack_iter::for_each_packed_chunk;
 
@@ -78,7 +80,7 @@ where
     F: Fn(T, T) -> bool + Copy,
 {
     let len = array.len();
-    let bit_width = array.bit_width() as usize;
+    let bit_width = uniform_bit_width(array.block_offsets())? as usize;
     let offset = array.offset() as usize;
 
     // A degenerate width has no packed payload for the fused kernel to consume; defer to the scalar

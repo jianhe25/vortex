@@ -10,7 +10,9 @@ root: vortex.struct({id=i64, category=utf8, value=f64}, len=16384) nbytes=57525
   category: vortex.dict(utf8, len=16384) nbytes=8373
     metadata: all_values_referenced: true
     codes: fastlanes.bitpacked(u8, len=16384) nbytes=8192
-      metadata: bit_width: 4, offset: 0
+      metadata: offset: 0
+      block_offsets: vortex.sequence(u64, len=17) nbytes=0
+        metadata: base: 0u64, multiplier: 512i64
     values: vortex.fsst(utf8, len=12) nbytes=181
       metadata: len: 12, nsymbols: 9
       uncompressed_lengths: vortex.primitive(u8, len=12) nbytes=12
@@ -20,4 +22,6 @@ root: vortex.struct({id=i64, category=utf8, value=f64}, len=16384) nbytes=57525
   value: vortex.alp(f64, len=16384) nbytes=49152
     metadata: exponents: e: 14, f: 12
     encoded: fastlanes.bitpacked(i64, len=16384) nbytes=49152
-      metadata: bit_width: 24, offset: 0
+      metadata: offset: 0
+      block_offsets: vortex.sequence(u64, len=17) nbytes=0
+        metadata: base: 0u64, multiplier: 3072i64

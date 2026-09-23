@@ -11172,6 +11172,7 @@ dependencies = [
  "vortex-error",
  "vortex-fastlanes",
  "vortex-mask",
+ "vortex-sequence",
  "vortex-session",
 ]
 

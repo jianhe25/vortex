@@ -73,6 +73,12 @@ pub struct MaterializedPlan {
     pub validity: Validity,
 }
 
+fn cuda_bit_width(bp: &impl BitPackedArrayExt) -> VortexResult<u8> {
+    bp.constant_bit_width().ok_or_else(|| {
+        vortex_err!("CUDA does not support BitPacked blocks with different bit widths")
+    })
+}
+
 /// Checks whether the encoding of an array can be fused into a dynamic-dispatch plan.
 fn is_dyn_dispatch_compatible(array: &ArrayRef) -> bool {
     // F16 has no reinterpret path in the kernel.
@@ -89,7 +95,7 @@ fn is_dyn_dispatch_compatible(array: &ArrayRef) -> bool {
         return matches!(arr.dtype().as_ptype(), PType::F32 | PType::F64);
     }
     if id == BitPacked.id() {
-        return true;
+        return array.as_::<BitPacked>().constant_bit_width().is_some();
     }
     if id == Dict.id() {
         let arr = array.as_::<Dict>();
@@ -570,7 +576,7 @@ impl FusedPlan {
             let buf_index = self.source_buffers.len();
             self.source_buffers.push(Some(packed));
             return Ok(Stage::new(
-                SourceOp::bitunpack(bp.bit_width(), bitpacked_offset),
+                SourceOp::bitunpack(cuda_bit_width(&bp)?, bitpacked_offset),
                 Some(buf_index),
                 source_ptype,
             )
@@ -625,7 +631,7 @@ impl FusedPlan {
         let buf_index = self.source_buffers.len();
         self.source_buffers.push(Some(bp.packed().clone()));
         Ok(Stage::new(
-            SourceOp::bitunpack(bp.bit_width(), bp.offset()),
+            SourceOp::bitunpack(cuda_bit_width(&bp)?, bp.offset()),
             Some(buf_index),
             source_ptype,
         )

@@ -16,6 +16,7 @@ pub(crate) mod compute;
 mod plugin;
 mod vtable;
 
+pub(crate) use array::uniform_bit_width;
 pub(crate) use plugin::BitPackedPatchedPlugin;
 pub use plugin::BitPackedPlugin;
 pub use vtable::BitPacked;
@@ -24,3 +25,6 @@ pub use vtable::BitPackedArray;
 pub(crate) fn initialize(session: &vortex_session::VortexSession) {
     vtable::initialize(session);
 }
+
+#[cfg(test)]
+mod block_offsets_tests;
