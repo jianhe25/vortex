@@ -41,10 +41,15 @@ pub trait ListContainsElementReduce: VTable {
 /// For a needle that is not canonical, execution prepares a constant list into a
 /// [`PreparedSetArray`] and runs the kernels again. Thus a kernel can get the prepared set with
 /// `list.as_opt::<PreparedSet>()`, and probe its own values with [`PreparedSetData::contains`].
-/// For example, a dictionary probes only its values.
+/// For example, a dictionary probes only its values. A single value, such as the fill value of a
+/// sparse needle, is probed with [`PreparedSetData::contains_scalar`]. A kernel that finds its
+/// matches in another way makes its result with [`PreparedSetData::result_from_bits`], which applies
+/// the same null semantics.
 ///
 /// [`PreparedSetArray`]: crate::scalar_fn::fns::list_contains::PreparedSetArray
 /// [`PreparedSetData::contains`]: crate::scalar_fn::fns::list_contains::PreparedSetData::contains
+/// [`PreparedSetData::contains_scalar`]: crate::scalar_fn::fns::list_contains::PreparedSetData::contains_scalar
+/// [`PreparedSetData::result_from_bits`]: crate::scalar_fn::fns::list_contains::PreparedSetData::result_from_bits
 pub trait ListContainsElementKernel: VTable {
     fn list_contains(
         list: &ArrayRef,
