@@ -38,9 +38,9 @@ fn main() {
 // Sized to keep CodSpeed simulation under 1ms per benchmark.
 const ROWS: usize = 1_024;
 const CHUNKS: usize = 4;
-const SET_LENS: &[usize] = &[4, 256];
+const SET_LENS: &[usize] = &[256];
 /// A nested set compares whole rows to sort its elements and to probe them, so it stays smaller.
-const NESTED_SET_LENS: &[usize] = &[4, 32];
+const NESTED_SET_LENS: &[usize] = &[32];
 
 /// A random set of `len` values, and needles of which about half are members.
 fn random_i64(len: usize) -> (Vec<i64>, Vec<i64>) {
