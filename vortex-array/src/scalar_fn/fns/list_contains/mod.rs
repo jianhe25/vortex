@@ -37,6 +37,7 @@ use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::ScalarFnArray;
 use crate::arrays::bool::BoolArrayExt;
+use crate::arrays::constant::list_scalar_elements;
 use crate::arrays::listview::ListViewArraySlotsExt;
 use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::dtype::DType;
@@ -208,10 +209,10 @@ impl ScalarFnVTable for ListContains {
         let value_array = args.get(1)?;
 
         // Borrow the list: a constant list scalar owns every element, so cloning it is not free.
-        if let Some(list) = constant_list(&list_array)
+        if let Some(list) = list_array.as_opt::<Constant>()
             && let Some(value_scalar) = value_array.as_constant()
         {
-            let result = compute_contains_scalar(list, &value_scalar, options)?;
+            let result = compute_contains_scalar(list.scalar(), &value_scalar, options)?;
             return Ok(ConstantArray::new(result, args.row_count()).into_array());
         }
 
@@ -219,7 +220,7 @@ impl ScalarFnVTable for ListContains {
     }
 
     /// A constant list and a constant needle fold to their constant answer, in expression and
-    /// array trees alike. A [`PreparedSetArray`] list folds through its own parent rule.
+    /// array trees alike. A [`PreparedSetArray`] list looks a constant needle up at execution.
     fn reduce<T: ReduceNode>(&self, options: &Self::Options, node: &T) -> VortexResult<Option<T>> {
         let Some(list) = node.child(0).as_constant() else {
             return Ok(None);
@@ -339,18 +340,20 @@ fn compute_list_contains(
         .into_array());
     }
 
+    if let Some(set) = array.as_opt::<PreparedSet>() {
+        return set.contains(value, options, ctx);
+    }
+
     let nullability = options.result_nullability(array.dtype(), value.dtype());
 
     if let Some(value_scalar) = value.as_constant() {
         return list_contains_scalar(array, &value_scalar, nullability, options, ctx);
     }
 
-    if let Some(set) = array.as_opt::<PreparedSet>() {
-        return set.contains(value, options, ctx);
-    }
-
     if let Some(list) = array.as_opt::<Constant>() {
-        let set = PreparedSetArray::try_new(list.scalar().clone(), array.len(), ctx)?;
+        let elements = list_scalar_elements(&list.scalar().as_list(), ctx.allocator());
+        let set =
+            PreparedSetArray::try_new(elements, array.dtype().nullability(), array.len(), ctx)?;
 
         // A canonical needle has no encoding for a kernel to use, so probe it now.
         if value.is_canonical() {
@@ -366,14 +369,6 @@ fn compute_list_contains(
     }
 
     lists_contain_needles(array, value, nullability, options, ctx)
-}
-
-/// The list that every row of `array` holds, when the array is a constant or a prepared set.
-fn constant_list(array: &ArrayRef) -> Option<&Scalar> {
-    if let Some(constant) = array.as_opt::<Constant>() {
-        return Some(constant.data().scalar());
-    }
-    array.as_opt::<PreparedSet>().map(|set| set.data().list())
 }
 
 /// Returns a [`BoolArray`] where each bit represents if a list contains the scalar.
