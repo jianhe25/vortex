@@ -6,25 +6,26 @@
 //!
 //! Every rule, kernel, and encoding execution is a single step `a -> a'`. `ExecuteSlot` focuses
 //! a child slot as an evaluation context: steps on the child are the premises of one congruence
-//! step `P[i <- c] -> P[i <- c']` on the parent. Nested `execute_until` and `optimize` passes are
+//! step `P -> P[i <- c']` on the parent. Nested `execute_until` and `optimize` passes are
 //! likewise premises of the step that invoked them.
 //!
-//! A block is rendered as a chain: the starting array on its own line, then one `-> rhs  [rule]`
-//! line per step, with each step's premises indented beneath it:
+//! Every line is a complete judgement, `lhs -> rhs  [rule]` for a step or `lhs ->* rhs  [pass]`
+//! for a whole pass, and the tree connectors attach each step's premises beneath it:
 //!
 //! ```text
-//! vortex.filter(i32, len=2)  [execute_until AnyCanonical]
-//! -> vortex.slice(i32, len=2)  [execute vortex.filter]
-//! -> vortex.slice(i32, len=2)[0 <- vortex.primitive(i32, len=4)]  [slot 0]
-//!     vortex.filter(i32, len=4)
-//!     -> vortex.primitive(i32, len=4)  [execute vortex.filter]
-//! -> vortex.primitive(i32, len=2)  [execute vortex.slice]
-//!     vortex.slice(i32, len=2)  [optimize]
-//!     -> vortex.primitive(i32, len=2)  [reduce_parent static:SliceReduceAdaptor(Primitive) ...]
+//! vortex.filter(i32, len=2) ->* vortex.primitive(i32, len=2)  [execute_until AnyCanonical]
+//! ├─ vortex.filter(i32, len=2) -> vortex.slice(i32, len=2)  [execute vortex.filter]
+//! ├─ vortex.slice(i32, len=2) -> vortex.slice(i32, len=2)[0 <- vortex.primitive(i32, len=4)]  [slot 0]
+//! │  └─ vortex.filter(i32, len=4) -> vortex.primitive(i32, len=4)  [execute vortex.filter]
+//! └─ vortex.slice(i32, len=2) -> vortex.primitive(i32, len=2)  [execute vortex.slice]
+//!    └─ vortex.slice(i32, len=2) ->* vortex.primitive(i32, len=2)  [optimize]
+//!       └─ vortex.slice(i32, len=2) -> vortex.primitive(i32, len=2)  [reduce_parent ...]
 //! ```
 //!
+//! Consecutive steps under one pass chain: each step's `lhs` is the previous step's `rhs`. A
+//! step whose summary is unchanged names the child slot it replaced, as `a[i <- new_child]`.
 //! At [`TraceResolution::Attempts`](super::TraceResolution::Attempts), rules and kernels that
-//! were tried and declined before a step appear as `x ...` premises of that step.
+//! were tried and declined before a step appear as `x ...` leaves under that step.
 
 use std::fmt;
 use std::fmt::Display;
@@ -42,55 +43,52 @@ pub struct DerivationDisplay<'a> {
 
 impl Display for DerivationDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut first = true;
-        for node in build(self.trace) {
-            render(f, &node, 0, &mut first)?;
+        for (idx, node) in build(self.trace).iter().enumerate() {
+            if idx > 0 {
+                writeln!(f)?;
+            }
+            render(f, node, "")?;
         }
         Ok(())
     }
 }
 
-enum Node {
-    /// A reduction chain: a starting array followed by its steps.
-    Chain { header: String, nodes: Vec<Node> },
-    /// A single line, usually a step, with the premises that justify it.
-    Item { text: String, premises: Vec<Node> },
+/// A judgement (a step or a whole pass) with the premises that justify it, or a bare note.
+struct Node {
+    text: String,
+    children: Vec<Node>,
 }
 
-fn render(f: &mut fmt::Formatter<'_>, node: &Node, depth: usize, first: &mut bool) -> fmt::Result {
-    let line = |f: &mut fmt::Formatter<'_>, text: &str, first: &mut bool| -> fmt::Result {
-        if *first {
-            *first = false;
+impl Node {
+    fn leaf(text: String) -> Self {
+        Self {
+            text,
+            children: Vec::new(),
+        }
+    }
+}
+
+fn render(f: &mut fmt::Formatter<'_>, node: &Node, prefix: &str) -> fmt::Result {
+    f.write_str(&node.text)?;
+    let last = node.children.len().saturating_sub(1);
+    for (idx, child) in node.children.iter().enumerate() {
+        let (branch, extend) = if idx == last {
+            ("└─ ", "   ")
         } else {
-            writeln!(f)?;
-        }
-        for _ in 0..depth {
-            f.write_str("    ")?;
-        }
-        f.write_str(text)
-    };
-    match node {
-        Node::Chain { header, nodes } => {
-            line(f, header, first)?;
-            for node in nodes {
-                render(f, node, depth, first)?;
-            }
-        }
-        Node::Item { text, premises } => {
-            line(f, text, first)?;
-            for premise in premises {
-                render(f, premise, depth + 1, first)?;
-            }
-        }
+            ("├─ ", "│  ")
+        };
+        write!(f, "\n{prefix}{branch}")?;
+        render(f, child, &format!("{prefix}{extend}"))?;
     }
     Ok(())
 }
 
 enum FrameKind {
     Root,
-    /// An `execute_until`, `optimize`, or single-step block.
+    /// An `execute_until`, `optimize`, or single-step pass over `lhs`.
     Chain {
-        header: String,
+        lhs: ArraySummary,
+        label: String,
         single_step: bool,
     },
     /// A child slot focused by `ExecuteSlot`; closed by `pop_frame` or a stack kernel.
@@ -207,22 +205,23 @@ impl Builder {
 
     /// Records a declined attempt or note that will justify the next step.
     fn note(&mut self, text: String) {
-        self.top().pending.push(Node::Item {
-            text,
-            premises: Vec::new(),
-        });
+        self.top().pending.push(Node::leaf(text));
     }
 
     /// Records the step `current -> output` justified by `rule`, taking pending nodes as its
     /// leading premises followed by `extra`.
     fn step(&mut self, rule: String, output: &ArraySummary, mut extra: Vec<Node>) {
         let frame = self.top();
+        let lhs = frame
+            .current
+            .as_ref()
+            .map_or_else(|| "?".to_string(), ToString::to_string);
         let rhs = describe_rewrite(frame.current.as_ref(), output);
-        let mut premises = std::mem::take(&mut frame.pending);
-        premises.append(&mut extra);
-        frame.nodes.push(Node::Item {
-            text: format!("-> {rhs}  [{rule}]"),
-            premises,
+        let mut children = std::mem::take(&mut frame.pending);
+        children.append(&mut extra);
+        frame.nodes.push(Node {
+            text: format!("{lhs} -> {rhs}  [{rule}]"),
+            children,
         });
         frame.current = Some(output.clone());
         frame.steps += 1;
@@ -234,7 +233,10 @@ impl Builder {
         };
         match &frame.kind {
             FrameKind::Root => {}
-            FrameKind::Chain { .. } => self.close_chain(),
+            FrameKind::Chain { .. } => {
+                let output = frame.current.clone();
+                self.close_chain(output.as_ref());
+            }
             FrameKind::Slot { .. } => self.close_slot(None),
             FrameKind::Builder => {
                 let output = frame.current.clone();
@@ -243,15 +245,18 @@ impl Builder {
         }
     }
 
-    fn close_chain(&mut self) {
+    fn close_chain(&mut self, output: Option<&ArraySummary>) {
         let Some(mut frame) = self.pop() else { return };
-        let FrameKind::Chain { header, .. } = frame.kind else {
+        let FrameKind::Chain { lhs, label, .. } = frame.kind else {
             return;
         };
+        let rhs = output
+            .or(frame.current.as_ref())
+            .map_or_else(|| "?".to_string(), ToString::to_string);
         frame.nodes.append(&mut frame.pending);
-        self.top().pending.push(Node::Chain {
-            header,
-            nodes: frame.nodes,
+        self.top().pending.push(Node {
+            text: format!("{lhs} ->* {rhs}  [{label}]"),
+            children: frame.nodes,
         });
     }
 
@@ -263,7 +268,8 @@ impl Builder {
                 ..
             }
         ) {
-            self.close_chain();
+            let output = self.top().current.clone();
+            self.close_chain(output.as_ref());
         }
     }
 
@@ -294,13 +300,12 @@ impl Builder {
             }
             None => {
                 // The child's steps are known but the rewritten parent was never materialized.
-                let rhs = format!("{parent}[{slot_idx} <- {child}]");
                 let top = self.top();
-                let mut premises = std::mem::take(&mut top.pending);
-                premises.extend(frame.nodes);
-                top.nodes.push(Node::Item {
-                    text: format!("-> {rhs}  [{rule}]"),
-                    premises,
+                let mut children = std::mem::take(&mut top.pending);
+                children.extend(frame.nodes);
+                top.nodes.push(Node {
+                    text: format!("{parent} -> {parent}[{slot_idx} <- {child}]  [{rule}]"),
+                    children,
                 });
                 top.current = Some(parent);
                 top.steps += 1;
@@ -315,8 +320,8 @@ impl Builder {
             return;
         }
         match frame.nodes.last_mut() {
-            Some(Node::Item { premises, .. }) => premises.append(&mut frame.pending),
-            _ => frame.nodes.append(&mut frame.pending),
+            Some(node) => node.children.append(&mut frame.pending),
+            None => frame.nodes.append(&mut frame.pending),
         }
     }
 
@@ -327,11 +332,11 @@ impl Builder {
             Some(output) => self.step("builder".to_string(), output, frame.nodes),
             None => {
                 let top = self.top();
-                let mut premises = std::mem::take(&mut top.pending);
-                premises.extend(frame.nodes);
-                top.nodes.push(Node::Item {
-                    text: "-> ?  [builder]".to_string(),
-                    premises,
+                let mut children = std::mem::take(&mut top.pending);
+                children.extend(frame.nodes);
+                top.nodes.push(Node {
+                    text: "? -> ?  [builder]".to_string(),
+                    children,
                 });
             }
         }
@@ -344,7 +349,8 @@ impl Builder {
                 let session = if *session { " session" } else { "" };
                 self.push(
                     FrameKind::Chain {
-                        header: format!("{root}  [optimize{session}]"),
+                        lhs: root.clone(),
+                        label: format!("optimize{session}"),
                         single_step: false,
                     },
                     root,
@@ -355,9 +361,9 @@ impl Builder {
             | TraceEvent::ExecuteUntilDoneCheck { .. }
             | TraceEvent::PhaseNone { .. }
             | TraceEvent::ExecuteEncoding { .. } => {}
-            TraceEvent::OptimizeDone { .. } => {
+            TraceEvent::OptimizeDone { output, .. } => {
                 if matches!(self.top().kind, FrameKind::Chain { .. }) {
-                    self.close_chain();
+                    self.close_chain(Some(output));
                 }
             }
             TraceEvent::OptimizeRecursiveStart { root } => {
@@ -371,10 +377,12 @@ impl Builder {
                 let parent_text = parent
                     .as_ref()
                     .map_or_else(|| "?".to_string(), ToString::to_string);
-                let text = format!("-> {parent_text}[{slot_idx} <- {output}]  [slot {slot_idx}]");
+                let text = format!(
+                    "{parent_text} -> {parent_text}[{slot_idx} <- {output}]  [slot {slot_idx}]"
+                );
                 let top = self.top();
-                let premises = std::mem::take(&mut top.pending);
-                top.nodes.push(Node::Item { text, premises });
+                let children = std::mem::take(&mut top.pending);
+                top.nodes.push(Node { text, children });
                 top.steps += 1;
             }
             TraceEvent::ReduceAttempt { rule, outcome, .. } => {
@@ -407,7 +415,8 @@ impl Builder {
             ),
             TraceEvent::ExecuteUntilStart { target, root } => self.push(
                 FrameKind::Chain {
-                    header: format!("{root}  [execute_until {target}]"),
+                    lhs: root.clone(),
+                    label: format!("execute_until {target}"),
                     single_step: false,
                 },
                 root,
@@ -415,9 +424,9 @@ impl Builder {
             TraceEvent::ExecuteUntilIteration { current, .. } => {
                 self.top().current = Some(current.clone());
             }
-            TraceEvent::ExecuteUntilReturn { .. } => {
+            TraceEvent::ExecuteUntilReturn { output } => {
                 if matches!(self.top().kind, FrameKind::Chain { .. }) {
-                    self.close_chain();
+                    self.close_chain(Some(output));
                 }
             }
             TraceEvent::ExecuteUntilPopFrame { output, .. } => self.close_slot(Some(output)),
@@ -462,9 +471,11 @@ impl Builder {
                     // premises that carry information of their own.
                     let frame = self.top();
                     let pending = std::mem::take(&mut frame.pending);
-                    frame.nodes.extend(pending.into_iter().filter(
-                        |node| !matches!(node, Node::Chain { nodes, .. } if nodes.is_empty()),
-                    ));
+                    frame.nodes.extend(
+                        pending.into_iter().filter(|node| {
+                            !(node.text.contains(" ->* ") && node.children.is_empty())
+                        }),
+                    );
                 }
             }
             TraceEvent::SlotTransition {
@@ -481,17 +492,12 @@ impl Builder {
                         },
                         child,
                     );
-                    self.top().nodes.push(Node::Item {
-                        text: child.to_string(),
-                        premises: Vec::new(),
-                    });
                 }
                 _ => {
                     self.attach_pending_to_last();
-                    self.top().nodes.push(Node::Item {
-                        text: format!("append slot={slot_idx} {child}"),
-                        premises: Vec::new(),
-                    });
+                    self.top()
+                        .nodes
+                        .push(Node::leaf(format!("append slot={slot_idx} {child}")));
                 }
             },
             TraceEvent::BuilderEvent { action, array, .. } => match *action {
@@ -510,7 +516,8 @@ impl Builder {
             }
             TraceEvent::SingleStepStart { array } => self.push(
                 FrameKind::Chain {
-                    header: format!("{array}  [execute_step]"),
+                    lhs: array.clone(),
+                    label: "execute_step".to_string(),
                     single_step: true,
                 },
                 array,
