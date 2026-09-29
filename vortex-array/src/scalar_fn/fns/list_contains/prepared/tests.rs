@@ -8,8 +8,8 @@ use vortex_error::VortexResult;
 
 use super::PreparedSet;
 use super::PreparedSetArray;
-use super::Probe;
 use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
 use crate::array_session;
@@ -21,6 +21,7 @@ use crate::arrays::FixedSizeListArray;
 use crate::arrays::ListArray;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::StructArray;
+use crate::arrays::constant::list_scalar_elements;
 use crate::assert_arrays_eq;
 use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
@@ -30,13 +31,24 @@ use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::dtype::i256;
 use crate::match_each_decimal_value_type;
-use crate::optimizer::ArrayOptimizer;
 use crate::scalar::DecimalValue;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::list_contains::ListContains;
 use crate::scalar_fn::fns::list_contains::ListContainsOptions;
 use crate::scalar_fn::fns::list_contains::PreparedSetData;
 use crate::validity::Validity;
+
+/// Prepares the elements of the non-null list scalar `list`.
+fn prepare(list: &Scalar, ctx: &mut ExecutionCtx) -> VortexResult<PreparedSetData> {
+    let elements = list_scalar_elements(&list.as_list(), ctx.allocator());
+    PreparedSetData::try_new(elements, list.dtype().nullability(), ctx)
+}
+
+/// Prepares the elements of the non-null list scalar `list` as a set repeated `len` times.
+fn prepare_array(list: &Scalar, len: usize, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    let elements = list_scalar_elements(&list.as_list(), ctx.allocator());
+    Ok(PreparedSetArray::try_new(elements, list.dtype().nullability(), len, ctx)?.into_array())
+}
 
 fn nested_needles() -> ArrayRef {
     ListArray::try_new(
@@ -103,7 +115,7 @@ fn test_row_set_returns_membership_bits(
     elements.push(Scalar::null(dtype.clone()));
     let list = Scalar::list(dtype, elements, Nullability::NonNullable);
     let options = ListContainsOptions { sql_null_semantics };
-    let set = PreparedSetData::try_new(list, &mut ctx)?;
+    let set = prepare(&list, &mut ctx)?;
     let result = set.contains(&needles, &options, &mut ctx)?;
     // The old fallback returned a lazy OR tree here.
     assert!(result.is::<Bool>());
@@ -170,8 +182,8 @@ fn test_decimal_bitmap_across_storage_widths(
         .into_array()
     });
     let options = ListContainsOptions { sql_null_semantics };
-    let set = PreparedSetData::try_new(list, &mut ctx)?;
-    assert!(matches!(&set.set.probe, Probe::DecimalBitmap { .. }));
+    let set = prepare(&list, &mut ctx)?;
+    assert!(set.set.probe.is_bitmap());
     let non_match = (!sql_null_semantics).then_some(false);
     assert_arrays_eq!(
         set.contains(&needles, &options, &mut ctx)?,
@@ -214,9 +226,8 @@ fn test_decimal_wide_values(
         decimal,
     )
     .into_array();
-    let set = PreparedSetData::try_new(list, &mut ctx)?;
-    assert_eq!(matches!(&set.set.probe, Probe::DecimalBitmap { .. }), dense);
-    assert_eq!(matches!(&set.set.probe, Probe::DecimalSorted(_)), !dense);
+    let set = prepare(&list, &mut ctx)?;
+    assert_eq!(set.set.probe.is_bitmap(), dense);
     assert_arrays_eq!(
         set.contains(&needles, &ListContainsOptions::default(), &mut ctx)?,
         BoolArray::from_iter([
@@ -227,6 +238,44 @@ fn test_decimal_wide_values(
             Some(false),
             None,
         ]),
+        &mut ctx
+    );
+    Ok(())
+}
+
+#[rstest]
+#[case::bitmap(
+    PrimitiveArray::from_option_iter([Some(5i64), Some(-3), Some(5)]).into_array(),
+    PrimitiveArray::from_option_iter([Some(-3i64), Some(4), Some(i64::MIN), None]).into_array(),
+    true,
+    [Some(true), Some(false), Some(false), None],
+)]
+#[case::unsigned_in_signed_order(
+    PrimitiveArray::from_option_iter([Some(u64::MAX), Some(0), Some(1 << 40)]).into_array(),
+    PrimitiveArray::from_option_iter([Some(1u64 << 40), Some(1), Some(u64::MAX), Some(0)])
+        .into_array(),
+    false,
+    [Some(true), Some(false), Some(true), Some(true)],
+)]
+#[case::float_bits(
+    PrimitiveArray::from_option_iter([Some(0.0f64), Some(f64::NAN)]).into_array(),
+    PrimitiveArray::from_option_iter([Some(-0.0f64), Some(0.0), Some(f64::NAN), Some(1.5)])
+        .into_array(),
+    false,
+    [Some(false), Some(true), Some(true), Some(false)],
+)]
+fn test_primitive_integers(
+    #[case] elements: ArrayRef,
+    #[case] needles: ArrayRef,
+    #[case] dense: bool,
+    #[case] expected: [Option<bool>; 4],
+) -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let set = PreparedSetData::try_new(elements, Nullability::NonNullable, &mut ctx)?;
+    assert_eq!(set.set.probe.is_bitmap(), dense);
+    assert_arrays_eq!(
+        set.contains(&needles, &ListContainsOptions::default(), &mut ctx)?,
+        BoolArray::from_iter(expected),
         &mut ctx
     );
     Ok(())
@@ -248,7 +297,7 @@ fn set_with_null() -> Scalar {
 #[test]
 fn test_prepared_set_rows_are_the_constant_list() -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
-    let set = PreparedSetArray::try_new(set_with_null(), 4, &mut ctx)?.into_array();
+    let set = prepare_array(&set_with_null(), 4, &mut ctx)?;
 
     assert_arrays_eq!(set, ConstantArray::new(set_with_null(), 4), &mut ctx);
 
@@ -270,7 +319,7 @@ fn test_list_contains_probes_a_prepared_set_list(
     #[case] expected: [Option<bool>; 4],
 ) -> VortexResult<()> {
     let mut ctx = array_session().create_execution_ctx();
-    let set = PreparedSetArray::try_new(set_with_null(), 4, &mut ctx)?.into_array();
+    let set = prepare_array(&set_with_null(), 4, &mut ctx)?;
     let needles =
         PrimitiveArray::from_option_iter([Some(1i32), Some(2), None, Some(3)]).into_array();
 
@@ -282,23 +331,43 @@ fn test_list_contains_probes_a_prepared_set_list(
 #[rstest]
 #[case::default(ListContainsOptions::default(), Some(false))]
 #[case::sql(ListContainsOptions { sql_null_semantics: true }, None)]
-fn test_constant_needle_folds_without_probing(
+fn test_constant_needle_gives_a_constant(
     #[case] options: ListContainsOptions,
     #[case] expected: Option<bool>,
 ) -> VortexResult<()> {
-    // `3 IN (2, NULL)` against the prepared set is decided at optimization, as it is against a
-    // constant list.
+    // `3 IN (2, NULL)` against the prepared set is looked up once, and gives a constant.
     let mut ctx = array_session().create_execution_ctx();
-    let set = PreparedSetArray::try_new(set_with_null(), 4, &mut ctx)?.into_array();
+    let set = prepare_array(&set_with_null(), 4, &mut ctx)?;
     let needle = ConstantArray::new(Scalar::primitive(3i32, Nullability::Nullable), 4).into_array();
 
-    let optimized = ListContains::try_new_opts(set, needle, options)?
+    let result = ListContains::try_new_opts(set, needle, options)?
         .into_array()
-        .optimize()?;
+        .execute::<ArrayRef>(&mut ctx)?;
     let expected = match expected {
         Some(value) => Scalar::bool(value, Nullability::Nullable),
         None => Scalar::null(DType::Bool(Nullability::Nullable)),
     };
-    assert_eq!(optimized.as_constant(), Some(expected));
+    assert_eq!(result.as_constant(), Some(expected));
+    Ok(())
+}
+
+#[test]
+fn test_constant_row_needle_probes_one_row() -> VortexResult<()> {
+    // A probe of rows cannot look a scalar needle up, so execution probes one row.
+    let mut ctx = array_session().create_execution_ctx();
+    let needles = nested_needles();
+    let dtype = needles.dtype().as_nullable();
+    let member = needles.execute_scalar(2, &mut ctx)?.cast(&dtype)?;
+    let list = Scalar::list(dtype, vec![member.clone()], Nullability::NonNullable);
+
+    let set = prepare_array(&list, 4, &mut ctx)?;
+    let needle = ConstantArray::new(member, 4).into_array();
+    let result = ListContains::try_new_opts(set, needle, ListContainsOptions::default())?
+        .into_array()
+        .execute::<ArrayRef>(&mut ctx)?;
+    assert_eq!(
+        result.as_constant(),
+        Some(Scalar::bool(true, Nullability::Nullable))
+    );
     Ok(())
 }
