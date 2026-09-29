@@ -591,3 +591,23 @@ but the fix lives in a kernel or a registration, not in the loop.
   used by `--features profile`; compiled out by default.
 - `vortex-array/src/canonical.rs`, `executor.rs`, `optimizer/mod.rs`, `optimizer/kernels.rs`,
   `stats/array.rs`, `array/mod.rs` — the loop changes of section 6.1.
+
+## 9. Real TPC-H queries (DataFusion, SF1, vortex files)
+
+`datafusion-bench tpch --formats vortex` on the same 4-vCPU container, baseline built from
+`develop` (50c3f9f) and the branch (0186706), three interleaved rounds (5 + 10 + 10 iterations,
+25 samples per query), all 22 queries. Data generated with `data-gen tpch --formats vortex`.
+
+| | baseline | branch | delta |
+|---|---:|---:|---:|
+| sum of per-query medians | 1713ms | 1724ms | +0.6% |
+| sum of per-query minimums | 1514ms | 1497ms | -1.1% |
+
+No query moved outside the run-to-run noise of this machine: the first 5-iteration round alone
+read -3.7% on the median sum with single queries swinging between -32% and +45%, and merging
+the two 10-iteration rounds pulled every query back to within about ±6%, both directions. This
+matches section 3: whole-chunk decode spends about 2% of its time in the loop, DataFusion scans
+execute whole chunks, and a 30% cut of that 2% is invisible at query level. The loop savings
+only show where `execute_until` runs on small arrays or many activations (section 4), which the
+TPC-H scan path does not do. The kernel-side items in section 7 (filter over FSST/OnPair,
+`Between` on decimals, `Like` over `Dict`, `RunEnd` slices) are the ones that would move queries.
