@@ -4,6 +4,7 @@
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
+use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
@@ -15,15 +16,20 @@ use crate::IntoArray;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynGroupedAccumulator;
 use crate::aggregate_fn::GroupedAccumulator;
+use crate::aggregate_fn::GroupedArray;
 use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::aggregate_fn::fns::sum_v2::SumV2;
 use crate::arrays::ConstantArray;
+use crate::arrays::ScalarFn;
+use crate::arrays::scalar_fn::ScalarFnArrayExt;
 use crate::dtype::DType;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::fns::list_filter::ListFilter;
+use crate::validity::Validity;
 
 /// Sum of the elements in each list of a `List` or `FixedSizeList` typed array.
 ///
@@ -92,6 +98,10 @@ impl ScalarFnVTable for ListSum {
             other => vortex_bail!("list_sum() requires List or FixedSizeList, got {other}"),
         };
 
+        if let Some(result) = try_filtered_list_sum(&input, elem_dtype.clone(), options, ctx)? {
+            return Ok(result);
+        }
+
         let columnar = input.execute::<Columnar>(ctx)?;
 
         match columnar {
@@ -123,6 +133,77 @@ impl ScalarFnVTable for ListSum {
     }
 }
 
+/// Try to sum a list filter over its original groups and predicate bitmap.
+/// Unsupported encodings and unaligned lists use the usual materialized filter path.
+fn try_filtered_list_sum(
+    input: &ArrayRef,
+    elem_dtype: DType,
+    options: &NumericalAggregateOpts,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    let Some(filter) = input.as_opt::<ScalarFn>() else {
+        return Ok(None);
+    };
+    if !filter.scalar_fn().is::<ListFilter>() {
+        return Ok(None);
+    }
+
+    let values = filter.child_at(0).clone().execute::<Canonical>(ctx)?;
+    let groups = match values {
+        Canonical::List(list) => GroupedArray::from(list),
+        Canonical::FixedSizeList(list) => GroupedArray::from(list),
+        _ => return Ok(None),
+    };
+    let mut accumulator = GroupedAccumulator::try_new(SumV2, *options, elem_dtype)?;
+    if !accumulator.supports_filtered_grouped_aggregate(groups.elements(), ctx) {
+        return Ok(None);
+    }
+
+    let predicate = filter.child_at(1).clone().execute::<Canonical>(ctx)?;
+    let predicate_groups = match predicate {
+        Canonical::List(list) => GroupedArray::from(list),
+        Canonical::FixedSizeList(list) => GroupedArray::from(list),
+        _ => return Ok(None),
+    };
+    if groups.len() != predicate_groups.len()
+        || groups.elements().len() != predicate_groups.elements().len()
+        || !groups
+            .group_ranges(ctx)?
+            .iter()
+            .zip(predicate_groups.group_ranges(ctx)?.iter())
+            .all(|(values, predicate)| values == predicate)
+    {
+        return Ok(None);
+    }
+
+    let predicate = predicate_groups
+        .elements()
+        .clone()
+        .null_as_false()
+        .execute(ctx)?;
+    let values_validity = groups.group_validity(ctx)?;
+    let predicate_validity = predicate_groups.group_validity(ctx)?;
+    let group_validity = if values_validity.all_true() && predicate_validity.all_true() {
+        Mask::new_true(groups.len())
+    } else {
+        Mask::from_iter(
+            values_validity
+                .iter()
+                .zip(predicate_validity.iter())
+                .map(|(values, predicate)| values && predicate),
+        )
+    };
+    let groups = groups.with_validity(Validity::from_mask(
+        group_validity,
+        input.dtype().nullability(),
+    ))?;
+    if accumulator.try_accumulate_filtered_list(&groups, &predicate, ctx)? {
+        Ok(Some(accumulator.finish()?))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Sum each list of a canonical `array` into one value per list.
 fn list_sum_impl(
     canonical: ArrayRef,
@@ -138,22 +219,35 @@ fn list_sum_impl(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     use prost::Message;
     use rstest::rstest;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_error::vortex_bail;
+    use vortex_mask::Mask;
 
     use crate::ArrayRef;
+    use crate::ExecutionCtx;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
+    use crate::aggregate_fn::AggregateFnRef;
+    use crate::aggregate_fn::AggregateFnVTable;
+    use crate::aggregate_fn::GroupedArray;
     use crate::aggregate_fn::NumericalAggregateOpts;
+    use crate::aggregate_fn::fns::sum_v2::SumV2;
+    use crate::aggregate_fn::kernels::DynGroupedAggregateKernel;
+    use crate::aggregate_fn::session::AggregateFnSessionExt;
+    use crate::array::VTable;
     use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::ConstantArray;
     use crate::arrays::FixedSizeListArray;
     use crate::arrays::ListArray;
     use crate::arrays::ListViewArray;
+    use crate::arrays::Primitive;
     use crate::arrays::PrimitiveArray;
     use crate::assert_arrays_eq;
     use crate::dtype::DType;
@@ -167,8 +261,80 @@ mod tests {
     use crate::proto::expr as pb;
     use crate::scalar::Scalar;
     use crate::scalar_fn::ScalarFnVTable;
+    use crate::scalar_fn::fns::list_filter::ListFilter;
     use crate::scalar_fn::fns::list_sum::ListSum;
     use crate::validity::Validity;
+
+    static FILTERED_HOOK_CALLED: AtomicBool = AtomicBool::new(false);
+
+    #[derive(Debug)]
+    struct SentinelFilteredSumKernel;
+
+    impl DynGroupedAggregateKernel for SentinelFilteredSumKernel {
+        fn supports_filtered_grouped_aggregate(&self) -> bool {
+            true
+        }
+
+        fn grouped_aggregate(
+            &self,
+            _aggregate_fn: &AggregateFnRef,
+            _groups: &GroupedArray,
+            _ctx: &mut ExecutionCtx,
+        ) -> VortexResult<Option<ArrayRef>> {
+            Ok(None)
+        }
+
+        fn filtered_grouped_aggregate(
+            &self,
+            _aggregate_fn: &AggregateFnRef,
+            _groups: &GroupedArray,
+            _predicate: &Mask,
+            _ctx: &mut ExecutionCtx,
+        ) -> VortexResult<Option<ArrayRef>> {
+            FILTERED_HOOK_CALLED.store(true, Ordering::SeqCst);
+            vortex_bail!("sentinel filtered grouped aggregate")
+        }
+    }
+
+    static SENTINEL_FILTERED_SUM_KERNEL: SentinelFilteredSumKernel = SentinelFilteredSumKernel;
+
+    #[test]
+    fn list_filter_sum_calls_filtered_hook_before_filter_execution() -> VortexResult<()> {
+        FILTERED_HOOK_CALLED.store(false, Ordering::SeqCst);
+        let session = array_session();
+        session.aggregate_fns().register_grouped_encoding_kernel(
+            Primitive.id(),
+            SumV2.id(),
+            &SENTINEL_FILTERED_SUM_KERNEL,
+        );
+        let mut ctx = session.create_execution_ctx();
+        let values = FixedSizeListArray::new(
+            buffer![1u8, 2, 3, 4].into_array(),
+            2,
+            Validity::NonNullable,
+            2,
+        )
+        .into_array();
+        let predicate = FixedSizeListArray::new(
+            BoolArray::from_iter([true, false, false, true]).into_array(),
+            2,
+            Validity::NonNullable,
+            2,
+        )
+        .into_array();
+        let filtered = ListFilter::try_new(values, predicate)?.into_array();
+        let summed = filtered.apply(&list_sum(root()))?;
+        let error = summed
+            .execute::<PrimitiveArray>(&mut ctx)
+            .expect_err("sentinel kernel");
+        assert!(
+            error
+                .to_string()
+                .contains("sentinel filtered grouped aggregate")
+        );
+        assert!(FILTERED_HOOK_CALLED.load(Ordering::SeqCst));
+        Ok(())
+    }
 
     fn create_list_elements() -> ArrayRef {
         PrimitiveArray::from_option_iter::<i32, _>([

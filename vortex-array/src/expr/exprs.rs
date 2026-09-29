@@ -41,6 +41,7 @@ use crate::scalar_fn::fns::like::Like;
 use crate::scalar_fn::fns::like::LikeOptions;
 use crate::scalar_fn::fns::list_contains::ListContains;
 use crate::scalar_fn::fns::list_contains::ListContainsOptions;
+use crate::scalar_fn::fns::list_filter::ListFilter;
 use crate::scalar_fn::fns::list_length::ListLength;
 use crate::scalar_fn::fns::list_sum::ListSum;
 use crate::scalar_fn::fns::literal::Literal;
@@ -1241,7 +1242,23 @@ pub fn bound_list_length(input: BoundExpression) -> BoundExpression {
         .vortex_expect("list-length expressions require a list child")
 }
 
-// ---- ListSum ----
+// ---- ListFilter / ListSum ----
+
+/// Creates an expression that selects elements from each input list using a parallel boolean
+/// list. Null predicate elements are false, and a null outer list produces a null result.
+///
+/// The inputs must contain the same number of rows, with equal list lengths where both are valid.
+/// Fixed-size list inputs yield variable-length lists.
+pub fn list_filter(input: Expression, predicate: Expression) -> Expression {
+    ListFilter.new_expr(EmptyOptions, [input, predicate])
+}
+
+/// Creates a bound list-filter expression.
+pub fn bound_list_filter(input: BoundExpression, predicate: BoundExpression) -> BoundExpression {
+    ListFilter
+        .try_new_bound_expr(EmptyOptions, [input, predicate])
+        .vortex_expect("list-filter expressions require list inputs and boolean predicate elements")
+}
 
 /// Creates an expression that sums the elements of each list for `List` and
 /// `FixedSizeList` inputs, akin to DuckDB's `list_sum()`.
@@ -1313,6 +1330,7 @@ pub mod bound {
     pub use super::bound_is_null as is_null;
     pub use super::bound_like as like;
     pub use super::bound_list_contains as list_contains;
+    pub use super::bound_list_filter as list_filter;
     pub use super::bound_list_length as list_length;
     pub use super::bound_list_sum as list_sum;
     pub use super::bound_list_sum_opts as list_sum_opts;

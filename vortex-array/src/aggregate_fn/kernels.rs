@@ -7,6 +7,7 @@
 use std::fmt::Debug;
 
 use vortex_error::VortexResult;
+use vortex_mask::Mask;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -41,6 +42,11 @@ pub trait DynAggregateKernel: 'static + Send + Sync + Debug {
 ///
 /// Return `Ok(None)` if the kernel cannot be applied to the given aggregate function.
 pub trait DynGroupedAggregateKernel: 'static + Send + Sync + Debug {
+    /// Whether this kernel can attempt selected aggregation without materializing a filter.
+    fn supports_filtered_grouped_aggregate(&self) -> bool {
+        false
+    }
+
     /// Aggregate each group in the provided grouped array and return an array of the aggregate
     /// states.
     fn grouped_aggregate(
@@ -49,4 +55,22 @@ pub trait DynGroupedAggregateKernel: 'static + Send + Sync + Debug {
         groups: &GroupedArray,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>>;
+
+    /// Aggregate each group after selecting elements with a flat predicate mask.
+    ///
+    /// The mask indexes the original, unfiltered child array and must have the same length.
+    /// False bits exclude values; null predicate elements have already been converted to false.
+    /// Group ranges and outer validity retain their original coordinates and semantics.
+    /// Implementations return partial aggregate states, as in [`Self::grouped_aggregate`], or
+    /// `Ok(None)` when they cannot evaluate the predicate without materializing a filtered child.
+    fn filtered_grouped_aggregate(
+        &self,
+        aggregate_fn: &AggregateFnRef,
+        groups: &GroupedArray,
+        predicate: &Mask,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        _ = (aggregate_fn, groups, predicate, ctx);
+        Ok(None)
+    }
 }

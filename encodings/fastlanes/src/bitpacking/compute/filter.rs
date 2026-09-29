@@ -10,6 +10,7 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::filter::FilterKernel;
+use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::UnsignedPType;
@@ -56,6 +57,33 @@ impl FilterKernel for BitPacked {
             Mask::Values(values) => values,
         };
 
+        // Preserve two-bit compression for selective filters. Dense masks use the existing
+        // decode-and-filter path below, since repacking all selected values is more expensive.
+        if array.dtype().as_ptype() == PType::U8
+            && array.bit_width() == 2
+            && values.density() <= unpack_then_filter_threshold(PType::U8)
+            && array.patches().is_none()
+            && array.validity()?.execute_mask(array.len(), ctx)?.all_true()
+        {
+            let packed = filter_two_bit_u8(array.data(), values);
+            let validity = match array.validity()? {
+                Validity::NonNullable => Validity::NonNullable,
+                _ => Validity::AllValid,
+            };
+            return Ok(Some(
+                BitPacked::try_new(
+                    BufferHandle::new_host(packed.freeze().into_byte_buffer()),
+                    PType::U8,
+                    validity,
+                    None,
+                    2,
+                    values.true_count(),
+                    0,
+                )?
+                .into_array(),
+            ));
+        }
+
         // If the density is high enough, then we would rather decompress the whole array and then apply
         // a filter over decompressing values one by one.
         if values.density() > unpack_then_filter_threshold(array.dtype().as_ptype()) {
@@ -93,6 +121,56 @@ impl FilterKernel for BitPacked {
 
         Ok(Some(primitive.into_array()))
     }
+}
+
+fn filter_two_bit_u8(array: &BitPackedData, selection: &MaskValuesRef) -> BufferMut<u8> {
+    let mut packed = BufferMut::with_capacity(selection.true_count().div_ceil(1024) * 256);
+    let mut unpacked_block = [0u8; 1024];
+    let mut output_block = [0u8; 1024];
+    let mut packed_block = [0u8; 256];
+    let mut output_count = 0;
+    let mut current_block = usize::MAX;
+    let mut selected_in_block = 0;
+    let source = array.packed_slice::<u8>();
+    let offset = array.offset() as usize;
+
+    selection.bit_buffer().for_each_set_index(|index| {
+        let physical = index + offset;
+        let block_index = physical / 1024;
+        if block_index != current_block {
+            current_block = block_index;
+            selected_in_block = 0;
+        }
+        let block = &source[block_index * 256..][..256];
+        let value = if selected_in_block < UNPACK_CHUNK_THRESHOLD {
+            // SAFETY: the selected index falls inside a complete, padded FastLanes block.
+            unsafe { u8::unchecked_unpack_single(2, block, physical % 1024) }
+        } else {
+            if selected_in_block == UNPACK_CHUNK_THRESHOLD {
+                // SAFETY: both input and scratch cover one complete FastLanes block.
+                unsafe { u8::unchecked_unpack(2, block, &mut unpacked_block) };
+            }
+            unpacked_block[physical % 1024]
+        };
+        selected_in_block += 1;
+        output_block[output_count] = value;
+        output_count += 1;
+        if output_count == 1024 {
+            // SAFETY: both buffers have the full lengths required by the two-bit packer.
+            unsafe { u8::unchecked_pack(2, &output_block, &mut packed_block) };
+            packed.extend_from_slice(&packed_block);
+            output_count = 0;
+        }
+    });
+
+    if output_count != 0 {
+        output_block[output_count..].fill(0);
+        // SAFETY: the tail is padded to a complete FastLanes block.
+        unsafe { u8::unchecked_pack(2, &output_block, &mut packed_block) };
+        packed.extend_from_slice(&packed_block);
+    }
+
+    packed
 }
 
 /// Specialized filter kernel for primitive bit-packed arrays.
@@ -181,14 +259,17 @@ mod tests {
     use vortex_array::IntoArray as _;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::filter::FilterKernel;
     use vortex_array::assert_arrays_eq;
     use vortex_array::compute::conformance::filter::test_filter_conformance;
     use vortex_array::validity::Validity;
     use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
     use vortex_mask::Mask;
     use vortex_session::VortexSession;
 
+    use crate::BitPacked;
     use crate::BitPackedData;
     use crate::bitpacking::array::BitPackedArrayExt;
 
@@ -213,6 +294,61 @@ mod tests {
             PrimitiveArray::from_iter([0u8, 62, 31, 33, 9, 18]),
             &mut ctx
         );
+    }
+
+    #[test]
+    fn sparse_two_bit_filter_stays_packed() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = PrimitiveArray::from_iter((0..4096).map(|idx| (idx % 3) as u8));
+        let packed = BitPackedData::encode(&values.into_array(), 2, &mut ctx)?;
+        let mask = Mask::from_indices(4096, [1, 1023, 1024, 2049, 4095]);
+        let filtered = BitPacked::filter(packed.as_view(), &mask, &mut ctx)?
+            .expect("selective two-bit filter has a packed kernel");
+        assert!(filtered.is::<BitPacked>());
+        assert_arrays_eq!(
+            filtered,
+            PrimitiveArray::from_iter([1u8, 0, 1, 0, 0]),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_two_bit_filter_handles_sliced_nullable_input() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let source = PrimitiveArray::from_option_iter((0..5000).map(|idx| Some((idx % 3) as u8)))
+            .into_array();
+        let packed = BitPackedData::encode(&source, 2, &mut ctx)?;
+        let sliced = packed.slice(123..4123)?;
+        let mask = Mask::from_indices(4000, [0, 900, 901, 3999]);
+        let filtered = BitPacked::filter(
+            sliced
+                .as_opt::<BitPacked>()
+                .expect("slice stays bit-packed"),
+            &mask,
+            &mut ctx,
+        )?
+        .expect("selective two-bit filter has a packed kernel");
+        assert!(filtered.is::<BitPacked>());
+        assert_eq!(filtered.dtype(), source.dtype());
+        assert_arrays_eq!(
+            filtered,
+            PrimitiveArray::from_option_iter(
+                [123, 1023, 1024, 4122].map(|idx| Some((idx % 3) as u8))
+            ),
+            &mut ctx
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dense_two_bit_filter_uses_decode_fallback() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = PrimitiveArray::from_iter((0..4096).map(|idx| (idx % 3) as u8));
+        let packed = BitPackedData::encode(&values.into_array(), 2, &mut ctx)?;
+        let mask = Mask::from_iter((0..4096).map(|idx| idx % 2 == 0));
+        assert!(BitPacked::filter(packed.as_view(), &mask, &mut ctx)?.is_none());
+        Ok(())
     }
 
     #[test]
@@ -351,5 +487,101 @@ mod tests {
 
         let expected: Vec<i32> = values[0..20].to_vec();
         assert_arrays_eq!(filtered, PrimitiveArray::from_iter(expected), &mut ctx);
+    }
+
+    #[test]
+    fn dense_genotype_filter_preserves_values() {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values: Vec<u8> = (0..20_000).map(|idx| (idx % 3) as u8).collect();
+        let source = PrimitiveArray::from_iter(values.clone()).into_array();
+        let packed = BitPackedData::encode(&source, 2, &mut ctx).unwrap();
+        let mask = Mask::from_indices(values.len(), (0..values.len()).filter(|idx| idx % 2 == 0));
+        let filtered = packed
+            .filter(mask)
+            .unwrap()
+            .execute::<vortex_array::ArrayRef>(&mut ctx)
+            .unwrap()
+            .into_array();
+        assert_arrays_eq!(
+            filtered,
+            PrimitiveArray::from_iter(values.into_iter().step_by(2)),
+            &mut ctx
+        );
+    }
+
+    #[test]
+    fn nullable_dense_genotype_filter_preserves_dtype() {
+        let mut ctx = SESSION.create_execution_ctx();
+        let source = PrimitiveArray::from_option_iter((0..4096).map(|idx| Some((idx % 3) as u8)))
+            .into_array();
+        let packed = BitPackedData::encode(&source, 2, &mut ctx).unwrap();
+        let mask = Mask::from_indices(4096, (0..4096).filter(|idx| idx % 2 == 0));
+        let filtered = packed
+            .filter(mask)
+            .unwrap()
+            .execute::<vortex_array::ArrayRef>(&mut ctx)
+            .unwrap()
+            .into_array();
+        assert_eq!(filtered.dtype(), source.dtype());
+        assert_arrays_eq!(
+            filtered,
+            PrimitiveArray::from_option_iter((0..4096).step_by(2).map(|idx| Some((idx % 3) as u8))),
+            &mut ctx
+        );
+    }
+
+    #[test]
+    fn dense_genotype_filter_handles_sliced_offset() {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values: Vec<u8> = (0..5000).map(|idx| (idx % 3) as u8).collect();
+        let packed = BitPackedData::encode(
+            &PrimitiveArray::from_iter(values.clone()).into_array(),
+            2,
+            &mut ctx,
+        )
+        .unwrap();
+        let sliced = packed.slice(123..4123).unwrap();
+        let mask = Mask::from_indices(4000, (0..4000).filter(|idx| idx % 2 == 1));
+        let filtered = sliced
+            .filter(mask)
+            .unwrap()
+            .execute::<vortex_array::ArrayRef>(&mut ctx)
+            .unwrap()
+            .into_array();
+        assert_arrays_eq!(
+            filtered,
+            PrimitiveArray::from_iter(
+                (123..4123)
+                    .filter(|idx| (idx - 123) % 2 == 1)
+                    .map(|idx| values[idx])
+            ),
+            &mut ctx
+        );
+    }
+
+    #[test]
+    fn dense_genotype_filter_sliced_nullable_all_valid() {
+        let mut ctx = SESSION.create_execution_ctx();
+        let source = PrimitiveArray::from_option_iter((0..5000).map(|idx| Some((idx % 3) as u8)))
+            .into_array();
+        let packed = BitPackedData::encode(&source, 2, &mut ctx).unwrap();
+        let sliced = packed.slice(123..4123).unwrap();
+        let mask = Mask::from_indices(4000, (0..4000).filter(|idx| idx % 2 == 1));
+        let filtered = sliced
+            .filter(mask)
+            .unwrap()
+            .execute::<vortex_array::ArrayRef>(&mut ctx)
+            .unwrap()
+            .into_array();
+        assert_eq!(filtered.dtype(), source.dtype());
+        assert_arrays_eq!(
+            filtered,
+            PrimitiveArray::from_option_iter(
+                (123..4123)
+                    .filter(|idx| (idx - 123) % 2 == 1)
+                    .map(|idx| Some((idx % 3) as u8))
+            ),
+            &mut ctx
+        );
     }
 }

@@ -22,6 +22,11 @@ name = "datafusion-bench"
 path = "src/main.rs"
 test = false
 
+[[bin]]
+name = "rare-genetics"
+path = "src/bin/rare_genetics.rs"
+test = false
+
 [lib]
 test = false
 

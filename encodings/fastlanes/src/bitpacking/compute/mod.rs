@@ -9,6 +9,7 @@ mod filter;
 pub(crate) mod is_constant;
 mod slice;
 mod stream_predicate;
+pub(crate) mod sum;
 mod take;
 
 // TODO(connor): This is duplicated in `encodings/fastlanes/src/bitpacking/kernels/mod.rs`.

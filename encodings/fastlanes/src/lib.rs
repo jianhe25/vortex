@@ -66,13 +66,18 @@ pub(crate) const fn untranspose_idx(idx: usize) -> usize {
 }
 
 use bitpacking::compute::is_constant::BitPackedIsConstantKernel;
+use bitpacking::compute::sum::BitPackedSumKernel;
+use bitpacking::compute::sum::FilteredBitPackedSumKernel;
 use r#for::compute::is_constant::FoRIsConstantKernel;
 use r#for::compute::is_sorted::FoRIsSortedKernel;
 use vortex_array::ArrayVTable;
 use vortex_array::aggregate_fn::AggregateFnVTable;
 use vortex_array::aggregate_fn::fns::is_constant::IsConstant;
 use vortex_array::aggregate_fn::fns::is_sorted::IsSorted;
+use vortex_array::aggregate_fn::fns::sum::Sum;
+use vortex_array::aggregate_fn::fns::sum_v2::SumV2;
 use vortex_array::aggregate_fn::session::AggregateFnSessionExt;
+use vortex_array::arrays::Filter;
 use vortex_array::arrays::patched::use_experimental_patches;
 use vortex_array::session::ArraySessionExt;
 use vortex_session::VortexSession;
@@ -99,6 +104,23 @@ pub fn initialize(session: &VortexSession) {
         BitPacked.id(),
         Some(IsConstant.id()),
         &BitPackedIsConstantKernel,
+    );
+    for sum in [Sum.id(), SumV2.id()] {
+        session.aggregate_fns().register_aggregate_kernel(
+            BitPacked.id(),
+            Some(sum),
+            &BitPackedSumKernel,
+        );
+    }
+    session.aggregate_fns().register_grouped_encoding_kernel(
+        BitPacked.id(),
+        SumV2.id(),
+        &BitPackedSumKernel,
+    );
+    session.aggregate_fns().register_grouped_encoding_kernel(
+        Filter.id(),
+        SumV2.id(),
+        &FilteredBitPackedSumKernel,
     );
     session.aggregate_fns().register_aggregate_kernel(
         FoR.id(),

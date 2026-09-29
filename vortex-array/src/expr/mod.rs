@@ -87,6 +87,7 @@ pub use exprs::is_root;
 pub use exprs::like;
 pub use exprs::list_contains;
 pub use exprs::list_contains_opts;
+pub use exprs::list_filter;
 pub use exprs::list_length;
 pub use exprs::list_sum;
 pub use exprs::list_sum_opts;

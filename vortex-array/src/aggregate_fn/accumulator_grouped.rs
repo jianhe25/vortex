@@ -34,6 +34,7 @@ use crate::columnar::AnyColumnar;
 use crate::dtype::DType;
 use crate::executor::max_iterations;
 use crate::match_each_integer_ptype;
+use crate::validity::Validity;
 
 /// Reference-counted type-erased grouped accumulator.
 pub type GroupedAccumulatorRef = Box<dyn DynGroupedAccumulator>;
@@ -103,6 +104,25 @@ impl GroupedArray {
     /// Returns true when every group is valid.
     pub fn all_groups_valid(&self, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
         Ok(self.group_validity(ctx)?.all_true())
+    }
+
+    pub(crate) fn with_validity(self, validity: Validity) -> VortexResult<Self> {
+        Ok(match self {
+            Self::ListView(groups) => ListViewArray::try_new(
+                groups.elements().clone(),
+                groups.offsets().clone(),
+                groups.sizes().clone(),
+                validity,
+            )?
+            .into(),
+            Self::FixedSizeList(groups) => FixedSizeListArray::try_new(
+                groups.elements().clone(),
+                groups.list_size(),
+                validity,
+                groups.len(),
+            )?
+            .into(),
+        })
     }
 
     unsafe fn with_elements_unchecked(&self, elements: ArrayRef) -> VortexResult<Self> {
@@ -205,6 +225,44 @@ impl<V: AggregateFnVTable> GroupedAccumulator<V> {
             dtypes,
             partials: vec![],
         })
+    }
+
+    /// Whether an encoding-specific kernel can aggregate selected values of this child encoding.
+    pub(crate) fn supports_filtered_grouped_aggregate(
+        &self,
+        elements: &ArrayRef,
+        ctx: &ExecutionCtx,
+    ) -> bool {
+        ctx.session()
+            .aggregate_fns()
+            .find_grouped_encoding_kernel(elements.encoding_id(), self.aggregate_fn.id())
+            .is_some_and(|kernel| kernel.supports_filtered_grouped_aggregate())
+    }
+
+    /// Try an encoding-specific aggregate over selected values without materializing them.
+    /// Returns `false` when no kernel supports this input, leaving the accumulator unchanged.
+    pub(crate) fn try_accumulate_filtered_list(
+        &mut self,
+        groups: &GroupedArray,
+        predicate: &Mask,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<bool> {
+        vortex_ensure!(predicate.len() == groups.elements().len());
+        vortex_ensure!(groups.elements().dtype() == &self.dtypes.dtype);
+        let session = ctx.session().clone();
+        let Some(kernel) = session
+            .aggregate_fns()
+            .find_grouped_encoding_kernel(groups.elements().encoding_id(), self.aggregate_fn.id())
+        else {
+            return Ok(false);
+        };
+        let Some(result) =
+            kernel.filtered_grouped_aggregate(&self.aggregate_fn, groups, predicate, ctx)?
+        else {
+            return Ok(false);
+        };
+        self.push_result(result)?;
+        Ok(true)
     }
 }
 
