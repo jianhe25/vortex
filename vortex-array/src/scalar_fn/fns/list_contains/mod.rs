@@ -242,16 +242,20 @@ impl ScalarFnVTable for ListContains {
         options: &Self::Options,
         expr: &BoundExpression,
     ) -> VortexResult<Option<BoundExpression>> {
-        let Some(list) = expr.child(0).as_opt::<Literal>() else {
+        let Some(literal) = expr.child(0).as_scalar() else {
             return Ok(None);
         };
         // A null list has no set, and answers null for every needle at execution.
-        if list.is_null() {
+        if !literal
+            .as_opt::<Literal>()
+            .is_some_and(|list| !list.is_null())
+        {
             return Ok(None);
         }
 
-        let set =
-            PreparedSetLiteral.try_new_bound_expr(PreparedSetData::try_new(list.clone())?, [])?;
+        // The set shares the literal, so the list is not cloned.
+        let set = PreparedSetLiteral
+            .try_new_bound_expr(PreparedSetData::try_from_literal(literal.clone())?, [])?;
         Ok(Some(ListContains.try_new_bound_expr(
             *options,
             [set, expr.child(1).clone()],

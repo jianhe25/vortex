@@ -48,7 +48,10 @@ use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::optimizer::rules::ParentRuleSet;
 use crate::scalar::Scalar;
+use crate::scalar_fn::ScalarFnRef;
+use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::fns::list_contains::ListContainsOptions;
+use crate::scalar_fn::fns::literal::Literal;
 use crate::serde::ArrayChildren;
 use crate::validity::Validity;
 
@@ -84,8 +87,9 @@ pub struct PreparedSet;
 pub struct PreparedSetData(Arc<SharedSet>);
 
 struct SharedSet {
-    /// The non-null list that every row holds.
-    list: Scalar,
+    /// The [`Literal`] of the non-null list that every row holds, shared with the expression it
+    /// came from rather than cloned out of it.
+    literal: ScalarFnRef,
     /// Whether the list holds a null element, which a probe does not hold.
     has_null_element: bool,
     /// Whether the list holds no element at all, counting null elements.
@@ -125,12 +129,25 @@ impl PreparedSetData {
     ///
     /// Fails when `list` is not a list, or is null.
     pub fn try_new(list: Scalar) -> VortexResult<Self> {
-        vortex_ensure!(
-            matches!(list.dtype(), DType::List(..)),
-            "A prepared set needs a list, got {}",
-            list.dtype()
-        );
+        Self::try_from_literal(Literal.bind(list))
+    }
+
+    /// Prepares the non-null list that the [`Literal`] `literal` holds as a set, sharing the
+    /// literal rather than cloning its list.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `literal` is not a literal, or holds a null, or a value that is not a list.
+    pub(crate) fn try_from_literal(literal: ScalarFnRef) -> VortexResult<Self> {
         let (has_null_element, is_empty) = {
+            let Some(list) = literal.as_opt::<Literal>() else {
+                vortex_bail!("A prepared set needs a literal list");
+            };
+            vortex_ensure!(
+                matches!(list.dtype(), DType::List(..)),
+                "A prepared set needs a list, got {}",
+                list.dtype()
+            );
             let Some(elements) = list.as_list().element_values() else {
                 vortex_bail!("A prepared set needs a non-null list");
             };
@@ -138,7 +155,7 @@ impl PreparedSetData {
         };
 
         Ok(Self(Arc::new(SharedSet {
-            list,
+            literal,
             has_null_element,
             is_empty,
             set: OnceLock::new(),
@@ -147,7 +164,7 @@ impl PreparedSetData {
 
     /// The list that every row holds.
     pub fn list(&self) -> &Scalar {
-        &self.0.list
+        self.0.literal.as_::<Literal>()
     }
 
     /// The elements of the list, one row each, null elements included.
@@ -166,14 +183,14 @@ impl PreparedSetData {
     ) -> VortexResult<&'a ElementSet> {
         self.0
             .set
-            .get_or_init(|| ElementSet::try_new(&self.0.list, ctx).map_err(Arc::new))
+            .get_or_init(|| ElementSet::try_new(self.list(), ctx).map_err(Arc::new))
             .as_ref()
             .map_err(|err| Arc::clone(err).into())
     }
 
     /// The dtype of the list that every row holds.
     fn list_dtype(&self) -> &DType {
-        self.0.list.dtype()
+        self.list().dtype()
     }
 
     /// The dtype of the list's elements.
@@ -292,20 +309,20 @@ impl PreparedSetData {
 impl Debug for PreparedSetData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedSetData")
-            .field("list", &self.0.list)
+            .field("list", self.list())
             .finish_non_exhaustive()
     }
 }
 
 impl Display for PreparedSetData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0.list)
+        write!(f, "{}", self.list())
     }
 }
 
 impl PartialEq for PreparedSetData {
     fn eq(&self, other: &Self) -> bool {
-        self.0.list == other.0.list
+        self.list() == other.list()
     }
 }
 
@@ -313,7 +330,7 @@ impl Eq for PreparedSetData {}
 
 impl Hash for PreparedSetData {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.list.hash(state);
+        self.list().hash(state);
     }
 }
 
