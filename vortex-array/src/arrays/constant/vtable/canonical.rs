@@ -308,15 +308,24 @@ fn constant_canonical_list_array(
 /// The elements of a list scalar as an array, one row per element; empty for a null list.
 pub(crate) fn list_scalar_elements(list: &ListScalar, allocator: &BufferAllocatorRef) -> ArrayRef {
     let element_dtype = list.element_dtype();
-    let Some(elements) = list.elements() else {
+    let Some(elements) = list.element_values() else {
         return Canonical::empty(element_dtype).into_array();
     };
 
     let mut builder = builder_with_capacity_in(element_dtype, elements.len(), allocator);
-    for element in &elements {
-        builder
-            .append_scalar(element)
-            .vortex_expect("list element scalar was invalid");
+    for element in elements {
+        match element {
+            Some(element) => {
+                builder
+                    .append_scalar(&unsafe {
+                        Scalar::new_unchecked(element_dtype.clone(), Some(element.clone()))
+                    })
+                    .vortex_expect("list element scalar was invalid");
+            }
+            None => {
+                builder.append_null();
+            }
+        }
     }
     builder.finish()
 }

@@ -52,6 +52,9 @@ use crate::validity::Validity;
 const BITMAP_BITS_PER_ELEMENT: u128 = 64;
 /// A span this narrow is probed through a bitmap whatever the size of the set.
 const BITMAP_MIN_BITS: u128 = 1 << 12;
+/// The bits per element of the filter of view heads. With one bit per head, about one in eight
+/// needles that are not elements passes the filter of a large set.
+const HEAD_FILTER_BITS_PER_ELEMENT: usize = 8;
 
 /// Probes the non-null elements of a set for membership.
 ///
@@ -200,41 +203,106 @@ impl<T: NativeDecimalType + SetInteger> Probe for DecimalSet<T> {
     }
 }
 
-/// UTF-8 or binary elements, found through a table of their indices hashed by their bytes, so that
-/// no element is copied.
+/// UTF-8 or binary elements, found by their views, so that most needles are decided without a
+/// read of a data buffer or a hash of their bytes.
+///
+/// The first 8 bytes of a view, its head, hold the length of the value and its first 4 bytes,
+/// zero-padded, whether the value is inlined or not. A value of at most 12 bytes is inlined whole,
+/// zero-padded as the compare kernel requires. Thus a needle is probed in three steps, the
+/// cheapest first:
+///
+/// 1. The filter of the elements' heads rejects most non-members with one multiply and one bit.
+/// 2. A short needle is an element exactly when its whole view is the view of a short element.
+/// 3. A long needle is found through a table of the long elements, hashed by their bytes. Its
+///    head is compared before the bytes after the prefix.
 struct BytesSet {
-    elements: VarBinViewArray,
+    heads: HeadFilter,
     hasher: RandomState,
-    table: HashTable<u32>,
+    /// The distinct whole views of the elements of at most 12 bytes.
+    short: HashTable<u128>,
+    /// The elements, for the bytes of the long ones.
+    elements: VarBinViewArray,
+    /// The indices of the distinct long elements, hashed by their bytes.
+    long: HashTable<u32>,
 }
 
 impl BytesSet {
-    /// A table of the elements' indices, hashed by their bytes, holding each distinct value once.
     fn new(elements: VarBinViewArray) -> Self {
         let hasher = RandomState::default();
-        let mut table = HashTable::with_capacity(elements.len());
-        {
-            let views = elements.views();
-            let buffers = data_buffers(&elements);
-            let bytes = |idx: u32| view_bytes(&views[idx as usize], &buffers);
-            for (idx, view) in views.iter().enumerate() {
-                let value = view_bytes(view, &buffers);
-                if let HashTableEntry::Vacant(vacant) = table.entry(
-                    hasher.hash_one(value),
-                    |&other| bytes(other) == value,
-                    |&other| hasher.hash_one(bytes(other)),
+        let views = elements.views();
+        let buffers = data_buffers(&elements);
+
+        let mut heads = HeadFilter::with_capacity(views.len());
+        let mut short = HashTable::new();
+        let mut long = HashTable::new();
+
+        for (idx, view) in views.iter().enumerate() {
+            heads.insert(view_head(view));
+
+            if view.is_inlined() {
+                let whole = view.as_u128();
+                if let HashTableEntry::Vacant(vacant) = short.entry(
+                    hasher.hash_one(whole),
+                    |&other| other == whole,
+                    |&other| hasher.hash_one(other),
                 ) {
-                    vacant.insert(
-                        u32::try_from(idx).vortex_expect("a list holds fewer than 2^32 elements"),
-                    );
+                    vacant.insert(whole);
                 }
+                continue;
+            }
+
+            let value = view.bytes(&buffers);
+            let bytes = |other: u32| views[other as usize].bytes(&buffers);
+            if let HashTableEntry::Vacant(vacant) = long.entry(
+                hasher.hash_one(value),
+                |&other| bytes(other) == value,
+                |&other| hasher.hash_one(bytes(other)),
+            ) {
+                vacant.insert(
+                    u32::try_from(idx).vortex_expect("a list holds fewer than 2^32 elements"),
+                );
             }
         }
+
         Self {
-            elements,
+            heads,
             hasher,
-            table,
+            short,
+            elements,
+            long,
         }
+    }
+
+    /// Whether `view`, which points into `buffers`, is the view of an element.
+    #[inline]
+    fn contains_view(
+        &self,
+        view: &BinaryView,
+        buffers: &[&[u8]],
+        element_views: &[BinaryView],
+        element_buffers: &[&[u8]],
+    ) -> bool {
+        let head = view_head(view);
+        if !self.heads.may_contain(head) {
+            return false;
+        }
+
+        if view.is_inlined() {
+            let whole = view.as_u128();
+            return self
+                .short
+                .find(self.hasher.hash_one(whole), |&other| other == whole)
+                .is_some();
+        }
+
+        // The heads are equal, so the bytes can differ only after the 4-byte prefix.
+        let value = view.bytes(buffers);
+        self.long
+            .find(self.hasher.hash_one(value), |&idx| {
+                let element = &element_views[idx as usize];
+                view_head(element) == head && element.bytes(element_buffers)[4..] == value[4..]
+            })
+            .is_some()
     }
 }
 
@@ -250,18 +318,62 @@ impl Probe for BytesSet {
         let buffers = data_buffers(&array);
         let bits = collect_bits(
             array.views(),
-            |view: BinaryView| {
-                let value = view_bytes(&view, &buffers);
-                self.table
-                    .find(self.hasher.hash_one(value), |&idx| {
-                        view_bytes(&element_views[idx as usize], &element_buffers) == value
-                    })
-                    .is_some()
-            },
+            |view: BinaryView| self.contains_view(&view, &buffers, element_views, &element_buffers),
             ctx.allocator(),
         );
         Ok((bits, array.validity()?))
     }
+}
+
+/// A filter of view heads with no false negatives: an inserted head always tests as present.
+///
+/// It holds about [`HEAD_FILTER_BITS_PER_ELEMENT`] bits per element, and tests one bit, chosen by
+/// a multiplicative hash of the head.
+struct HeadFilter {
+    words: Box<[u64]>,
+    /// The shift that takes the top bits of the hash as the index of a bit.
+    shift: u32,
+}
+
+impl HeadFilter {
+    fn with_capacity(elements: usize) -> Self {
+        let bits = (elements * HEAD_FILTER_BITS_PER_ELEMENT)
+            .next_power_of_two()
+            .max(64);
+        Self {
+            words: vec![0; bits / 64].into_boxed_slice(),
+            shift: u64::BITS - bits.trailing_zeros(),
+        }
+    }
+
+    #[inline]
+    fn bit(&self, head: u64) -> usize {
+        // Fibonacci hashing: the top bits of the product depend on every bit of the head.
+        let hash = head.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        usize::try_from(hash >> self.shift).vortex_expect("a bit index fits a usize")
+    }
+
+    fn insert(&mut self, head: u64) {
+        let bit = self.bit(head);
+        self.words[bit / 64] |= 1 << (bit % 64);
+    }
+
+    #[inline]
+    fn may_contain(&self, head: u64) -> bool {
+        let bit = self.bit(head);
+        self.words[bit / 64] & (1 << (bit % 64)) != 0
+    }
+}
+
+/// The head of a view: the `u32` length of its value and the first 4 bytes of the value,
+/// zero-padded for a value shorter than 4 bytes.
+#[inline]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the head is the low 8 bytes"
+)]
+fn view_head(view: &BinaryView) -> u64 {
+    view.as_u128() as u64
 }
 
 /// Recursively canonical elements, indexed in sorted order with duplicates removed.
@@ -323,16 +435,6 @@ fn data_buffers(array: &VarBinViewArray) -> Vec<&[u8]> {
     (0..array.data_buffers().len())
         .map(|idx| array.buffer(idx).as_slice())
         .collect()
-}
-
-/// The bytes a view points at, inlined in the view itself or out of line in one of `buffers`.
-fn view_bytes<'a>(view: &'a BinaryView, buffers: &[&'a [u8]]) -> &'a [u8] {
-    if view.is_inlined() {
-        view.as_inlined().value()
-    } else {
-        let reference = view.as_view();
-        &buffers[reference.buffer_index as usize][reference.as_range()]
-    }
 }
 
 /// The integer type with a float's bit pattern, or the type itself for an integer.
