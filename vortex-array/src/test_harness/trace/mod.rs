@@ -32,6 +32,11 @@
 //!   building a canonical intermediate.
 //! - A chunked array should drive the builder path rather than the stack path.
 //!
+//! [`TraceDisplay`] renders the event log as written. [`TraceDisplay::derivation`] renders the
+//! same events as a derivation of the reduction semantics: one `-> rhs  [rule]` line per step,
+//! with the child steps, nested passes, and declined attempts that justify a step indented
+//! beneath it. See [`derivation`] for the format.
+//!
 //! Two resolutions are available:
 //!
 //! - [`TraceResolution::ExecutedOnly`] (default) — only events that actually fired (rule
@@ -75,6 +80,10 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 
 use crate::ArrayRef;
+
+mod derivation;
+
+pub use derivation::DerivationDisplay;
 
 /// Controls how much rule and kernel resolution detail is captured.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -152,6 +161,11 @@ impl Display for TraceDisplay {
 }
 
 impl TraceDisplay {
+    /// Render this trace as a derivation of the reduction semantics; see [`derivation`].
+    pub fn derivation(&self) -> DerivationDisplay<'_> {
+        DerivationDisplay { trace: self }
+    }
+
     fn hidden_events(&self) -> Vec<bool> {
         let mut hidden = vec![false; self.events.len()];
         if self.options.resolution != TraceResolution::ExecutedOnly {
