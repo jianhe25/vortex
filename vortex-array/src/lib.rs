@@ -117,6 +117,7 @@ mod columnar;
 pub mod compute;
 pub mod display;
 pub mod dtype;
+pub mod exec_profile;
 mod executor;
 pub mod expr;
 mod expression;

@@ -38,15 +38,19 @@ use crate::array::ArrayId;
 use crate::builders::ArrayBuilder;
 use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
+use crate::exec_profile::prof_count;
+use crate::exec_profile::prof_time;
+use crate::exec_profile::prof_time_branch;
 use crate::matcher::Matcher;
 use crate::memory::BufferAllocatorRef;
 use crate::memory::MemorySessionExt;
-use crate::optimizer::ArrayOptimizer;
+use crate::optimizer::kernels::ArrayKernels;
 use crate::optimizer::kernels::ArrayKernelsExt;
 use crate::optimizer::kernels::ParentExecutionKernels;
+use crate::optimizer::kernels::ParentExecutionParents;
 use crate::optimizer::kernels::execute_parent_key;
+use crate::optimizer::optimize_with_kernels;
 use crate::stats::ArrayStats;
-use crate::stats::StatsSet;
 use crate::trace_op;
 
 /// Returns the maximum number of iterations to attempt when executing an array before giving up and returning
@@ -143,13 +147,14 @@ impl ArrayRef {
     ///     - yes -> skip Step 2a / 2b
     ///     - no  -> try parent kernels
     ///
-    ///   Step 2a: if stack.top exists:
+    ///   Step 2a: if stack.top exists and parent's encoding has any registered kernel:
     ///               parent = stack.top.parent_array
     ///               child = current_array
     ///               kernels[(parent.encoding_id(), child.encoding_id())]
     ///                 .try_execute_parent(child, parent, stack.top.slot_idx)
     ///
-    ///   Step 2b: for child in current_array.children():
+    ///   Step 2b: if current_array's encoding has any registered kernel,
+    ///            for child in current_array.children():
     ///               parent = current_array
     ///               kernels[(parent.encoding_id(), child.encoding_id())]
     ///                 .try_execute_parent(child, parent, child.slot_idx)
@@ -161,22 +166,45 @@ impl ArrayRef {
     ///     Done                 -> finish current_builder if present, else use returned array
     /// ```
     ///
+    /// Both steps first consult the set of parent encodings that own execute-parent kernels
+    /// (snapshotted in the [`ExecutionCtx`]), so a pure compression encoding never probes the
+    /// registry for each of its children.
+    ///
     /// Step 2a and Step 2b are skipped while `current_builder` is active. `AppendChild`
     /// partially consumes `current_array`: some slots already live in the builder, so a
     /// parent rewrite would observe inconsistent state and could discard accumulated builder
     /// data.
-    #[allow(clippy::cognitive_complexity)]
     pub fn execute_until<M: Matcher>(self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+        #[cfg(feature = "exec-profile")]
+        {
+            let depth = crate::exec_profile::enter_call();
+            let nested_before = crate::exec_profile::nested_ns();
+            let start = std::time::Instant::now();
+            let result = self.execute_until_inner::<M>(ctx);
+            let elapsed = crate::exec_profile::elapsed_ns(start);
+            let nested_during = crate::exec_profile::nested_ns() - nested_before;
+            crate::exec_profile::exit_call(depth, elapsed, nested_during);
+            result
+        }
+        #[cfg(not(feature = "exec-profile"))]
+        self.execute_until_inner::<M>(ctx)
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn execute_until_inner<M: Matcher>(self, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
         let mut current_array = self;
         let mut current_builder: Option<Box<dyn ArrayBuilder>> = None;
         let mut stack: Vec<StackFrame> = Vec::new();
         let execute_parent_kernels = Arc::clone(&ctx.execute_parent_kernels);
         let kernels = execute_parent_kernels.as_ref();
+        let execute_parent_parents = Arc::clone(&ctx.execute_parent_parents);
+        let parents = execute_parent_parents.as_ref();
         let max_iterations = max_iterations();
 
         trace_op!(record_execute_until_start::<M>(&current_array));
 
         for _iteration in 0..max_iterations {
+            prof_count!(iterations);
             trace_op!(record_execute_until_iteration(
                 _iteration,
                 &current_array,
@@ -190,8 +218,11 @@ impl ArrayRef {
                 .last()
                 .map_or(M::matches as DonePredicate, |frame| frame.done);
 
-            let done_target = is_done(&current_array);
-            let done_canonical = AnyCanonical::matches(&current_array);
+            let (done_target, done_canonical) = prof_time!(done_check_ns, {
+                let done_target = is_done(&current_array);
+                let done_canonical = AnyCanonical::matches(&current_array);
+                (done_target, done_canonical)
+            });
             trace_op!(record_execute_until_done_check(done_target, done_canonical));
 
             if done_target || done_canonical {
@@ -206,7 +237,9 @@ impl ArrayRef {
                     }
                     Some(frame) => {
                         let _slot_idx = frame.slot_idx;
-                        (current_array, current_builder) = pop_frame(frame, current_array)?;
+                        prof_count!(pops);
+                        (current_array, current_builder) =
+                            prof_time!(pop_ns, pop_frame(frame, current_array))?;
                         trace_op!(record_execute_until_pop_frame(_slot_idx, &current_array));
                         continue;
                     }
@@ -225,7 +258,9 @@ impl ArrayRef {
             // would be lost when we restore frame.parent_builder.
             if current_builder.is_none()
                 && let Some(frame) = stack.last()
+                && parents.contains_key(&frame.parent_array.encoding_id())
                 && let Some(result) = {
+                    prof_count!(stack_ep_attempts);
                     execute_parent_for_child(
                         "stack_execute_parent",
                         &frame.parent_array,
@@ -236,8 +271,11 @@ impl ArrayRef {
                     )?
                 }
             {
+                prof_count!(stack_ep_hits);
                 let frame = stack.pop().vortex_expect("just peeked");
-                let optimized = result.optimize_ctx(ctx.session())?;
+                prof_count!(optimize_calls);
+                let optimized =
+                    prof_time!(optimize_ns, optimize_with_kernels(&result, &ctx.kernels))?;
                 trace_op!(record_execute_optimized(&result, &optimized));
                 current_array = optimized;
                 current_builder = frame.parent_builder;
@@ -252,9 +290,16 @@ impl ArrayRef {
 
             // Step 2b: execute_parent against current_array's own children.
             if current_builder.is_none()
-                && let Some(rewritten) = try_execute_parent(&current_array, kernels, ctx)?
+                && parents.contains_key(&current_array.encoding_id())
+                && let Some(rewritten) = {
+                    prof_count!(child_ep_attempts);
+                    try_execute_parent(&current_array, kernels, ctx)?
+                }
             {
-                let optimized = rewritten.optimize_ctx(ctx.session())?;
+                prof_count!(child_ep_hits);
+                prof_count!(optimize_calls);
+                let optimized =
+                    prof_time!(optimize_ns, optimize_with_kernels(&rewritten, &ctx.kernels))?;
                 trace_op!(record_execute_optimized(&rewritten, &optimized));
                 current_array = optimized;
                 continue;
@@ -266,16 +311,33 @@ impl ArrayRef {
                 ));
             }
 
-            let expected_len = current_array.len();
-            let expected_dtype = current_array.dtype().clone();
-            let stats = current_array.statistics().to_array_stats();
-            let encoding_id = current_array.encoding_id();
+            let (expected_len, expected_dtype, stats, encoding_id) = prof_time!(pre_execute_ns, {
+                (
+                    current_array.len(),
+                    // Only the debug postcondition compares dtypes, so skip the clone otherwise.
+                    cfg!(debug_assertions).then(|| current_array.dtype().clone()),
+                    current_array.statistics().to_array_stats(),
+                    current_array.encoding_id(),
+                )
+            });
             trace_op!(record_execute_encoding(&current_array));
+            #[cfg(feature = "exec-profile")]
+            let (execute_start, nested_before) =
+                (std::time::Instant::now(), crate::exec_profile::nested_ns());
             let result = current_array.execute_encoding_unchecked(ctx)?;
+            #[cfg(feature = "exec-profile")]
+            let execute_ns = crate::exec_profile::elapsed_ns(execute_start)
+                .saturating_sub(crate::exec_profile::nested_ns() - nested_before);
             let (array, step) = result.into_parts();
             match step {
                 ExecutionStep::ExecuteSlot(i, done) => {
-                    let (parent, child) = unsafe { array.take_slot_unchecked(i) }?;
+                    prof_count!(execute_slot_steps);
+                    prof_count!(execute_slot_ns, execute_ns);
+                    #[cfg(feature = "exec-profile")]
+                    let shared = Arc::strong_count(array.inner_arc()) > 1;
+                    prof_count!(take_slot_shared, shared as u64);
+                    let (parent, child) =
+                        prof_time!(take_slot_ns, unsafe { array.take_slot_unchecked(i) })?;
 
                     trace_op!(record_execute_slot(i, &parent, &child));
                     stack.push(StackFrame {
@@ -288,41 +350,58 @@ impl ArrayRef {
                     });
                     current_array = child;
                     current_builder = None;
+                    #[cfg(feature = "exec-profile")]
+                    crate::exec_profile::with_mut(|p| {
+                        p.max_depth = p.max_depth.max(stack.len() as u64)
+                    });
                 }
                 ExecutionStep::AppendChild(i) => {
+                    prof_count!(append_child_steps);
+                    prof_count!(append_child_execute_ns, execute_ns);
                     if current_builder.is_none() {
                         trace_op!(record_builder_start(&array));
-                        current_builder = Some(builder_with_capacity_in(
-                            array.dtype(),
-                            array.len(),
-                            ctx.allocator(),
+                        current_builder = Some(prof_time!(
+                            builder_create_ns,
+                            builder_with_capacity_in(array.dtype(), array.len(), ctx.allocator())
                         ));
                     }
-                    let (parent, child) = unsafe { array.take_slot_unchecked(i) }?;
+                    #[cfg(feature = "exec-profile")]
+                    let shared = Arc::strong_count(array.inner_arc()) > 1;
+                    prof_count!(take_slot_shared, shared as u64);
+                    let (parent, child) =
+                        prof_time!(take_slot_ns, unsafe { array.take_slot_unchecked(i) })?;
 
                     trace_op!(record_append_child(i, &parent, &child));
                     trace_op!(record_builder_append(&child));
 
                     // TODO(joe)[7674]: replace with a builder kernel registry so we don't
                     // need to go through the VTable append_to_builder indirection.
-                    child.append_to_builder(
-                        current_builder
-                            .as_deref_mut()
-                            .vortex_expect("builder must exist"),
-                        ctx,
+                    prof_time!(
+                        builder_append_ns,
+                        child.append_to_builder(
+                            current_builder
+                                .as_deref_mut()
+                                .vortex_expect("builder must exist"),
+                            ctx,
+                        )
                     )?;
                     current_array = parent;
                 }
                 ExecutionStep::Done => {
+                    prof_count!(done_steps);
+                    prof_count!(done_execute_ns, execute_ns);
                     let had_builder = current_builder.is_some();
                     trace_op!(record_execute_done(&array));
-                    (current_array, current_builder) = finalize_done(
-                        array,
-                        current_builder,
-                        expected_len,
-                        expected_dtype,
-                        stats,
-                        encoding_id,
+                    (current_array, current_builder) = prof_time!(
+                        finalize_ns,
+                        finalize_done(
+                            array,
+                            current_builder,
+                            expected_len,
+                            expected_dtype,
+                            stats,
+                            encoding_id,
+                        )
                     )?;
                     if had_builder {
                         trace_op!(record_builder_finish(&current_array));
@@ -353,7 +432,11 @@ pub struct ExecutionCtx {
     session: VortexSession,
     // OnceLock avoids cloning the session allocator when a context does not allocate.
     allocator: OnceLock<BufferAllocatorRef>,
+    /// The session's kernel registry, held here so rewrites between execution steps skip the
+    /// session variable lookup.
+    kernels: ArrayKernels,
     execute_parent_kernels: Arc<ParentExecutionKernels>,
+    execute_parent_parents: Arc<ParentExecutionParents>,
     #[cfg(debug_assertions)]
     id: usize,
     #[cfg(debug_assertions)]
@@ -367,11 +450,17 @@ impl ExecutionCtx {
     /// registered after this context is created are not visible to it; create a new
     /// [`ExecutionCtx`] after registration to use newly registered kernels.
     pub fn new(session: VortexSession) -> Self {
-        let execute_parent_kernels = session.kernels().execute_parent_snapshot();
+        let kernels_guard = session.kernels();
+        let execute_parent_kernels = kernels_guard.execute_parent_snapshot();
+        let execute_parent_parents = kernels_guard.execute_parent_parents_snapshot();
+        let kernels = kernels_guard.kernels().clone();
+        drop(kernels_guard);
         Self {
             session,
             allocator: OnceLock::new(),
+            kernels,
             execute_parent_kernels,
+            execute_parent_parents,
             #[cfg(debug_assertions)]
             id: {
                 static EXEC_CTX_ID: AtomicUsize = AtomicUsize::new(0);
@@ -492,17 +581,22 @@ impl Executable for ArrayRef {
 
         let execute_parent_kernels = Arc::clone(&ctx.execute_parent_kernels);
         let kernels = execute_parent_kernels.as_ref();
+        let has_parent_kernels = ctx
+            .execute_parent_parents
+            .contains_key(&array.encoding_id());
 
         for (slot_idx, slot) in array.slots().iter().enumerate() {
             let Some(child) = slot else { continue };
-            if let Some(executed_parent) = execute_parent_for_child(
-                "single_step_execute_parent",
-                &array,
-                child,
-                slot_idx,
-                kernels,
-                ctx,
-            )? {
+            if has_parent_kernels
+                && let Some(executed_parent) = execute_parent_for_child(
+                    "single_step_execute_parent",
+                    &array,
+                    child,
+                    slot_idx,
+                    kernels,
+                    ctx,
+                )?
+            {
                 ctx.log(format_args!(
                     "execute_parent: slot[{}]({}) rewrote {} -> {}",
                     slot_idx,
@@ -583,6 +677,9 @@ fn pop_frame(
         frame.original_len,
         "child len changed during execution"
     );
+    #[cfg(feature = "exec-profile")]
+    let shared = Arc::strong_count(frame.parent_array.inner_arc()) > 1;
+    prof_count!(put_slot_shared, shared as u64);
     let parent_array = unsafe { frame.parent_array.put_slot_unchecked(frame.slot_idx, child) }?;
     Ok((parent_array, frame.parent_builder))
 }
@@ -591,7 +688,7 @@ fn finalize_done(
     result: ArrayRef,
     mut builder: Option<Box<dyn ArrayBuilder>>,
     expected_len: usize,
-    expected_dtype: DType,
+    expected_dtype: Option<DType>,
     stats: ArrayStats,
     encoding_id: ArrayId,
 ) -> VortexResult<(ArrayRef, Option<Box<dyn ArrayBuilder>>)> {
@@ -607,16 +704,16 @@ fn finalize_done(
             "Result length mismatch for {:?}",
             encoding_id
         );
-        vortex_ensure!(
-            output.dtype() == &expected_dtype,
-            "Executed canonical dtype mismatch for {:?}",
-            encoding_id
-        );
+        if let Some(expected_dtype) = expected_dtype {
+            vortex_ensure!(
+                output.dtype() == &expected_dtype,
+                "Executed canonical dtype mismatch for {:?}",
+                encoding_id
+            );
+        }
     }
 
-    output
-        .statistics()
-        .set_iter(StatsSet::from(stats).into_iter());
+    output.statistics().transfer_from(&stats);
     Ok((output, None))
 }
 
@@ -628,11 +725,22 @@ fn execute_parent_for_child(
     kernels: &ParentExecutionKernels,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<ArrayRef>> {
-    let key = execute_parent_key(parent.encoding_id(), child.encoding_id());
-    if let Some(plugins) = kernels.get(&key) {
+    prof_count!(ep_lookups);
+    let plugins = prof_time!(ep_lookup_ns, {
+        let key = execute_parent_key(parent.encoding_id(), child.encoding_id());
+        kernels.get(&key)
+    });
+    if let Some(plugins) = plugins {
+        prof_count!(ep_lookup_found);
         #[allow(clippy::unused_enumerate_index)]
         for (_plugin_idx, plugin) in plugins.as_ref().iter().enumerate() {
-            if let Some(result) = plugin.execute_parent(child, parent, slot_idx, ctx)? {
+            let outcome = prof_time_branch!(
+                plugin.execute_parent(child, parent, slot_idx, ctx)?,
+                |r| r.is_some(),
+                (ep_applied_ns, ep_applied),
+                (ep_declined_ns, ep_declined)
+            );
+            if let Some(result) = outcome {
                 if cfg!(debug_assertions) {
                     vortex_ensure!(
                         result.len() == parent.len(),

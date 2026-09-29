@@ -1,0 +1,40 @@
+[package]
+name = "execute-overhead-bench"
+description = "Measures iterative executor overhead on real TPC-H chunk encodings"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+futures = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["full"] }
+tpchgen = { workspace = true }
+tpchgen-arrow = { workspace = true }
+vortex = { workspace = true, features = ["tokio"] }
+vortex-array = { workspace = true }
+vortex-arrow = { workspace = true }
+
+[features]
+# Per-phase timers inside `execute_until`.
+profile = ["vortex-array/exec-profile"]
+# Step-by-step execution traces via the vortex-array test harness.
+trace = ["vortex-array/_test-harness"]
+
+[[bin]]
+name = "execute-overhead-bench"
+test = false
+
+[lints]
+workspace = true

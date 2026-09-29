@@ -94,6 +94,22 @@ impl StatsSetRef<'_> {
         }
     }
 
+    /// Copy every statistic of `stats` into this set, overwriting existing entries, without
+    /// cloning the source set. A no-op when both refer to the same stats or the source is empty.
+    pub(crate) fn transfer_from(&self, stats: &ArrayStats) {
+        if Arc::ptr_eq(&self.array_stats.inner, &stats.inner) {
+            return;
+        }
+        let source = stats.inner.read();
+        if source.is_empty() {
+            return;
+        }
+        let mut guard = self.array_stats.inner.write();
+        for (stat, value) in source.iter() {
+            guard.set(*stat, value.clone());
+        }
+    }
+
     pub fn inherit_from(&self, stats: StatsSetRef<'_>) {
         // Only inherit if the underlying stats are different
         if !Arc::ptr_eq(&self.array_stats.inner, &stats.array_stats.inner) {

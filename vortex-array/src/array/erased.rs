@@ -81,6 +81,12 @@ pub struct ArrayRef(Arc<ArrayInner<dyn DynArrayData>>);
 
 impl ArrayRef {
     /// Create from an `Arc<ArrayInner<dyn DynArrayData>>`.
+    /// The reference-counted allocation behind this handle, for executor profiling.
+    #[cfg(feature = "exec-profile")]
+    pub(crate) fn inner_arc(&self) -> &Arc<ArrayInner<dyn DynArrayData>> {
+        &self.0
+    }
+
     pub(crate) fn from_inner<D: DynArrayData>(inner: Arc<ArrayInner<D>>) -> Self {
         Self(inner)
     }

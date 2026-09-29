@@ -79,6 +79,8 @@ vortex-utils = { workspace = true, features = ["dyn-traits"] }
 [features]
 arbitrary = ["dep:arbitrary", "dep:primitive-types"]
 canonical_counter = []
+# Thread-local per-phase timers and counters for the iterative executor.
+exec-profile = []
 cudarc = ["dep:cudarc"]
 table-display = ["dep:tabled"]
 _test-harness = ["dep:goldenfile", "dep:rstest", "dep:rstest_reuse"]

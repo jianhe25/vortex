@@ -1235,48 +1235,46 @@ pub struct AnyCanonical;
 impl Matcher for AnyCanonical {
     type Match<'a> = CanonicalView<'a>;
 
+    /// Each logical [`DType`] has exactly one canonical encoding, and every canonical encoding
+    /// validates that its dtype is of the matching kind, so one downcast decides the match
+    /// instead of trying all twelve canonical encodings in turn.
     #[inline]
     fn matches(array: &ArrayRef) -> bool {
-        array.is::<Null>()
-            || array.is::<Bool>()
-            || array.is::<Primitive>()
-            || array.is::<Decimal>()
-            || array.is::<Struct>()
-            || array.is::<Union>()
-            || array.is::<ListView>()
-            || array.is::<Map>()
-            || array.is::<FixedSizeList>()
-            || array.is::<VarBinView>()
-            || array.is::<Variant>()
-            || array.is::<Extension>()
+        match array.dtype() {
+            DType::Null => array.is::<Null>(),
+            DType::Bool(_) => array.is::<Bool>(),
+            DType::Primitive(..) => array.is::<Primitive>(),
+            DType::Decimal(..) => array.is::<Decimal>(),
+            DType::Utf8(_) | DType::Binary(_) => array.is::<VarBinView>(),
+            DType::List(..) => array.is::<ListView>(),
+            DType::FixedSizeList(..) => array.is::<FixedSizeList>(),
+            DType::Map(..) => array.is::<Map>(),
+            DType::Struct(..) => array.is::<Struct>(),
+            DType::Union(..) => array.is::<Union>(),
+            DType::Variant(_) => array.is::<Variant>(),
+            DType::Extension(_) => array.is::<Extension>(),
+        }
     }
 
     #[inline]
     fn try_match(array: &ArrayRef) -> Option<Self::Match<'_>> {
-        if let Some(a) = array.as_opt::<Null>() {
-            Some(CanonicalView::Null(a))
-        } else if let Some(a) = array.as_opt::<Bool>() {
-            Some(CanonicalView::Bool(a))
-        } else if let Some(a) = array.as_opt::<Primitive>() {
-            Some(CanonicalView::Primitive(a))
-        } else if let Some(a) = array.as_opt::<Decimal>() {
-            Some(CanonicalView::Decimal(a))
-        } else if let Some(a) = array.as_opt::<Struct>() {
-            Some(CanonicalView::Struct(a))
-        } else if let Some(a) = array.as_opt::<Union>() {
-            Some(CanonicalView::Union(a))
-        } else if let Some(a) = array.as_opt::<ListView>() {
-            Some(CanonicalView::List(a))
-        } else if let Some(a) = array.as_opt::<Map>() {
-            Some(CanonicalView::Map(a))
-        } else if let Some(a) = array.as_opt::<FixedSizeList>() {
-            Some(CanonicalView::FixedSizeList(a))
-        } else if let Some(a) = array.as_opt::<VarBinView>() {
-            Some(CanonicalView::VarBinView(a))
-        } else if let Some(a) = array.as_opt::<Variant>() {
-            Some(CanonicalView::Variant(a))
-        } else {
-            array.as_opt::<Extension>().map(CanonicalView::Extension)
+        match array.dtype() {
+            DType::Null => array.as_opt::<Null>().map(CanonicalView::Null),
+            DType::Bool(_) => array.as_opt::<Bool>().map(CanonicalView::Bool),
+            DType::Primitive(..) => array.as_opt::<Primitive>().map(CanonicalView::Primitive),
+            DType::Decimal(..) => array.as_opt::<Decimal>().map(CanonicalView::Decimal),
+            DType::Utf8(_) | DType::Binary(_) => {
+                array.as_opt::<VarBinView>().map(CanonicalView::VarBinView)
+            }
+            DType::List(..) => array.as_opt::<ListView>().map(CanonicalView::List),
+            DType::FixedSizeList(..) => array
+                .as_opt::<FixedSizeList>()
+                .map(CanonicalView::FixedSizeList),
+            DType::Map(..) => array.as_opt::<Map>().map(CanonicalView::Map),
+            DType::Struct(..) => array.as_opt::<Struct>().map(CanonicalView::Struct),
+            DType::Union(..) => array.as_opt::<Union>().map(CanonicalView::Union),
+            DType::Variant(_) => array.as_opt::<Variant>().map(CanonicalView::Variant),
+            DType::Extension(_) => array.as_opt::<Extension>().map(CanonicalView::Extension),
         }
     }
 }
