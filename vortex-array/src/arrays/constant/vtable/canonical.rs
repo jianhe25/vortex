@@ -7,7 +7,6 @@ use itertools::Itertools;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferAllocatorRef;
-use vortex_buffer::BufferMut;
 use vortex_buffer::BufferString;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::buffer;
@@ -35,8 +34,6 @@ use crate::arrays::UnionArray;
 use crate::arrays::VarBinViewArray;
 use crate::arrays::VariantArray;
 use crate::arrays::varbinview::BinaryView;
-use crate::builders::ArrayBuilder;
-use crate::builders::VarBinViewBuilder;
 use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
 use crate::dtype::DecimalType;
@@ -48,7 +45,6 @@ use crate::match_smallest_list_offset_type;
 use crate::scalar::DecimalValue;
 use crate::scalar::ListScalar;
 use crate::scalar::Scalar;
-use crate::scalar::ScalarValue;
 use crate::validity::Validity;
 
 /// Shared implementation for both `canonicalize` and `execute` methods.
@@ -310,65 +306,19 @@ fn constant_canonical_list_array(
 }
 
 /// The elements of a list scalar as an array, one row per element; empty for a null list.
-///
-/// Primitive and byte elements are written straight from their values rather than through a scalar
-/// each.
 pub(crate) fn list_scalar_elements(list: &ListScalar, allocator: &BufferAllocatorRef) -> ArrayRef {
     let element_dtype = list.element_dtype();
-    let Some(values) = list.element_values() else {
+    let Some(elements) = list.elements() else {
         return Canonical::empty(element_dtype).into_array();
     };
 
-    match element_dtype {
-        DType::Primitive(ptype, nullability) => match_each_native_ptype!(ptype, |T| {
-            let mut buffer = BufferMut::<T>::with_capacity_in(values.len(), allocator.clone());
-            buffer.extend(values.iter().map(|value| {
-                value.as_ref().map_or_else(T::default, |value| {
-                    value
-                        .as_primitive()
-                        .cast::<T>()
-                        .vortex_expect("list element of the list's element ptype")
-                })
-            }));
-            PrimitiveArray::new(buffer.freeze(), element_validity(values, *nullability))
-                .into_array()
-        }),
-        DType::Utf8(_) | DType::Binary(_) => {
-            let mut builder = VarBinViewBuilder::with_capacity_in(
-                element_dtype.clone(),
-                values.len(),
-                allocator.clone(),
-            );
-            for value in values {
-                match value {
-                    None => builder.append_null(),
-                    Some(ScalarValue::Utf8(value)) => builder.append_value(value.as_bytes()),
-                    Some(value) => builder.append_value(value.as_binary().as_slice()),
-                }
-            }
-            builder.finish()
-        }
-        _ => {
-            let mut builder = builder_with_capacity_in(element_dtype, values.len(), allocator);
-            for idx in 0..values.len() {
-                builder
-                    .append_scalar(&list.element(idx).vortex_expect("index within the list"))
-                    .vortex_expect("list element scalar was invalid");
-            }
-            builder.finish()
-        }
+    let mut builder = builder_with_capacity_in(element_dtype, elements.len(), allocator);
+    for element in &elements {
+        builder
+            .append_scalar(element)
+            .vortex_expect("list element scalar was invalid");
     }
-}
-
-/// The validity of a list's elements, a null element being a `None` value.
-fn element_validity(values: &[Option<ScalarValue>], nullability: Nullability) -> Validity {
-    match nullability {
-        Nullability::NonNullable => Validity::NonNullable,
-        Nullability::Nullable if values.iter().all(Option::is_some) => Validity::AllValid,
-        Nullability::Nullable => {
-            Validity::from(BitBuffer::from_iter(values.iter().map(Option::is_some)))
-        }
-    }
+    builder.finish()
 }
 
 /// Creates a [`FixedSizeListArray`] whose every row holds the same list.

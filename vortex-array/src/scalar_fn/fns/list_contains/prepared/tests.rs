@@ -371,3 +371,44 @@ fn test_constant_row_needle_probes_one_row() -> VortexResult<()> {
     );
     Ok(())
 }
+
+#[rstest]
+#[case::default(ListContainsOptions::default(), [Some(true), Some(false), None])]
+#[case::sql(ListContainsOptions { sql_null_semantics: true }, [Some(true), None, None])]
+fn test_result_from_bits_applies_null_semantics(
+    #[case] options: ListContainsOptions,
+    #[case] expected: [Option<bool>; 3],
+) -> VortexResult<()> {
+    // Against `{2, null}`: a match, a non-match, and a null needle whose bit has no effect.
+    let mut ctx = array_session().create_execution_ctx();
+    let set = prepare(&set_with_null(), &mut ctx)?;
+    let needle_dtype = DType::Primitive(PType::I32, Nullability::Nullable);
+    let bits = BitBuffer::from_iter([true, false, true]);
+    let validity = Validity::from_iter([true, true, false]);
+
+    let result = set.result_from_bits(bits, validity, &needle_dtype, &options)?;
+    assert_arrays_eq!(result, BoolArray::from_iter(expected), &mut ctx);
+    Ok(())
+}
+
+#[test]
+fn test_result_from_bits_rejects_mismatched_needles() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let set = prepare(&set_with_null(), &mut ctx)?;
+    let options = ListContainsOptions::default();
+    let bits = BitBuffer::from_iter([true, false]);
+
+    let short_validity = Validity::from_iter([true]);
+    let needle_dtype = DType::Primitive(PType::I32, Nullability::Nullable);
+    assert!(
+        set.result_from_bits(bits.clone(), short_validity, &needle_dtype, &options)
+            .is_err()
+    );
+
+    let wrong_dtype = DType::Primitive(PType::I64, Nullability::Nullable);
+    assert!(
+        set.result_from_bits(bits, Validity::AllValid, &wrong_dtype, &options)
+            .is_err()
+    );
+    Ok(())
+}

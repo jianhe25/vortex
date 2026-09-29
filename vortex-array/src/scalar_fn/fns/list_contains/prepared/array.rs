@@ -142,54 +142,74 @@ impl PreparedSetData {
     /// a null element gives `null` for a needle that matches no element.
     ///
     /// A constant needle is probed once, and gives a constant result.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the needles do not have the dtype of the list's elements.
     pub fn contains(
         &self,
         needles: &ArrayRef,
         options: &ListContainsOptions,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let element_dtype = self.elements.dtype();
-        if !element_dtype.eq_ignore_nullability(needles.dtype()) {
-            vortex_bail!(
-                "Element type {} of list does not match search value {}",
-                element_dtype,
-                needles.dtype(),
-            );
-        }
-
         if let Some(needle) = needles.as_constant() {
             let result = self.contains_scalar(&needle, options, ctx)?;
             return Ok(ConstantArray::new(result, needles.len()).into_array());
         }
 
+        self.check_needle_dtype(needles.dtype())?;
         let (bits, needle_validity) = self.set.probe.contains(needles, ctx)?;
-        self.finish(bits, needle_validity, needles.dtype(), options)
+        self.result_from_bits(bits, needle_validity, needles.dtype(), options)
     }
 
     /// Whether the constant `needle` is an element of the list, under `options`.
     ///
-    /// The answer is the one [`Self::contains`] gives for each row of a needle with this value. The
-    /// probe gets one row, not a row per needle.
-    fn contains_scalar(
+    /// The answer is the one [`Self::contains`] gives for each row of a needle with this value, for
+    /// example for the fill value of a sparse needle. The probe gets one row.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the needle does not have the dtype of the list's elements.
+    pub fn contains_scalar(
         &self,
         needle: &Scalar,
         options: &ListContainsOptions,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
+        self.check_needle_dtype(needle.dtype())?;
         let needles = ConstantArray::new(needle.clone(), 1).into_array();
         let (bits, needle_validity) = self.set.probe.contains(&needles, ctx)?;
-        self.finish(bits, needle_validity, needle.dtype(), options)?
+        self.result_from_bits(bits, needle_validity, needle.dtype(), options)?
             .execute_scalar(0, ctx)
     }
 
-    /// Makes the result from one membership bit per needle and the validity of the needles.
-    fn finish(
+    /// Makes the result of [`Self::contains`] from one membership bit per needle.
+    ///
+    /// A kernel that finds the matches of its needles without this probe, for example from bounds
+    /// of its own, uses this to apply the null semantics of [`Self::contains`]. A set bit in `bits`
+    /// tells that the needle equals an element. `needle_validity` is the validity of the needles,
+    /// and `needle_dtype` is their dtype. The bit of a null needle has no effect.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `needle_dtype` is not the dtype of the list's elements, or when
+    /// `needle_validity` does not have one row per bit.
+    pub fn result_from_bits(
         &self,
         bits: BitBuffer,
         needle_validity: Validity,
         needle_dtype: &DType,
         options: &ListContainsOptions,
     ) -> VortexResult<ArrayRef> {
+        self.check_needle_dtype(needle_dtype)?;
+        if let Some(len) = needle_validity.maybe_len() {
+            vortex_ensure!(
+                len == bits.len(),
+                "Needle validity has {len} rows, but there are {} membership bits",
+                bits.len()
+            );
+        }
+
         let nullability = options.result_nullability(&self.list_dtype(), needle_dtype);
 
         let validity = if self.set.is_empty && !options.sql_null_semantics {
@@ -202,6 +222,19 @@ impl PreparedSetData {
         };
 
         Ok(BoolArray::new(bits, validity.union_nullability(nullability)).into_array())
+    }
+
+    /// Fails when needles of `needle_dtype` cannot be elements of the list.
+    fn check_needle_dtype(&self, needle_dtype: &DType) -> VortexResult<()> {
+        let element_dtype = self.elements.dtype();
+        if !element_dtype.eq_ignore_nullability(needle_dtype) {
+            vortex_bail!(
+                "Element type {} of list does not match search value {}",
+                element_dtype,
+                needle_dtype,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -236,7 +269,17 @@ impl ArrayEq for PreparedSetData {
 impl Array<PreparedSet> {
     /// Prepares `elements`, the elements of a non-null list with the list nullability
     /// `nullability`, as a set repeated `len` times.
-    pub(crate) fn try_new(
+    ///
+    /// [`ListContains`] prepares a constant list itself. A kernel crate can use this to test its
+    /// [`ListContainsElementKernel`] against a prepared set.
+    ///
+    /// [`ListContains`]: crate::scalar_fn::fns::list_contains::ListContains
+    /// [`ListContainsElementKernel`]: crate::scalar_fn::fns::list_contains::ListContainsElementKernel
+    ///
+    /// # Errors
+    ///
+    /// Fails when the elements cannot be executed into the probe.
+    pub fn try_new(
         elements: ArrayRef,
         nullability: Nullability,
         len: usize,
