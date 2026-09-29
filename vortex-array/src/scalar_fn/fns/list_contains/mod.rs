@@ -44,7 +44,6 @@ use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
 use crate::dtype::Nullability;
-use crate::expr::BoundExpression;
 use crate::expr::Expression;
 use crate::expr::lit;
 use crate::match_each_integer_ptype;
@@ -222,27 +221,24 @@ impl ScalarFnVTable for ListContains {
     }
 
     /// A constant list and a constant needle fold to their constant answer, in expression and
-    /// array trees alike. A [`PreparedSetArray`] list looks a constant needle up at execution.
+    /// array trees alike. Otherwise a literal list becomes a [`PreparedSetLiteral`], so that every
+    /// batch the expression is applied to probes one shared set rather than preparing the list
+    /// again.
     fn reduce<T: ReduceNode>(&self, options: &Self::Options, node: &T) -> VortexResult<Option<T>> {
-        // The needle first: it is rarely constant, and a list is costly to clone.
-        let Some(needle) = node.child(1).as_constant() else {
-            return Ok(None);
-        };
-        let Some(list) = constant_list_node(&node.child(0)) else {
-            return Ok(None);
-        };
-        let result = compute_contains_scalar(&list, &needle, options)?;
-        Ok(Some(node.new_constant(result)))
-    }
+        let list = node.child(0);
 
-    /// A literal list becomes a [`PreparedSetLiteral`], so that every batch the expression is
-    /// applied to probes one shared set rather than preparing the list again.
-    fn simplify(
-        &self,
-        options: &Self::Options,
-        expr: &BoundExpression,
-    ) -> VortexResult<Option<BoundExpression>> {
-        let Some(literal) = expr.child(0).as_scalar() else {
+        // The needle first: it is rarely constant, and a list is costly to clone.
+        if let Some(needle) = node.child(1).as_constant()
+            && let Some(list) = constant_list_node(&list)
+        {
+            let result = compute_contains_scalar(&list, &needle, options)?;
+            return Ok(Some(node.new_constant(result)));
+        }
+
+        // Only an expression tree holds a literal as a scalar function: applied to an array, a
+        // literal is a constant array. So this prepares the list once per expression, and never
+        // once per batch.
+        let Some(literal) = list.scalar_fn() else {
             return Ok(None);
         };
         // A null list has no set, and answers null for every needle at execution.
@@ -254,11 +250,11 @@ impl ScalarFnVTable for ListContains {
         }
 
         // The set shares the literal, so the list is not cloned.
-        let set = PreparedSetLiteral
-            .try_new_bound_expr(PreparedSetData::try_from_literal(literal.clone())?, [])?;
-        Ok(Some(ListContains.try_new_bound_expr(
-            *options,
-            [set, expr.child(1).clone()],
+        let set = PreparedSetData::try_from_literal(literal.clone())?;
+        let set = node.new_node(PreparedSetLiteral.bind(set), &[])?;
+        Ok(Some(node.new_node(
+            ListContains.bind(*options),
+            &[set, node.child(1)],
         )?))
     }
 
