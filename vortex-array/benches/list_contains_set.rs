@@ -2,8 +2,10 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! `list_contains(lit([...]), column)`, the `IN` shape: a constant set probed by a column of
-//! needles, flat and split into chunks so that the cost of preparing the set shows next to the
-//! cost of probing it.
+//! needles, so that the cost of preparing the set shows next to the cost of probing it.
+//!
+//! Each element type exercises one probe: integers, UTF-8 strings, and nested lists that compare
+//! whole rows. Integer needles are also split into chunks, which share one prepared set.
 
 #![expect(clippy::unwrap_used)]
 
@@ -18,12 +20,10 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ChunkedArray;
-use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::dtype::DType;
-use vortex_array::dtype::DecimalDType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::expr::list_contains;
@@ -36,9 +36,11 @@ fn main() {
 }
 
 // Sized to keep CodSpeed simulation under 1ms per benchmark.
-const ROWS: usize = 4_096;
-const CHUNKS: usize = 16;
-const SET_LENS: &[usize] = &[4, 64, 1_024];
+const ROWS: usize = 1_024;
+const CHUNKS: usize = 4;
+const SET_LENS: &[usize] = &[4, 256];
+/// A nested set compares whole rows to sort its elements and to probe them, so it stays smaller.
+const NESTED_SET_LENS: &[usize] = &[4, 32];
 
 /// A random set of `len` values, and needles of which about half are members.
 fn random_i64(len: usize) -> (Vec<i64>, Vec<i64>) {
@@ -54,66 +56,6 @@ fn random_i64(len: usize) -> (Vec<i64>, Vec<i64>) {
         })
         .collect();
     (set, needles)
-}
-
-/// The set `0..len`, and needles drawn from twice that range.
-fn dense_i64(len: usize) -> (Vec<i64>, Vec<i64>) {
-    let mut rng = StdRng::seed_from_u64(0);
-    let set = (0..len as i64).collect();
-    let needles = (0..ROWS)
-        .map(|_| rng.random_range(0..2 * len as i64))
-        .collect();
-    (set, needles)
-}
-
-fn i64_set(values: &[i64]) -> Scalar {
-    Scalar::list(
-        Arc::new(DType::Primitive(PType::I64, Nullability::NonNullable)),
-        values.iter().map(|&v| v.into()).collect(),
-        Nullability::NonNullable,
-    )
-}
-
-fn utf8_set(values: &[String]) -> Scalar {
-    Scalar::list(
-        Arc::new(DType::Utf8(Nullability::NonNullable)),
-        values
-            .iter()
-            .map(|v| Scalar::utf8(v.as_str(), Nullability::NonNullable))
-            .collect(),
-        Nullability::NonNullable,
-    )
-}
-
-fn chunked(needles: &[ArrayRef]) -> ArrayRef {
-    let dtype = needles[0].dtype().clone();
-    ChunkedArray::try_new(needles.iter().cloned(), dtype)
-        .unwrap()
-        .into_array()
-}
-
-fn i64_needles(needles: &[i64], chunks: usize) -> ArrayRef {
-    let parts: Vec<ArrayRef> = needles
-        .chunks(needles.len() / chunks)
-        .map(|chunk| PrimitiveArray::from_iter(chunk.iter().copied()).into_array())
-        .collect();
-    if chunks == 1 {
-        parts[0].clone()
-    } else {
-        chunked(&parts)
-    }
-}
-
-fn utf8_needles(needles: &[String], chunks: usize) -> ArrayRef {
-    let parts: Vec<ArrayRef> = needles
-        .chunks(needles.len() / chunks)
-        .map(|chunk| VarBinViewArray::from_iter_str(chunk.iter().map(String::as_str)).into_array())
-        .collect();
-    if chunks == 1 {
-        parts[0].clone()
-    } else {
-        chunked(&parts)
-    }
 }
 
 fn bench_in_set(bencher: Bencher, set: Scalar, needles: ArrayRef) {
@@ -134,72 +76,50 @@ fn bench_in_set(bencher: Bencher, set: Scalar, needles: ArrayRef) {
         .bench_values(|(array, mut ctx)| array.execute::<BoolArray>(&mut ctx).unwrap());
 }
 
+fn i64_set(values: Vec<i64>) -> Scalar {
+    Scalar::list(
+        Arc::new(DType::Primitive(PType::I64, Nullability::NonNullable)),
+        values.into_iter().map(Scalar::from).collect(),
+        Nullability::NonNullable,
+    )
+}
+
 #[divan::bench(args = SET_LENS)]
 fn i64_random(bencher: Bencher, set_len: usize) {
     let (set, needles) = random_i64(set_len);
-    bench_in_set(bencher, i64_set(&set), i64_needles(&needles, 1));
+    let needles = PrimitiveArray::from_iter(needles);
+    bench_in_set(bencher, i64_set(set), needles.into_array());
 }
 
 #[divan::bench(args = SET_LENS)]
 fn i64_random_chunked(bencher: Bencher, set_len: usize) {
     let (set, needles) = random_i64(set_len);
-    bench_in_set(bencher, i64_set(&set), i64_needles(&needles, CHUNKS));
-}
-
-#[divan::bench(args = SET_LENS)]
-fn i64_dense(bencher: Bencher, set_len: usize) {
-    let (set, needles) = dense_i64(set_len);
-    bench_in_set(bencher, i64_set(&set), i64_needles(&needles, 1));
+    let chunks = needles
+        .chunks(ROWS / CHUNKS)
+        .map(|chunk| PrimitiveArray::from_iter(chunk.iter().copied()).into_array());
+    let needles = ChunkedArray::try_new(
+        chunks,
+        DType::Primitive(PType::I64, Nullability::NonNullable),
+    )
+    .unwrap();
+    bench_in_set(bencher, i64_set(set), needles.into_array());
 }
 
 #[divan::bench(args = SET_LENS)]
 fn utf8_random(bencher: Bencher, set_len: usize) {
     let (set, needles) = random_i64(set_len);
-    let set: Vec<String> = set.iter().map(|v| format!("value-{v}")).collect();
-    let needles: Vec<String> = needles.iter().map(|v| format!("value-{v}")).collect();
-    bench_in_set(bencher, utf8_set(&set), utf8_needles(&needles, 1));
-}
-
-#[divan::bench(args = SET_LENS)]
-fn utf8_random_chunked(bencher: Bencher, set_len: usize) {
-    let (set, needles) = random_i64(set_len);
-    let set: Vec<String> = set.iter().map(|v| format!("value-{v}")).collect();
-    let needles: Vec<String> = needles.iter().map(|v| format!("value-{v}")).collect();
-    bench_in_set(bencher, utf8_set(&set), utf8_needles(&needles, CHUNKS));
-}
-
-#[divan::bench(args = [4_096, 16_384])]
-fn i64_random_large(bencher: Bencher, set_len: usize) {
-    let (set, needles) = random_i64(set_len);
-    bench_in_set(bencher, i64_set(&set), i64_needles(&needles, 1));
-}
-
-#[divan::bench(args = SET_LENS)]
-fn decimal_random(bencher: Bencher, set_len: usize) {
-    let (set, needles) = random_i64(set_len);
-    bench_decimal(bencher, set, needles);
-}
-
-#[divan::bench(args = SET_LENS)]
-fn decimal_dense(bencher: Bencher, set_len: usize) {
-    let (set, needles) = dense_i64(set_len);
-    bench_decimal(bencher, set, needles);
-}
-
-fn bench_decimal(bencher: Bencher, set: Vec<i64>, needles: Vec<i64>) {
-    let dtype = DecimalDType::new(20, 2);
     let set = Scalar::list(
-        DType::Decimal(dtype, Nullability::NonNullable),
-        set.into_iter()
-            .map(|value| Scalar::decimal(value.into(), dtype, Nullability::NonNullable))
+        Arc::new(DType::Utf8(Nullability::NonNullable)),
+        set.iter()
+            .map(|v| Scalar::utf8(format!("value-{v}"), Nullability::NonNullable))
             .collect(),
         Nullability::NonNullable,
     );
-    let needles = DecimalArray::from_iter::<i64, _>(needles, dtype).into_array();
-    bench_in_set(bencher, set, needles);
+    let needles = VarBinViewArray::from_iter_str(needles.iter().map(|v| format!("value-{v}")));
+    bench_in_set(bencher, set, needles.into_array());
 }
 
-#[divan::bench(args = SET_LENS)]
+#[divan::bench(args = NESTED_SET_LENS)]
 fn nested_list_random(bencher: Bencher, set_len: usize) {
     let (set, needles) = random_i64(set_len);
     let element_dtype = Arc::new(DType::Primitive(PType::I64, Nullability::NonNullable));
