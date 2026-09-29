@@ -21,6 +21,7 @@ use crate::arrays::FixedSizeListArray;
 use crate::arrays::ListArray;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::StructArray;
+use crate::arrays::VarBinViewArray;
 use crate::arrays::constant::list_scalar_elements;
 use crate::assert_arrays_eq;
 use crate::builders::builder_with_capacity_in;
@@ -409,6 +410,49 @@ fn test_result_from_bits_rejects_mismatched_needles() -> VortexResult<()> {
     assert!(
         set.result_from_bits(bits, Validity::AllValid, &wrong_dtype, &options)
             .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_bytes_set_short_and_long_views() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let elements = VarBinViewArray::from_iter_nullable_str([
+        Some("ab"),
+        Some(""),
+        Some("a long string with suffix A"),
+        Some("another long string"),
+        None,
+        Some("ab"),
+    ])
+    .into_array();
+    let set = PreparedSetData::try_new(elements, Nullability::NonNullable, &mut ctx)?;
+
+    // "abc" shares the prefix of a short element, and "... suffix B" shares the head of a long
+    // one: length and first 4 bytes. Neither is an element.
+    let needles = VarBinViewArray::from_iter_nullable_str([
+        Some("ab"),
+        Some("abc"),
+        Some(""),
+        Some("a long string with suffix B"),
+        Some("another long string"),
+        Some("a string never in the set"),
+        None,
+    ])
+    .into_array();
+
+    assert_arrays_eq!(
+        set.contains(&needles, &ListContainsOptions::default(), &mut ctx)?,
+        BoolArray::from_iter([
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
+            Some(false),
+            None,
+        ]),
+        &mut ctx
     );
     Ok(())
 }
