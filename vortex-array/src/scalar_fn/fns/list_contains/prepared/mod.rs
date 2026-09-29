@@ -5,12 +5,14 @@
 //! built from its elements, so that the kernels of a needle encoding can probe their own values.
 
 mod array;
+mod literal;
 
 use std::hash::BuildHasher;
 
 pub use array::PreparedSet;
 pub use array::PreparedSetArray;
 pub use array::PreparedSetData;
+pub use literal::PreparedSetLiteral;
 use num_traits::ToPrimitive;
 use num_traits::WrappingSub;
 use vortex_buffer::BitBuffer;
@@ -233,8 +235,10 @@ impl BytesSet {
         let buffers = data_buffers(&elements);
 
         let mut heads = HeadFilter::with_capacity(views.len());
-        let mut short = HashTable::new();
-        let mut long = HashTable::new();
+        // Sized up front, so that no insert grows a table and hashes every element again.
+        let short_len = views.iter().filter(|view| view.is_inlined()).count();
+        let mut short = HashTable::with_capacity(short_len);
+        let mut long = HashTable::with_capacity(views.len() - short_len);
 
         for (idx, view) in views.iter().enumerate() {
             heads.insert(view_head(view));

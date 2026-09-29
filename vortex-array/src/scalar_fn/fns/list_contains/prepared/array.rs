@@ -8,9 +8,10 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use vortex_buffer::BitBuffer;
-use vortex_error::VortexExpect;
+use vortex_error::SharedVortexResult;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -38,15 +39,13 @@ use crate::array::ValidityVTable;
 use crate::array::with_empty_buffers;
 use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
-use crate::arrays::ListViewArray;
+use crate::arrays::constant::list_scalar_elements;
 use crate::arrays::filter::FilterReduce;
 use crate::arrays::filter::FilterReduceAdaptor;
 use crate::arrays::slice::SliceReduce;
 use crate::arrays::slice::SliceReduceAdaptor;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
-use crate::dtype::Nullability;
-use crate::match_smallest_list_offset_type;
 use crate::optimizer::rules::ParentRuleSet;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::list_contains::ListContainsOptions;
@@ -58,79 +57,131 @@ pub type PreparedSetArray = Array<PreparedSet>;
 
 /// A constant, non-null list whose elements are prepared as a set for membership probes.
 ///
-/// Every row holds the same list, as in a [`ConstantArray`]. When [`ListContains`] gets a constant
-/// list and a needle that is not canonical, it puts this array in place of the list and gives the
-/// node back to the executor. Thus a [`ListContainsElementKernel`] of the needle encoding gets the
-/// prepared set as its list, and can probe its own values with [`PreparedSetData::contains`].
+/// Every row holds the same list, as in a [`ConstantArray`]. [`ListContains`] gets one from a
+/// [`PreparedSetLiteral`], or prepares a constant list itself, and when the needle is not canonical
+/// it puts this array in place of the list and gives the node back to the executor. Thus a
+/// [`ListContainsElementKernel`] of the needle encoding gets the prepared set as its list, and can
+/// probe its own values with [`PreparedSetData::contains`].
 ///
-/// The probe is shared, so a slice or a filter of this array does not build it again. This encoding
+/// The set is shared, so a slice or a filter of this array does not build it again. This encoding
 /// exists only during execution, and it cannot be serialized.
+///
+/// [`PreparedSetLiteral`]: crate::scalar_fn::fns::list_contains::PreparedSetLiteral
 ///
 /// [`ListContains`]: crate::scalar_fn::fns::list_contains::ListContains
 /// [`ListContainsElementKernel`]: crate::scalar_fn::fns::list_contains::ListContainsElementKernel
 #[derive(Clone, Debug)]
 pub struct PreparedSet;
 
-/// The data of a [`PreparedSetArray`]: the elements of the list, and the probe built from them.
+/// The data of a [`PreparedSetArray`]: the list that every row holds, and its set.
+///
+/// The set is shared by every clone, so a slice or a filter of the array, and every batch a
+/// [`PreparedSetLiteral`] is applied to, probe the one set. The probe needs an [`ExecutionCtx`] to
+/// materialize the elements, so it is built on the first probe.
+///
+/// [`PreparedSetLiteral`]: crate::scalar_fn::fns::list_contains::PreparedSetLiteral
 #[derive(Clone)]
-pub struct PreparedSetData {
-    /// All elements of the list, null elements included, with the element dtype of the list.
-    elements: ArrayRef,
-    /// The nullability of the list dtype. The list itself is never null.
-    nullability: Nullability,
-    pub(super) set: Arc<ElementSet>,
-}
+pub struct PreparedSetData(Arc<SharedSet>);
 
-/// The non-null elements of the list in a probe structure, and the facts about the list that
-/// decide the answer when no element matches.
-pub(super) struct ElementSet {
-    pub(super) probe: Box<dyn Probe>,
+struct SharedSet {
+    /// The non-null list that every row holds.
+    list: Scalar,
     /// Whether the list holds a null element, which a probe does not hold.
     has_null_element: bool,
     /// Whether the list holds no element at all, counting null elements.
     is_empty: bool,
+    /// The elements, and the probe over the non-null ones, built on the first probe.
+    set: OnceLock<SharedVortexResult<ElementSet>>,
 }
 
-impl PreparedSetData {
-    /// Prepares `elements`, the elements of a non-null list with the list nullability
-    /// `nullability`.
-    pub(super) fn try_new(
-        elements: ArrayRef,
-        nullability: Nullability,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Self> {
-        let is_empty = elements.is_empty();
+/// The elements of the list, and the non-null ones in a probe structure.
+pub(super) struct ElementSet {
+    /// All elements of the list, null elements included, with the element dtype of the list.
+    elements: ArrayRef,
+    pub(super) probe: Box<dyn Probe>,
+}
+
+impl ElementSet {
+    fn try_new(list: &Scalar, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
+        let elements = list_scalar_elements(&list.as_list(), ctx.allocator());
 
         // A null element never equals a needle, so the probe is better off without it.
         let valid = elements.validity()?.execute_mask(elements.len(), ctx)?;
-        let has_null_element = !valid.all_true();
-        let probe_elements = if has_null_element {
-            elements.filter(valid)?
-        } else {
+        let probe_elements = if valid.all_true() {
             elements.clone()
+        } else {
+            elements.filter(valid)?
         };
-
         let probe = new_probe(probe_elements, ctx)?;
 
-        Ok(Self {
-            elements,
-            nullability,
-            set: Arc::new(ElementSet {
-                probe,
-                has_null_element,
-                is_empty,
-            }),
-        })
+        Ok(Self { elements, probe })
+    }
+}
+
+impl PreparedSetData {
+    /// Prepares the non-null list scalar `list` as a set.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `list` is not a list, or is null.
+    pub fn try_new(list: Scalar) -> VortexResult<Self> {
+        vortex_ensure!(
+            matches!(list.dtype(), DType::List(..)),
+            "A prepared set needs a list, got {}",
+            list.dtype()
+        );
+        let (has_null_element, is_empty) = {
+            let Some(elements) = list.as_list().element_values() else {
+                vortex_bail!("A prepared set needs a non-null list");
+            };
+            (elements.iter().any(Option::is_none), elements.is_empty())
+        };
+
+        Ok(Self(Arc::new(SharedSet {
+            list,
+            has_null_element,
+            is_empty,
+            set: OnceLock::new(),
+        })))
     }
 
-    /// The elements of the list that every row holds.
-    pub fn elements(&self) -> &ArrayRef {
-        &self.elements
+    /// The list that every row holds.
+    pub fn list(&self) -> &Scalar {
+        &self.0.list
+    }
+
+    /// The elements of the list, one row each, null elements included.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the elements cannot be executed into the probe.
+    pub fn elements(&self, ctx: &mut ExecutionCtx) -> VortexResult<&ArrayRef> {
+        Ok(&self.element_set(ctx)?.elements)
+    }
+
+    /// The elements and their probe, built on the first call and shared after it.
+    pub(super) fn element_set<'a>(
+        &'a self,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<&'a ElementSet> {
+        self.0
+            .set
+            .get_or_init(|| ElementSet::try_new(&self.0.list, ctx).map_err(Arc::new))
+            .as_ref()
+            .map_err(|err| Arc::clone(err).into())
     }
 
     /// The dtype of the list that every row holds.
-    fn list_dtype(&self) -> DType {
-        DType::List(Arc::new(self.elements.dtype().clone()), self.nullability)
+    fn list_dtype(&self) -> &DType {
+        self.0.list.dtype()
+    }
+
+    /// The dtype of the list's elements.
+    fn element_dtype(&self) -> &DType {
+        let DType::List(element_dtype, _) = self.list_dtype() else {
+            vortex_panic!("A prepared set always holds a list");
+        };
+        element_dtype
     }
 
     /// Whether each of `needles` is an element of the list, under `options`.
@@ -158,7 +209,7 @@ impl PreparedSetData {
         }
 
         self.check_needle_dtype(needles.dtype())?;
-        let (bits, needle_validity) = self.set.probe.contains(needles, ctx)?;
+        let (bits, needle_validity) = self.element_set(ctx)?.probe.contains(needles, ctx)?;
         self.result_from_bits(bits, needle_validity, needles.dtype(), options)
     }
 
@@ -178,7 +229,7 @@ impl PreparedSetData {
     ) -> VortexResult<Scalar> {
         self.check_needle_dtype(needle.dtype())?;
         let needles = ConstantArray::new(needle.clone(), 1).into_array();
-        let (bits, needle_validity) = self.set.probe.contains(&needles, ctx)?;
+        let (bits, needle_validity) = self.element_set(ctx)?.probe.contains(&needles, ctx)?;
         self.result_from_bits(bits, needle_validity, needle.dtype(), options)?
             .execute_scalar(0, ctx)
     }
@@ -210,11 +261,11 @@ impl PreparedSetData {
             );
         }
 
-        let nullability = options.result_nullability(&self.list_dtype(), needle_dtype);
+        let nullability = options.result_nullability(self.list_dtype(), needle_dtype);
 
-        let validity = if self.set.is_empty && !options.sql_null_semantics {
+        let validity = if self.0.is_empty && !options.sql_null_semantics {
             Validity::NonNullable
-        } else if options.sql_null_semantics && self.set.has_null_element {
+        } else if options.sql_null_semantics && self.0.has_null_element {
             // Only a match is known. A comparison with the null element makes a non-match unknown.
             needle_validity.and(Validity::from(bits.clone()))?
         } else {
@@ -226,7 +277,7 @@ impl PreparedSetData {
 
     /// Fails when needles of `needle_dtype` cannot be elements of the list.
     fn check_needle_dtype(&self, needle_dtype: &DType) -> VortexResult<()> {
-        let element_dtype = self.elements.dtype();
+        let element_dtype = self.element_dtype();
         if !element_dtype.eq_ignore_nullability(needle_dtype) {
             vortex_bail!(
                 "Element type {} of list does not match search value {}",
@@ -241,34 +292,45 @@ impl PreparedSetData {
 impl Debug for PreparedSetData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedSetData")
-            .field("elements", &self.elements)
-            .field("nullability", &self.nullability)
+            .field("list", &self.0.list)
             .finish_non_exhaustive()
     }
 }
 
 impl Display for PreparedSetData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "elements: {}", self.elements.len())
+        write!(f, "{}", self.0.list)
+    }
+}
+
+impl PartialEq for PreparedSetData {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.list == other.0.list
+    }
+}
+
+impl Eq for PreparedSetData {}
+
+impl Hash for PreparedSetData {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.list.hash(state);
     }
 }
 
 impl ArrayHash for PreparedSetData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, accuracy: EqMode) {
-        self.elements.array_hash(state, accuracy);
-        self.nullability.hash(state);
+    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
+        self.hash(state);
     }
 }
 
 impl ArrayEq for PreparedSetData {
-    fn array_eq(&self, other: &Self, accuracy: EqMode) -> bool {
-        self.nullability == other.nullability && self.elements.array_eq(&other.elements, accuracy)
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
+        self == other
     }
 }
 
 impl Array<PreparedSet> {
-    /// Prepares `elements`, the elements of a non-null list with the list nullability
-    /// `nullability`, as a set repeated `len` times.
+    /// Prepares the non-null list scalar `list` as a set repeated `len` times.
     ///
     /// [`ListContains`] prepares a constant list itself. A kernel crate can use this to test its
     /// [`ListContainsElementKernel`] against a prepared set.
@@ -278,23 +340,17 @@ impl Array<PreparedSet> {
     ///
     /// # Errors
     ///
-    /// Fails when the elements cannot be executed into the probe.
-    pub fn try_new(
-        elements: ArrayRef,
-        nullability: Nullability,
-        len: usize,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<Self> {
-        let data = PreparedSetData::try_new(elements, nullability, ctx)?;
-        Ok(Self::from_data(data, len))
+    /// Fails when `list` is not a list, or is null.
+    pub fn try_new(list: Scalar, len: usize) -> VortexResult<Self> {
+        Ok(Self::new(PreparedSetData::try_new(list)?, len))
     }
 
-    /// An array of `len` rows that share the prepared set `data`.
-    fn from_data(data: PreparedSetData, len: usize) -> Self {
-        let dtype = data.list_dtype();
+    /// An array of `len` rows that share the prepared set `set`.
+    pub fn new(set: PreparedSetData, len: usize) -> Self {
+        let dtype = set.list_dtype().clone();
 
         // SAFETY: the dtype is the dtype of the list that every row holds.
-        unsafe { Array::from_parts_unchecked(ArrayParts::new(PreparedSet, dtype, len, data)) }
+        unsafe { Array::from_parts_unchecked(ArrayParts::new(PreparedSet, dtype, len, set)) }
     }
 }
 
@@ -322,7 +378,7 @@ impl VTable for PreparedSet {
         _slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
         vortex_ensure!(
-            &data.list_dtype() == dtype,
+            data.list_dtype() == dtype,
             "PreparedSetArray list dtype does not match outer dtype"
         );
         Ok(())
@@ -373,31 +429,10 @@ impl VTable for PreparedSet {
 
     fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         // The rows hold the list only. The probe is of no use to the canonical form.
-        let data = array.data();
-        let n_elements = data.elements.len();
-
-        // Every row has the same offset and size, so use the narrowest width that fits the list.
-        let (offsets, sizes) = match_smallest_list_offset_type!(n_elements, |O| {
-            let size =
-                O::try_from(n_elements).vortex_expect("list length fits the chosen offset type");
-            (
-                ConstantArray::new::<O>(O::default(), array.len()).into_array(),
-                ConstantArray::new::<O>(size, array.len()).into_array(),
-            )
-        });
-
-        // SAFETY: every view points at the range [0, n_elements) of the elements, and the list
-        // is never null.
-        let list = unsafe {
-            ListViewArray::new_unchecked(
-                data.elements.clone(),
-                offsets,
-                sizes,
-                Validity::from(data.nullability),
-            )
-        };
-
-        Ok(ExecutionResult::done(list))
+        Ok(ExecutionResult::done(ConstantArray::new(
+            array.data().list().clone(),
+            array.len(),
+        )))
     }
 
     fn reduce_parent(
@@ -415,17 +450,9 @@ impl OperationsVTable<PreparedSet> for PreparedSet {
     fn scalar_at(
         array: ArrayView<'_, PreparedSet>,
         _index: usize,
-        ctx: &mut ExecutionCtx,
+        _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
-        let elements = (0..array.elements.len())
-            .map(|idx| array.elements.execute_scalar(idx, ctx))
-            .collect::<VortexResult<Vec<_>>>()?;
-
-        Ok(Scalar::list(
-            array.elements.dtype().clone(),
-            elements,
-            array.nullability,
-        ))
+        Ok(array.data().list().clone())
     }
 }
 
@@ -439,7 +466,7 @@ impl ValidityVTable<PreparedSet> for PreparedSet {
 impl SliceReduce for PreparedSet {
     fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
         Ok(Some(
-            PreparedSetArray::from_data(array.data().clone(), range.len()).into_array(),
+            PreparedSetArray::new(array.data().clone(), range.len()).into_array(),
         ))
     }
 }
@@ -447,7 +474,7 @@ impl SliceReduce for PreparedSet {
 impl FilterReduce for PreparedSet {
     fn filter(array: ArrayView<'_, Self>, mask: &Mask) -> VortexResult<Option<ArrayRef>> {
         Ok(Some(
-            PreparedSetArray::from_data(array.data().clone(), mask.true_count()).into_array(),
+            PreparedSetArray::new(array.data().clone(), mask.true_count()).into_array(),
         ))
     }
 }

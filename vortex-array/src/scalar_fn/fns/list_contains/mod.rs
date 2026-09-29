@@ -16,6 +16,7 @@ use num_traits::Zero;
 pub use prepared::PreparedSet;
 pub use prepared::PreparedSetArray;
 pub use prepared::PreparedSetData;
+pub use prepared::PreparedSetLiteral;
 use prost::Message;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
@@ -35,14 +36,15 @@ use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
 use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::ScalarFn;
 use crate::arrays::ScalarFnArray;
 use crate::arrays::bool::BoolArrayExt;
-use crate::arrays::constant::list_scalar_elements;
 use crate::arrays::listview::ListViewArraySlotsExt;
 use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
 use crate::dtype::Nullability;
+use crate::expr::BoundExpression;
 use crate::expr::Expression;
 use crate::expr::lit;
 use crate::match_each_integer_ptype;
@@ -209,10 +211,10 @@ impl ScalarFnVTable for ListContains {
         let value_array = args.get(1)?;
 
         // Borrow the list: a constant list scalar owns every element, so cloning it is not free.
-        if let Some(list) = list_array.as_opt::<Constant>()
-            && let Some(value_scalar) = value_array.as_constant()
+        if let Some(value_scalar) = value_array.as_constant()
+            && let Some(list) = constant_list(&list_array)
         {
-            let result = compute_contains_scalar(list.scalar(), &value_scalar, options)?;
+            let result = compute_contains_scalar(list, &value_scalar, options)?;
             return Ok(ConstantArray::new(result, args.row_count()).into_array());
         }
 
@@ -222,14 +224,38 @@ impl ScalarFnVTable for ListContains {
     /// A constant list and a constant needle fold to their constant answer, in expression and
     /// array trees alike. A [`PreparedSetArray`] list looks a constant needle up at execution.
     fn reduce<T: ReduceNode>(&self, options: &Self::Options, node: &T) -> VortexResult<Option<T>> {
-        let Some(list) = node.child(0).as_constant() else {
+        // The needle first: it is rarely constant, and a list is costly to clone.
+        let Some(needle) = node.child(1).as_constant() else {
             return Ok(None);
         };
-        let Some(needle) = node.child(1).as_constant() else {
+        let Some(list) = constant_list_node(&node.child(0)) else {
             return Ok(None);
         };
         let result = compute_contains_scalar(&list, &needle, options)?;
         Ok(Some(node.new_constant(result)))
+    }
+
+    /// A literal list becomes a [`PreparedSetLiteral`], so that every batch the expression is
+    /// applied to probes one shared set rather than preparing the list again.
+    fn simplify(
+        &self,
+        options: &Self::Options,
+        expr: &BoundExpression,
+    ) -> VortexResult<Option<BoundExpression>> {
+        let Some(list) = expr.child(0).as_opt::<Literal>() else {
+            return Ok(None);
+        };
+        // A null list has no set, and answers null for every needle at execution.
+        if list.is_null() {
+            return Ok(None);
+        }
+
+        let set =
+            PreparedSetLiteral.try_new_bound_expr(PreparedSetData::try_new(list.clone())?, [])?;
+        Ok(Some(ListContains.try_new_bound_expr(
+            *options,
+            [set, expr.child(1).clone()],
+        )?))
     }
 
     /// The validity of `needle IN list` for a literal list, decided without a probe.
@@ -246,7 +272,12 @@ impl ScalarFnVTable for ListContains {
         options: &Self::Options,
         expression: &Expression,
     ) -> VortexResult<Option<Expression>> {
-        let Some(list) = expression.child(0).as_opt::<Literal>() else {
+        let list_child = expression.child(0);
+        let Some(list) = list_child.as_opt::<Literal>().or_else(|| {
+            list_child
+                .as_opt::<PreparedSetLiteral>()
+                .map(PreparedSetData::list)
+        }) else {
             return Ok(None);
         };
         if !matches!(list.dtype(), DType::List(..)) {
@@ -340,35 +371,63 @@ fn compute_list_contains(
         .into_array());
     }
 
-    if let Some(set) = array.as_opt::<PreparedSet>() {
+    // A literal list arrives prepared once per expression. A constant list of one batch is
+    // prepared here, and a prepared set that came back from the executor probes at once.
+    let set = if let Some(set) = array.as_opt::<PreparedSet>() {
+        return set.contains(value, options, ctx);
+    } else if let Some(set) = prepared_literal(array) {
+        set.clone()
+    } else if let Some(list) = array.as_opt::<Constant>() {
+        PreparedSetData::try_new(list.scalar().clone())?
+    } else {
+        let nullability = options.result_nullability(array.dtype(), value.dtype());
+        if let Some(value_scalar) = value.as_constant() {
+            return list_contains_scalar(array, &value_scalar, nullability, options, ctx);
+        }
+        return lists_contain_needles(array, value, nullability, options, ctx);
+    };
+
+    // A canonical needle has no encoding for a kernel to use, so probe it now.
+    if value.is_canonical() {
         return set.contains(value, options, ctx);
     }
 
-    let nullability = options.result_nullability(array.dtype(), value.dtype());
+    // Give the prepared set back to the executor. Thus a kernel of the needle encoding can probe
+    // it, for example on the values of a dictionary only. When no kernel does, the next execution
+    // finds the prepared set above and probes it, so this happens at most once.
+    let set = PreparedSetArray::new(set, array.len()).into_array();
+    Ok(ListContains::try_new_opts(set, value.clone(), *options)?.into_array())
+}
 
-    if let Some(value_scalar) = value.as_constant() {
-        return list_contains_scalar(array, &value_scalar, nullability, options, ctx);
+/// The list that every row of `array` holds: a constant, or a set prepared from one.
+fn constant_list(array: &ArrayRef) -> Option<&Scalar> {
+    if let Some(constant) = array.as_opt::<Constant>() {
+        return Some(constant.data().scalar());
     }
-
-    if let Some(list) = array.as_opt::<Constant>() {
-        let elements = list_scalar_elements(&list.scalar().as_list(), ctx.allocator());
-        let set =
-            PreparedSetArray::try_new(elements, array.dtype().nullability(), array.len(), ctx)?;
-
-        // A canonical needle has no encoding for a kernel to use, so probe it now.
-        if value.is_canonical() {
-            return set.data().contains(value, options, ctx);
-        }
-
-        // Give the prepared set back to the executor. Thus a kernel of the needle encoding can
-        // probe it, for example on the values of a dictionary only. When no kernel does, the next
-        // execution finds the prepared set above and probes it, so this happens at most once.
-        return Ok(
-            ListContains::try_new_opts(set.into_array(), value.clone(), *options)?.into_array(),
-        );
+    if let Some(set) = array.as_opt::<PreparedSet>() {
+        return Some(set.data().list());
     }
+    prepared_literal(array).map(PreparedSetData::list)
+}
 
-    lists_contain_needles(array, value, nullability, options, ctx)
+/// The set of a [`PreparedSetLiteral`] array.
+fn prepared_literal(array: &ArrayRef) -> Option<&PreparedSetData> {
+    array
+        .as_opt::<ScalarFn>()?
+        .data()
+        .scalar_fn()
+        .as_opt::<PreparedSetLiteral>()
+}
+
+/// The list a reduce node holds when it is a constant or a prepared set, in an expression or an
+/// array tree.
+fn constant_list_node<T: ReduceNode>(node: &T) -> Option<Scalar> {
+    if let Some(list) = node.as_constant() {
+        return Some(list);
+    }
+    node.scalar_fn()?
+        .as_opt::<PreparedSetLiteral>()
+        .map(|set| set.list().clone())
 }
 
 /// Returns a [`BoolArray`] where each bit represents if a list contains the scalar.
@@ -804,6 +863,8 @@ mod tests {
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::list_contains::ListContains;
     use crate::scalar_fn::fns::list_contains::ListContainsOptions;
+    use crate::scalar_fn::fns::list_contains::PreparedSetData;
+    use crate::scalar_fn::fns::list_contains::PreparedSetLiteral;
     use crate::scalar_fn::fns::literal::Literal;
     use crate::stats::StatsSession;
     use crate::stats::stat as stat_expr;
@@ -2034,6 +2095,48 @@ mod tests {
             list_contains(lit(null_list), needle).validity()?,
             lit(false)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn optimize_prepares_a_literal_list_once() -> VortexResult<()> {
+        // The literal becomes a prepared set that every batch the expression is applied to
+        // probes, and a prepared set is left alone, so optimization reaches a fixed point.
+        let dtype = DType::Primitive(I32, Nullability::Nullable);
+        let set = i32_set(vec![Some(2), None]);
+        let expr = in_list(root(), lit(set.clone())).bind(&dtype)?.optimize()?;
+        assert_eq!(
+            expr.child(0)
+                .as_opt::<PreparedSetLiteral>()
+                .map(PreparedSetData::list),
+            Some(&set)
+        );
+        assert_eq!(expr.optimize()?, expr);
+
+        let mut ctx = array_session().create_execution_ctx();
+        let first = PrimitiveArray::from_option_iter([Some(1i32), Some(2), None])
+            .into_array()
+            .apply_bound(&expr)?;
+        assert_arrays_eq!(
+            first,
+            BoolArray::from_iter([None, Some(true), None]),
+            &mut ctx
+        );
+        let second = PrimitiveArray::from_option_iter([Some(2i32), Some(3)])
+            .into_array()
+            .apply_bound(&expr)?;
+        assert_arrays_eq!(second, BoolArray::from_iter([Some(true), None]), &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn optimize_leaves_a_null_list_a_literal() -> VortexResult<()> {
+        let dtype = DType::Primitive(I32, Nullability::Nullable);
+        let null_list = Scalar::null(DType::List(Arc::new(dtype.clone()), Nullability::Nullable));
+        let expr = list_contains(lit(null_list.clone()), root())
+            .bind(&dtype)?
+            .optimize()?;
+        assert_eq!(expr.child(0).as_opt::<Literal>(), Some(&null_list));
         Ok(())
     }
 }
