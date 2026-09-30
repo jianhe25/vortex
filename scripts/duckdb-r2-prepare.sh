@@ -65,6 +65,7 @@ else
         BUILD_UNITTESTS=false \
         ENABLE_UNITTEST_CPP_TESTS=false \
         BUILD_EXTENSIONS="parquet;tpch;tpcds;icu;httpfs" \
+        LINK_CORE_EXTENSIONS=1 \
         $extra
 
     lib_dir="${src_dir}/build/release/src"

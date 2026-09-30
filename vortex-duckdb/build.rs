@@ -23,7 +23,7 @@ const DUCKDB_RELEASES_URL: &str = "https://ci-builds.vortex.dev";
 
 const DUCKDB_SOURCE_RELEASE_URL: &str = "https://github.com/duckdb/duckdb/archive/refs/tags";
 const DUCKDB_SOURCE_COMMIT_URL: &str = "https://github.com/duckdb/duckdb/archive";
-const DEFAULT_DUCKDB_VERSION: &str = "a2af0a7bbae3e6fb17c99a1102a41df7b338d66e";
+const DEFAULT_DUCKDB_VERSION: &str = "561522aea03e400bd20adc64fcc63e78b8721f3f";
 
 const BUILD_ARTIFACTS: [&str; 3] = ["libduckdb.dylib", "libduckdb.so", "libduckdb_static.a"];
 const BUILD_MARKER: &str = ".vx-build-complete";
@@ -405,12 +405,12 @@ fn build_duckdb(version: &DuckDBVersion, duckdb_repo_dir: &Path) {
     // If we're building from a commit we need to build some extensions
     // statically, otherwise DuckDB tries to load them from an http endpoint
     // with version 0.0.1 (all non-tagged builds) which doesn't exist.
-    let static_extensions = match version {
-        DuckDBVersion::Release(_) => "parquet",
+    let (static_extensions, link_extensions) = match version {
+        DuckDBVersion::Release(_) => ("parquet", "0"),
         // tpch/tpcds/parquet needed for benchmarks
         // icu needed for timestamptz tests
         // httpfs needed for s3 write test
-        DuckDBVersion::Commit(_) => "parquet;tpch;tpcds;icu;httpfs",
+        DuckDBVersion::Commit(_) => ("parquet;tpch;tpcds;icu;httpfs", "1"),
     };
 
     let envs = [
@@ -421,6 +421,7 @@ fn build_duckdb(version: &DuckDBVersion, duckdb_repo_dir: &Path) {
         ("BUILD_UNITTESTS", "false"),
         ("ENABLE_UNITTEST_CPP_TESTS", "false"),
         ("BUILD_EXTENSIONS", static_extensions),
+        ("LINK_CORE_EXTENSIONS", link_extensions),
     ];
 
     let output = Command::new("make")
