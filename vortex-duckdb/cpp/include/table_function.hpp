@@ -15,7 +15,7 @@ using namespace duckdb;
 
 static_assert(sizeof(idx_t) == 8);
 
-bool is_vortex_scan(const TableFunction &function);
+bool is_vortex_scan(const BoundTableFunction &function);
 
 constexpr inline idx_t COUNT_STAR_PROJ_IDX = std::numeric_limits<idx_t>::max();
 

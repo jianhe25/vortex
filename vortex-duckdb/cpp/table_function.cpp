@@ -111,11 +111,11 @@ InsertionOrderPreservingMap<string> to_string(TableFunctionToStringInput &input)
     return result;
 }
 
-bool is_vortex_scan(const TableFunction &function) {
+bool is_vortex_scan(const BoundTableFunction &function) {
     return function.bind == MultiFileFunction<VortexReaderInterface>::MultiFileBind;
 }
 
-unique_ptr<MultiFileReader> get_multi_file_reader(const TableFunction &) {
+unique_ptr<MultiFileReader> get_multi_file_reader(const BoundTableFunction &) {
     return make_uniq<VortexMultiFileReader>();
 }
 
@@ -189,10 +189,14 @@ static bool projection_expression_pushdown(ClientContext &,
 
 duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter, const std::string &name) {
     MultiFileFunction<VortexReaderInterface> fn {Identifier(name)};
-    fn.arguments[0] = parameter;
-    fn.named_parameters = {{"filename", LogicalType::ANY},
-                           {"allow_empty", LogicalType::BOOLEAN},
-                           {"hive_partitioning", LogicalType::BOOLEAN}};
+    FunctionSignature signature;
+    signature.AddPositionalOnly("path", std::move(parameter));
+    signature.WithTypedKwargs("options", [](TypedKwargs &options) {
+        options.Add("filename", LogicalType::ANY)
+            .Add("allow_empty", LogicalType::BOOLEAN)
+            .Add("hive_partitioning", LogicalType::BOOLEAN);
+    });
+    fn.GetSignature() = std::move(signature);
 
     fn.filter_pushdown = true;
     fn.filter_prune = true;
