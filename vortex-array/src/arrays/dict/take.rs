@@ -3,7 +3,6 @@
 
 use smallvec::SmallVec;
 use vortex_error::VortexResult;
-use vortex_mask::Mask;
 
 use super::Dict;
 use crate::ArrayRef;
@@ -13,16 +12,13 @@ use crate::IntoArray;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::arrays::ConstantArray;
-use crate::arrays::PrimitiveArray;
 use crate::arrays::dict::DictArraySlotsExt;
 use crate::builtins::ArrayBuiltins;
-use crate::dtype::IntegerPType;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
 use crate::expr::stats::StatsProviderExt;
 use crate::kernel::ExecuteParentKernel;
-use crate::match_each_integer_ptype;
 use crate::matcher::Matcher;
 use crate::optimizer::rules::ArrayParentReduceRule;
 use crate::scalar::Scalar;
@@ -136,7 +132,7 @@ where
         if let Some(result) = short_circuit::<V>(array, parent.codes()) {
             return Ok(Some(result));
         }
-        if let Some(result) = take_strict_sorted_as_filter(array.array(), parent.codes(), ctx)? {
+        if let Some(result) = take_strict_sorted_as_slice(array.array(), parent.codes(), ctx)? {
             return Ok(Some(result));
         }
         let result = <V as TakeExecute>::take(array, parent.codes(), ctx)?;
@@ -147,17 +143,21 @@ where
     }
 }
 
-/// Execute a take whose indices are known to be strictly sorted as a filter.
+/// Execute a take whose indices are a strictly sorted contiguous run as a slice.
 ///
-/// Strictly increasing, all-valid indices select each position at most once and in order, which
-/// is exactly what a filter mask expresses. Filters are cheaper than takes for most encodings:
-/// encoded arrays filter in place rather than decompressing to gather, chunked arrays skip whole
-/// chunks, and a contiguous run of indices becomes a zero-copy slice.
+/// Strictly increasing indices whose first and last are `len - 1` apart leave no gaps, so they
+/// select exactly `first..=last`. A slice is zero-copy for most encodings, where a take gathers
+/// every selected element. Only the first and last index are read, so the check costs two scalar
+/// reads whatever the encoding of the indices.
+///
+/// Strictly sorted indices with gaps are left to the take kernels: filtering with a mask built
+/// from them measured slower than taking for most canonical encodings (see the
+/// `take_strict_sorted` benchmark).
 ///
 /// Only a cached [`Stat::IsStrictSorted`] is consulted; computing sortedness would cost a pass
-/// over the indices. Returns `None` when the indices are not known to be strictly sorted, contain
-/// nulls, or are out of bounds, leaving those cases to the take kernels.
-pub(crate) fn take_strict_sorted_as_filter(
+/// over the indices. Returns `None` when the indices are not known to be strictly sorted, are not
+/// contiguous, contain nulls, or are out of bounds, leaving those cases to the take kernels.
+pub(crate) fn take_strict_sorted_as_slice(
     values: &ArrayRef,
     indices: &ArrayRef,
     ctx: &mut ExecutionCtx,
@@ -171,46 +171,34 @@ pub(crate) fn take_strict_sorted_as_filter(
         return Ok(None);
     }
 
-    let indices = indices.clone().execute::<PrimitiveArray>(ctx)?;
-    let all_valid = match indices.validity()? {
-        Validity::NonNullable | Validity::AllValid => true,
-        Validity::AllInvalid => false,
-        validity @ Validity::Array(_) => validity.execute_mask(indices.len(), ctx)?.all_true(),
+    // Strict sortedness allows a null only in the first position, so a valid first index means
+    // every index is valid. `as_opt` is `None` for a negative index and `Some(None)` for a null.
+    let index_at = |position: usize, ctx: &mut ExecutionCtx| -> VortexResult<Option<usize>> {
+        Ok(indices
+            .execute_scalar(position, ctx)?
+            .as_primitive()
+            .as_opt::<usize>()
+            .flatten())
     };
-    if !all_valid {
+    let Some(first) = index_at(0, ctx)? else {
+        return Ok(None);
+    };
+    let Some(last) = index_at(indices.len() - 1, ctx)? else {
+        return Ok(None);
+    };
+    if last >= values.len() || last - first + 1 != indices.len() {
         return Ok(None);
     }
-
-    let Some(mask) = match_each_integer_ptype!(indices.ptype(), |I| {
-        strict_sorted_mask(indices.as_slice::<I>(), values.len())
-    }) else {
-        return Ok(None);
-    };
 
     let result_dtype = values
         .dtype()
         .union_nullability(indices.dtype().nullability());
-    let filtered = values.filter(mask)?;
-    if filtered.dtype() == &result_dtype {
-        Ok(Some(filtered))
+    let sliced = values.slice(first..last + 1)?;
+    if sliced.dtype() == &result_dtype {
+        Ok(Some(sliced))
     } else {
-        filtered.cast(result_dtype).map(Some)
+        sliced.cast(result_dtype).map(Some)
     }
-}
-
-/// Build the filter mask selecting strictly increasing `indices` out of `len` positions, or
-/// `None` if they fall outside `0..len`. Since the indices are sorted, the first and last bound
-/// every other index.
-fn strict_sorted_mask<I: IntegerPType>(indices: &[I], len: usize) -> Option<Mask> {
-    // A negative first index fails the conversion.
-    indices.first()?.to_usize()?;
-    if indices.last()?.to_usize()? >= len {
-        return None;
-    }
-    Some(Mask::from_indices(
-        len,
-        indices.iter().map(|index| index.as_()),
-    ))
 }
 
 pub(crate) fn propagate_take_stats(
@@ -338,7 +326,7 @@ mod tests {
         Ok(())
     }
 
-    /// Strict sortedness allows a single leading null index, which a filter cannot express.
+    /// Strict sortedness allows a single leading null index, which a slice cannot express.
     #[test]
     fn leading_null_index_falls_back_to_take() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();

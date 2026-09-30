@@ -43,7 +43,7 @@ use crate::arrays::dict::DictArrayExt;
 use crate::arrays::dict::DictArraySlotsExt;
 use crate::arrays::dict::compute::rules::PARENT_RULES;
 use crate::arrays::dict::execute::take_canonical;
-use crate::arrays::dict::take_strict_sorted_as_filter;
+use crate::arrays::dict::take_strict_sorted_as_slice;
 use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
 use crate::builders::VarBinBuilder;
@@ -210,9 +210,9 @@ impl VTable for Dict {
             )));
         }
 
-        // Before canonicalizing the values, so encodings without a take kernel can filter in
-        // place instead of decompressing everything to gather.
-        if let Some(filtered) = take_strict_sorted_as_filter(array.values(), array.codes(), ctx)? {
+        // Before canonicalizing the values, so encodings without a take kernel slice in place
+        // instead of decompressing everything to gather.
+        if let Some(filtered) = take_strict_sorted_as_slice(array.values(), array.codes(), ctx)? {
             return Ok(ExecutionResult::done(filtered));
         }
 

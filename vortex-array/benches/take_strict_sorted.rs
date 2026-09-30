@@ -2,14 +2,14 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 //! Benchmarks take with strictly sorted indices, with and without the cached
-//! [`Stat::IsStrictSorted`] statistic that lets take execute as a filter.
+//! [`Stat::IsStrictSorted`] statistic that lets a contiguous run of indices execute as a slice.
 //!
 //! Each case takes the same indices from the same values and differs only in whether the indices
-//! carry the statistic (`filter`) or not (`take`):
+//! carry the statistic (`strict_sorted`) or not (`plain`):
 //!
-//! - `sparse`: every 64th position.
-//! - `alternate`: every other position.
-//! - `run`: the contiguous middle half, which a filter turns into a zero-copy slice.
+//! - `run`: the contiguous middle half, which becomes a zero-copy slice.
+//! - `sparse`: every 64th position, and `alternate`: every other position. These have gaps, so
+//!   they still take; they measure the cost of checking for a run.
 //!
 //! Results are executed to [`RecursiveCanonical`] so lazy results pay for materialization.
 
@@ -62,7 +62,11 @@ impl fmt::Display for Case {
             Pattern::Alternate => "alternate",
             Pattern::Run => "run",
         };
-        let mode = if self.strict_sorted { "filter" } else { "take" };
+        let mode = if self.strict_sorted {
+            "strict_sorted"
+        } else {
+            "plain"
+        };
         write!(f, "{pattern}/{mode}")
     }
 }
@@ -85,10 +89,11 @@ const CASES: [Case; 6] = {
 };
 
 fn indices(case: Case) -> ArrayRef {
+    let len = u32::try_from(LEN).unwrap();
     let indices: Buffer<u32> = match case.pattern {
-        Pattern::Sparse => (0..LEN as u32).step_by(64).collect(),
-        Pattern::Alternate => (0..LEN as u32).step_by(2).collect(),
-        Pattern::Run => (LEN as u32 / 4..3 * LEN as u32 / 4).collect(),
+        Pattern::Sparse => (0..len).step_by(64).collect(),
+        Pattern::Alternate => (0..len).step_by(2).collect(),
+        Pattern::Run => (len / 4..3 * len / 4).collect(),
     };
     let indices = indices.into_array();
     if case.strict_sorted {
@@ -122,8 +127,8 @@ fn struct_values() -> ArrayRef {
         ("a", primitive_values()),
         (
             "b",
-            (0..LEN as u8)
-                .map(|_| 1u8)
+            (0..LEN)
+                .map(|i| u8::try_from(i % 256).unwrap())
                 .collect::<Buffer<_>>()
                 .into_array(),
         ),
