@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Executing a compressed stack runs one scheduler loop. Encodings hand their children back to
-//! the scheduler through `ExecuteSlot` rather than executing them inline, so the trace of a whole
-//! stack shows exactly one `execute_until`.
+//! Executing a compressed chunk runs one scheduler loop. Encodings hand their children back to
+//! the scheduler through `ExecuteSlot` rather than executing them inline, so the trace of a
+//! `Shared` chunk shows exactly one `execute_until` to canonical. A `Chunked` stack appends each
+//! chunk through its builder, which executes the chunk in a loop of its own, so it shows one
+//! loop plus one per chunk.
+//!
+//! Validity masks are read off already canonical `Bool` arrays through `AnyColumnar` loops that
+//! return on their first iteration, so only loops to `AnyCanonical` are counted.
 
 use std::sync::LazyLock;
 
@@ -20,6 +25,7 @@ use vortex::array::arrays::DecimalArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::SharedArray;
 use vortex::array::arrays::VarBinViewArray;
+use vortex::array::arrays::chunked::ChunkedArrayExt;
 use vortex::array::assert_arrays_eq;
 use vortex::array::validity::Validity;
 use vortex::compressor::BtrBlocksCompressorBuilder;
@@ -107,21 +113,37 @@ fn stack(column: Column) -> VortexResult<(ArrayRef, ArrayRef)> {
     ))
 }
 
-fn assert_one_scheduler_loop(column: Column) -> VortexResult<()> {
-    let (stack, expected) = stack(column)?;
+/// The number of `execute_until` loops to canonical that executing `array` runs.
+fn canonical_loops(array: ArrayRef, expected: &ArrayRef) -> VortexResult<(usize, String)> {
     let mut ctx = SESSION.create_execution_ctx();
     let traced = trace_op(|| {
-        stack
+        array
             .execute::<Canonical>(&mut ctx)
             .map(IntoArray::into_array)
     })?;
-    let trace = traced.trace.to_string();
-    let loops = trace.matches("execute_until target=").count();
-    assert_eq!(
-        loops, 1,
-        "{column:?}: expected one scheduler loop, found {loops}:\n{trace}"
-    );
     assert_arrays_eq!(traced.output, expected, &mut ctx);
+    let trace = traced.trace.to_string();
+    let loops = trace.matches("execute_until target=AnyCanonical").count();
+    Ok((loops, trace))
+}
+
+fn assert_one_scheduler_loop(column: Column) -> VortexResult<()> {
+    let (stack, expected) = stack(column)?;
+    let chunks = stack.as_::<vortex::array::arrays::Chunked>().chunks();
+    let expected_chunks = expected.as_::<vortex::array::arrays::Chunked>().chunks();
+    for (chunk, expected) in chunks.into_iter().zip(expected_chunks) {
+        let (loops, trace) = canonical_loops(chunk, &expected)?;
+        assert_eq!(
+            loops, 1,
+            "{column:?}: a Shared chunk should execute in one loop:\n{trace}"
+        );
+    }
+    let (loops, trace) = canonical_loops(stack, &expected)?;
+    assert_eq!(
+        loops,
+        1 + NUM_CHUNKS,
+        "{column:?}: a Chunked stack should execute in one loop plus one per appended chunk:\n{trace}"
+    );
     Ok(())
 }
 

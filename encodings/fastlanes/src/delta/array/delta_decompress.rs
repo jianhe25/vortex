@@ -8,7 +8,9 @@ use fastlanes::Delta;
 use fastlanes::FastLanes;
 use fastlanes::Transpose;
 use itertools::Itertools;
+use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
 use vortex_array::dtype::NativePType;
@@ -25,8 +27,8 @@ pub fn delta_decompress(
     array: &DeltaArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    let bases = array.bases().clone().execute::<PrimitiveArray>(ctx)?;
-    let deltas = array.deltas().clone().execute::<PrimitiveArray>(ctx)?;
+    let bases = primitive_child(array.bases(), ctx)?;
+    let deltas = primitive_child(array.deltas(), ctx)?;
 
     let start = array.offset();
     let end = start + array.len();
@@ -49,6 +51,15 @@ pub fn delta_decompress(
     });
 
     Ok(decoded.reinterpret_cast(original_ptype))
+}
+
+/// A child as a primitive array. `Delta::execute` requires its children to be primitive before
+/// decoding, so this executes only for callers that come in another way.
+fn primitive_child(child: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
+    match child.as_opt::<Primitive>() {
+        Some(primitive) => Ok(primitive.into_owned()),
+        None => child.clone().execute::<PrimitiveArray>(ctx),
+    }
 }
 
 /// Performs the low-level delta decompression on primitive values.
