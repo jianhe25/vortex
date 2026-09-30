@@ -17,18 +17,12 @@ use arrow_select::take::take_record_batch;
 use async_trait::async_trait;
 use futures::stream;
 use itertools::Itertools;
-use object_store::path::Path as ObjectStorePath;
 use parking_lot::Mutex;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::async_reader;
 use parquet::arrow::async_reader::AsyncFileReader;
-#[expect(
-    deprecated,
-    reason = "arrow-rs deprecated this in favour of a hand-rolled AsyncFileReader; \
-        keeping it holds the measured I/O path fixed (arrow-rs#10308)"
-)]
-use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::file::metadata::PageIndexPolicy;
 use stream::StreamExt;
 use tokio::fs::File;
@@ -170,7 +164,7 @@ impl VortexRandomAccessor {
         let file = SESSION
             .open_options()
             .with_layout_reader_cache()
-            .open_object_store(remote.store(), ObjectStorePath::from(remote.key(path)?))
+            .open_object_store(remote.store(), remote.key(path)?)
             .await?;
         Ok(Self {
             name: name.into(),
@@ -221,17 +215,30 @@ pub struct ParquetRandomAccessor {
     source: ParquetSource,
 }
 
+/// Reader for a Parquet file held in an object store.
+#[expect(
+    deprecated,
+    reason = "arrow-rs deprecated this in favour of a hand-rolled AsyncFileReader; \
+        keeping it holds the measured I/O path fixed (arrow-rs#10308)"
+)]
+type ObjectReader = async_reader::ParquetObjectReader;
+
 /// Backing store of a [`ParquetRandomAccessor`].
 enum ParquetSource {
     /// Path to a local Parquet file.
     Local(PathBuf),
     /// Reader for a Parquet file held in an object store.
-    #[expect(
-        deprecated,
-        reason = "arrow-rs deprecated this in favour of a hand-rolled AsyncFileReader; \
-        keeping it holds the measured I/O path fixed (arrow-rs#10308)"
-    )]
-    Object(ParquetObjectReader),
+    Object(ObjectReader),
+}
+
+impl ParquetSource {
+    /// Open a fresh reader on the file, so each take pays the open cost like a cold reader.
+    async fn open(&self) -> anyhow::Result<Box<dyn AsyncFileReader>> {
+        Ok(match self {
+            ParquetSource::Local(path) => Box::new(File::open(path).await?),
+            ParquetSource::Object(reader) => Box::new(reader.clone()),
+        })
+    }
 }
 
 impl ParquetRandomAccessor {
@@ -248,15 +255,7 @@ impl ParquetRandomAccessor {
         path: &Path,
         name: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        #[expect(
-            deprecated,
-            reason = "arrow-rs deprecated this in favour of a hand-rolled AsyncFileReader; \
-        keeping it holds the measured I/O path fixed (arrow-rs#10308)"
-        )]
-        let mut reader = ParquetObjectReader::new(
-            Arc::clone(remote.store()),
-            ObjectStorePath::from(remote.key(path)?),
-        );
+        let mut reader = ObjectReader::new(Arc::clone(remote.store()), remote.key(path)?);
         let arrow_metadata = load_metadata(&mut reader).await?;
         Ok(Self::new(
             name,
@@ -332,62 +331,31 @@ impl RandomAccessor for ParquetRandomAccessor {
             .collect_vec();
 
         // Re-open the file but reuse cached metadata (avoids re-parsing the footer).
-        match &self.source {
-            ParquetSource::Local(path) => {
-                let file = File::open(path).await?;
-                take_row_groups(
-                    file,
-                    self.arrow_metadata.clone(),
-                    sorted_row_group_keys,
-                    &row_group_indices,
-                )
-                .await
-            }
-            ParquetSource::Object(reader) => {
-                take_row_groups(
-                    reader.clone(),
-                    self.arrow_metadata.clone(),
-                    sorted_row_group_keys,
-                    &row_group_indices,
-                )
-                .await
-            }
-        }
+        let file = self.source.open().await?;
+        let builder =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(file, self.arrow_metadata.clone());
+
+        let reader = builder
+            .with_row_groups(sorted_row_group_keys)
+            // FIXME(ngates): our indices code assumes the batch size == the row group sizes
+            .with_batch_size(10_000_000)
+            .build()?;
+
+        let schema = Arc::clone(reader.schema());
+
+        let batches = reader
+            .enumerate()
+            .map(|(idx, batch)| {
+                let batch = batch.unwrap();
+                let indices = PrimitiveArray::<Int64Type>::from(row_group_indices[idx].clone());
+                take_record_batch(&batch, &indices).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .await;
+
+        let result = concat_batches(&schema, &batches)?;
+        Ok(RandomAccessorRet::RecordBatch(result))
     }
-}
-
-/// Read `row_groups` from `reader` and take `row_group_indices` within each of them.
-async fn take_row_groups<T>(
-    reader: T,
-    metadata: ArrowReaderMetadata,
-    row_groups: Vec<usize>,
-    row_group_indices: &[Vec<i64>],
-) -> anyhow::Result<RandomAccessorRet>
-where
-    T: AsyncFileReader + Unpin + Send + 'static,
-{
-    let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, metadata);
-
-    let reader = builder
-        .with_row_groups(row_groups)
-        // FIXME(ngates): our indices code assumes the batch size == the row group sizes
-        .with_batch_size(10_000_000)
-        .build()?;
-
-    let schema = Arc::clone(reader.schema());
-
-    let batches = reader
-        .enumerate()
-        .map(|(idx, batch)| {
-            let batch = batch.unwrap();
-            let indices = PrimitiveArray::<Int64Type>::from(row_group_indices[idx].clone());
-            take_record_batch(&batch, &indices).unwrap()
-        })
-        .collect::<Vec<_>>()
-        .await;
-
-    let result = concat_batches(&schema, &batches)?;
-    Ok(RandomAccessorRet::RecordBatch(result))
 }
 
 #[cfg(test)]

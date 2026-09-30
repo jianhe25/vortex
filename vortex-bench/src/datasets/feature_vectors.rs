@@ -66,9 +66,6 @@ const VECTOR_DIM: i32 = 1024;
 /// Batch size for data generation.
 const BATCH_SIZE: usize = 100_000;
 
-/// Approximate encoded size of one row: `id` plus `VECTOR_DIM` uncompressed `f32` values.
-const APPROX_ROW_BYTES: usize = 8 + (VECTOR_DIM as usize) * 4;
-
 /// Generate a synthetic feature vectors parquet file.
 ///
 /// Schema: `id: Int64, embedding: FixedSizeList<Float32, VECTOR_DIM>`.
@@ -93,7 +90,7 @@ pub async fn feature_vectors_parquet() -> Result<PathBuf> {
             let mut writer = ArrowWriter::try_new(
                 file,
                 Arc::clone(&schema),
-                Some(random_access_writer_properties(APPROX_ROW_BYTES)?),
+                Some(random_access_writer_properties()?),
             )?;
             let mut rng = StdRng::seed_from_u64(42);
 

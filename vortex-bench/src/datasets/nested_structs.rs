@@ -63,9 +63,6 @@ impl BenchDataset for NestedStructsData {
 /// Batch size for data generation.
 const BATCH_SIZE: usize = 100_000;
 
-/// Approximate encoded size of one row: `id`, `a`, `b`, and the three inner `f64` fields.
-const APPROX_ROW_BYTES: usize = 8 * 6;
-
 /// Generate a synthetic nested structs parquet file.
 ///
 /// Schema:
@@ -104,7 +101,7 @@ pub async fn nested_structs_parquet() -> Result<PathBuf> {
             let mut writer = ArrowWriter::try_new(
                 file,
                 Arc::clone(&schema),
-                Some(random_access_writer_properties(APPROX_ROW_BYTES)?),
+                Some(random_access_writer_properties()?),
             )?;
             let mut rng = StdRng::seed_from_u64(42);
 

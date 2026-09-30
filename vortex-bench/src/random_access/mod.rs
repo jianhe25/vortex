@@ -13,6 +13,7 @@ use arrow_ipc::writer::FileWriter;
 use async_trait::async_trait;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
+use object_store::path::Path as ObjectStorePath;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::basic::ZstdLevel;
@@ -81,45 +82,31 @@ pub fn parquet_to_arrow_file(parquet_path: PathBuf, arrow_path: String) -> Resul
     })
 }
 
-/// Approximate byte budget for one row group in the synthetic random-access datasets.
-const TARGET_ROW_GROUP_BYTES: usize = 128 * 1024 * 1024;
-
-/// Row groups are sized in whole multiples of this many rows.
+/// Rows per row group in the synthetic random-access datasets.
 ///
-/// Parquet is converted to Vortex by streaming Arrow batches of [`PARQUET_READ_BATCH_SIZE`] rows,
-/// so keeping row groups a whole multiple of it leaves the derived Vortex files byte-identical:
-/// only the Parquet layout changes.
-const PARQUET_READ_BATCH_SIZE: usize = 1024;
-
-/// Bounds on the row group size, in units of [`PARQUET_READ_BATCH_SIZE`] rows.
+/// The parquet-rs default of 1Mi rows is more than every dataset here holds, so each file would
+/// end up as one row group. Readers select row groups before rows, so a single-row-group file
+/// forces a point lookup to fetch and decode the whole file: cheap from page cache, ruinous over
+/// an object store.
 ///
-/// The upper bound matters more than the byte budget for narrow rows: without it a million-row
-/// dataset lands in a single row group, and a point lookup then has to read the entire file.
-const MIN_BATCHES_PER_ROW_GROUP: usize = 8;
-const MAX_BATCHES_PER_ROW_GROUP: usize = 64;
+/// This is a whole multiple of the 1024-row Arrow batches the Parquet-to-Vortex conversion reads,
+/// so the derived Vortex files are unaffected by the Parquet layout.
+const ROW_GROUP_ROWS: usize = 32 * 1024;
 
 /// Rows per data page.
 ///
 /// Finer pages than the 20k-row default give the page index enough resolution to be useful for
 /// point lookups, at the cost of a slightly larger index.
-const DATA_PAGE_ROWS: usize = PARQUET_READ_BATCH_SIZE;
+const DATA_PAGE_ROWS: usize = 1024;
 
-/// Parquet writer properties for a synthetic random-access dataset of `approx_row_bytes` per row.
-///
-/// The defaults are wrong for this suite: the max row group row count defaults to 1Mi rows, which is more
-/// than every dataset here holds, so each file ends up as one row group. Readers select row groups
-/// before rows, so a single-row-group file forces a point lookup to fetch and decode the whole
-/// file — cheap from page cache, ruinous over an object store.
+/// Parquet writer properties for the synthetic random-access datasets.
 ///
 /// Compression is zstd level 3, matching every other benchmark data generator; parquet-rs would
 /// otherwise write these files uncompressed.
-pub fn random_access_writer_properties(approx_row_bytes: usize) -> Result<WriterProperties> {
-    let batches = (TARGET_ROW_GROUP_BYTES / approx_row_bytes / PARQUET_READ_BATCH_SIZE)
-        .clamp(MIN_BATCHES_PER_ROW_GROUP, MAX_BATCHES_PER_ROW_GROUP);
-
+pub fn random_access_writer_properties() -> Result<WriterProperties> {
     Ok(WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-        .set_max_row_group_row_count(Some(batches * PARQUET_READ_BATCH_SIZE))
+        .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
         .set_data_page_row_count_limit(DATA_PAGE_ROWS)
         .build())
 }
@@ -159,7 +146,7 @@ impl RemoteDataDir {
     }
 
     /// The object key of `local_path`, mirroring its location under the local data directory.
-    pub fn key(&self, local_path: &Path) -> Result<String> {
+    pub fn key(&self, local_path: &Path) -> Result<ObjectStorePath> {
         let relative = local_path.strip_prefix(data_dir()).map_err(|_| {
             anyhow!(
                 "{} is not inside the benchmark data directory",
@@ -169,16 +156,11 @@ impl RemoteDataDir {
         let relative = relative
             .to_str()
             .ok_or_else(|| anyhow!("non-UTF-8 data path: {}", local_path.display()))?;
-        let prefix = self
-            .url
-            .path()
-            .trim_start_matches('/')
-            .trim_end_matches('/');
-        Ok(if prefix.is_empty() {
-            relative.to_string()
-        } else {
-            format!("{prefix}/{relative}")
-        })
+        // `ObjectStorePath` drops the empty segments left by leading or trailing slashes.
+        Ok(ObjectStorePath::from(format!(
+            "{}/{relative}",
+            self.url.path()
+        )))
     }
 
     /// The fully qualified URL of `local_path` in this remote directory.
@@ -231,8 +213,6 @@ pub trait RandomAccessor: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use rstest::rstest;
-
     use super::*;
 
     fn remote(url: &str) -> Result<RemoteDataDir> {
@@ -245,11 +225,11 @@ mod tests {
         let local = data_dir().join("random_access/taxi/taxi.vortex");
 
         assert_eq!(
-            remote("s3://bucket/prefix/")?.key(&local)?,
+            remote("s3://bucket/prefix/")?.key(&local)?.as_ref(),
             "prefix/random_access/taxi/taxi.vortex"
         );
         assert_eq!(
-            remote("s3://bucket/")?.key(&local)?,
+            remote("s3://bucket/")?.key(&local)?.as_ref(),
             "random_access/taxi/taxi.vortex"
         );
         assert_eq!(
@@ -269,61 +249,24 @@ mod tests {
         Ok(())
     }
 
-    /// Rows per row group, treating "unlimited" as the whole file.
-    fn rows_per_row_group(props: &WriterProperties) -> usize {
-        props.max_row_group_row_count().unwrap_or(usize::MAX)
-    }
-
-    /// Row widths of the three synthetic random-access datasets.
-    const FEATURE_VECTORS_ROW_BYTES: usize = 8 + 1024 * 4;
-    const NESTED_LISTS_ROW_BYTES: usize = 8 + 10 * 8;
-    const NESTED_STRUCTS_ROW_BYTES: usize = 8 * 6;
-
-    #[rstest]
-    #[case::feature_vectors(FEATURE_VECTORS_ROW_BYTES)]
-    #[case::nested_lists(NESTED_LISTS_ROW_BYTES)]
-    #[case::nested_structs(NESTED_STRUCTS_ROW_BYTES)]
-    fn row_groups_split_a_million_row_dataset(#[case] approx_row_bytes: usize) -> Result<()> {
-        let props = random_access_writer_properties(approx_row_bytes)?;
-        let rows_per_group = rows_per_row_group(&props);
-
-        // The whole point: a million-row dataset must not land in a single row group.
-        assert!(
-            rows_per_group < 1_000_000,
-            "{approx_row_bytes} byte rows produced one row group of {rows_per_group}"
-        );
-        // Row group boundaries stay aligned to the Arrow batches the Vortex conversion reads,
-        // so the derived Vortex files are unaffected by this layout.
-        assert_eq!(rows_per_group % PARQUET_READ_BATCH_SIZE, 0);
-        assert!(rows_per_group * approx_row_bytes <= TARGET_ROW_GROUP_BYTES);
+    #[test]
+    fn unsupported_scheme_is_rejected() -> Result<()> {
+        assert!(RemoteDataDir::try_new(Url::parse("gs://bucket/prefix/")?).is_err());
         Ok(())
     }
 
     #[test]
-    fn generated_parquet_is_zstd_level_3() -> Result<()> {
-        let props = random_access_writer_properties(FEATURE_VECTORS_ROW_BYTES)?;
+    fn writer_properties_split_a_million_row_dataset() -> Result<()> {
+        let props = random_access_writer_properties()?;
+        let rows_per_group = props.max_row_group_row_count().unwrap_or(usize::MAX);
+
+        assert!(rows_per_group < 1_000_000);
+        // Row group boundaries stay aligned to the Arrow batches the Vortex conversion reads.
+        assert_eq!(rows_per_group % 1024, 0);
         assert_eq!(
             props.compression(&"embedding".into()),
             Compression::ZSTD(ZstdLevel::try_new(3)?)
         );
-        Ok(())
-    }
-
-    #[test]
-    fn wide_rows_get_smaller_row_groups_than_narrow_rows() -> Result<()> {
-        let wide = rows_per_row_group(&random_access_writer_properties(FEATURE_VECTORS_ROW_BYTES)?);
-        let narrow =
-            rows_per_row_group(&random_access_writer_properties(NESTED_STRUCTS_ROW_BYTES)?);
-        assert!(
-            wide < narrow,
-            "wide {wide} should be smaller than narrow {narrow}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn unsupported_scheme_is_rejected() -> Result<()> {
-        assert!(RemoteDataDir::try_new(Url::parse("gs://bucket/prefix/")?).is_err());
         Ok(())
     }
 }
