@@ -63,6 +63,21 @@ stated cause does not. **Disproved** = the statement is wrong on this tree.
 - The only way to hit the described full-decode path is a session without the FSST/OnPair
   `initialize()` calls (for example a bare `array_session()`), in which case Filter's own
   `execute` canonicalises the child (`vortex-array/src/arrays/filter/vtable.rs:179`).
+  `vortex-datafusion` builds its sessions with `VortexSession::default()`
+  (`vortex-datafusion/src/persistent/format.rs:318`), so the profiled DataFusion runs had both
+  kernels registered.
+- Nothing needs adding; the PRs that did it are already merged:
+  - FSST: [vortex-data/vortex#5755](https://github.com/vortex-data/vortex/pull/5755)
+    "FSST Filter Kernel" (2025-12-16) added `encodings/fsst/src/kernel.rs`, and
+    [vortex-data/vortex#8482](https://github.com/vortex-data/vortex/pull/8482) (2026-06-18)
+    moved the registration into the session registry via `vortex_fsst::initialize`.
+  - OnPair: [vortex-data/vortex#8872](https://github.com/vortex-data/vortex/pull/8872)
+    "promote OnPair to a stable read-only encoding" (2026-07-21) added
+    `encodings/onpair/src/compute/filter.rs` and its registration.
+  - Both predate the SF1 measurements, so the note's "no kernel exists" was already wrong when
+    written. The remaining cost (28 to 50ns per surviving row) is inside the kernels: the VarBin
+    code filter and decoding the survivors, so a cheaper kernel is still a valid follow-up, just
+    not a missing one.
 
 ### 3. `Between` on `DecimalByteParts` is not pushed into the packed part — Confirmed
 
