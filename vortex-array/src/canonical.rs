@@ -1235,48 +1235,46 @@ pub struct AnyCanonical;
 impl Matcher for AnyCanonical {
     type Match<'a> = CanonicalView<'a>;
 
+    /// Each logical [`DType`] has exactly one canonical encoding, and every canonical encoding
+    /// validates that its dtype is of the matching kind, so one downcast decides the match
+    /// instead of trying all twelve canonical encodings in turn.
     #[inline]
     fn matches(array: &ArrayRef) -> bool {
-        array.is::<Null>()
-            || array.is::<Bool>()
-            || array.is::<Primitive>()
-            || array.is::<Decimal>()
-            || array.is::<Struct>()
-            || array.is::<Union>()
-            || array.is::<ListView>()
-            || array.is::<Map>()
-            || array.is::<FixedSizeList>()
-            || array.is::<VarBinView>()
-            || array.is::<Variant>()
-            || array.is::<Extension>()
+        match array.dtype() {
+            DType::Null => array.is::<Null>(),
+            DType::Bool(_) => array.is::<Bool>(),
+            DType::Primitive(..) => array.is::<Primitive>(),
+            DType::Decimal(..) => array.is::<Decimal>(),
+            DType::Utf8(_) | DType::Binary(_) => array.is::<VarBinView>(),
+            DType::List(..) => array.is::<ListView>(),
+            DType::FixedSizeList(..) => array.is::<FixedSizeList>(),
+            DType::Map(..) => array.is::<Map>(),
+            DType::Struct(..) => array.is::<Struct>(),
+            DType::Union(..) => array.is::<Union>(),
+            DType::Variant(_) => array.is::<Variant>(),
+            DType::Extension(_) => array.is::<Extension>(),
+        }
     }
 
     #[inline]
     fn try_match(array: &ArrayRef) -> Option<Self::Match<'_>> {
-        if let Some(a) = array.as_opt::<Null>() {
-            Some(CanonicalView::Null(a))
-        } else if let Some(a) = array.as_opt::<Bool>() {
-            Some(CanonicalView::Bool(a))
-        } else if let Some(a) = array.as_opt::<Primitive>() {
-            Some(CanonicalView::Primitive(a))
-        } else if let Some(a) = array.as_opt::<Decimal>() {
-            Some(CanonicalView::Decimal(a))
-        } else if let Some(a) = array.as_opt::<Struct>() {
-            Some(CanonicalView::Struct(a))
-        } else if let Some(a) = array.as_opt::<Union>() {
-            Some(CanonicalView::Union(a))
-        } else if let Some(a) = array.as_opt::<ListView>() {
-            Some(CanonicalView::List(a))
-        } else if let Some(a) = array.as_opt::<Map>() {
-            Some(CanonicalView::Map(a))
-        } else if let Some(a) = array.as_opt::<FixedSizeList>() {
-            Some(CanonicalView::FixedSizeList(a))
-        } else if let Some(a) = array.as_opt::<VarBinView>() {
-            Some(CanonicalView::VarBinView(a))
-        } else if let Some(a) = array.as_opt::<Variant>() {
-            Some(CanonicalView::Variant(a))
-        } else {
-            array.as_opt::<Extension>().map(CanonicalView::Extension)
+        match array.dtype() {
+            DType::Null => array.as_opt::<Null>().map(CanonicalView::Null),
+            DType::Bool(_) => array.as_opt::<Bool>().map(CanonicalView::Bool),
+            DType::Primitive(..) => array.as_opt::<Primitive>().map(CanonicalView::Primitive),
+            DType::Decimal(..) => array.as_opt::<Decimal>().map(CanonicalView::Decimal),
+            DType::Utf8(_) | DType::Binary(_) => {
+                array.as_opt::<VarBinView>().map(CanonicalView::VarBinView)
+            }
+            DType::List(..) => array.as_opt::<ListView>().map(CanonicalView::List),
+            DType::FixedSizeList(..) => array
+                .as_opt::<FixedSizeList>()
+                .map(CanonicalView::FixedSizeList),
+            DType::Map(..) => array.as_opt::<Map>().map(CanonicalView::Map),
+            DType::Struct(..) => array.as_opt::<Struct>().map(CanonicalView::Struct),
+            DType::Union(..) => array.as_opt::<Union>().map(CanonicalView::Union),
+            DType::Variant(_) => array.as_opt::<Variant>().map(CanonicalView::Variant),
+            DType::Extension(_) => array.as_opt::<Extension>().map(CanonicalView::Extension),
         }
     }
 }
@@ -1302,6 +1300,7 @@ mod test {
     use crate::arrays::VariantArray;
     use crate::arrays::struct_::StructArrayExt;
     use crate::arrays::variant::VariantArraySlotsExt;
+    use crate::canonical::AnyCanonical;
     use crate::canonical::StructArray;
     use crate::dtype::Nullability;
     use crate::scalar::Scalar;
@@ -1315,6 +1314,66 @@ mod test {
             len,
         )
         .into_array()
+    }
+
+    /// The exhaustive form of [`AnyCanonical::matches`] that the dtype-directed version replaced.
+    fn matches_any_canonical_exhaustively(array: &ArrayRef) -> bool {
+        array.is::<crate::arrays::Null>()
+            || array.is::<crate::arrays::Bool>()
+            || array.is::<Primitive>()
+            || array.is::<crate::arrays::Decimal>()
+            || array.is::<Struct>()
+            || array.is::<crate::arrays::Union>()
+            || array.is::<crate::arrays::ListView>()
+            || array.is::<crate::arrays::Map>()
+            || array.is::<crate::arrays::FixedSizeList>()
+            || array.is::<crate::arrays::VarBinView>()
+            || array.is::<Variant>()
+            || array.is::<crate::arrays::Extension>()
+    }
+
+    #[test]
+    fn any_canonical_matches_by_dtype() -> VortexResult<()> {
+        use std::sync::Arc;
+
+        use crate::dtype::DType;
+        use crate::dtype::PType;
+        use crate::dtype::StructFields;
+
+        let i32_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let canonical_dtypes = [
+            DType::Null,
+            DType::Bool(Nullability::Nullable),
+            i32_dtype.clone(),
+            DType::Utf8(Nullability::NonNullable),
+            DType::Binary(Nullability::Nullable),
+            DType::List(Arc::new(i32_dtype.clone()), Nullability::NonNullable),
+            DType::FixedSizeList(Arc::new(i32_dtype.clone()), 2, Nullability::NonNullable),
+            DType::Struct(
+                StructFields::from_iter([("a", i32_dtype)]),
+                Nullability::NonNullable,
+            ),
+        ];
+        let mut arrays: Vec<ArrayRef> = canonical_dtypes
+            .iter()
+            .map(|dtype| Canonical::empty(dtype).into_array())
+            .collect();
+        arrays.push(ConstantArray::new(1i32, 4).into_array());
+        arrays.push(VariantArray::try_new(variant_core_storage(2), None)?.into_array());
+
+        for array in &arrays {
+            assert_eq!(
+                array.is::<AnyCanonical>(),
+                matches_any_canonical_exhaustively(array),
+                "{array}"
+            );
+            assert_eq!(
+                array.as_opt::<AnyCanonical>().is_some(),
+                matches_any_canonical_exhaustively(array),
+                "{array}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

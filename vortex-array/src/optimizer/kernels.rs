@@ -112,6 +112,12 @@ pub(crate) type ExecuteParentKernelRef = Arc<dyn DynExecuteParentKernel>;
 
 pub(crate) type ParentExecutionKernels = HashMap<ExecuteParentFnId, Arc<[ExecuteParentKernelRef]>>;
 
+/// The set of parent encoding ids that have at least one execute-parent kernel registered.
+///
+/// The executor consults this before looking up `(parent, child)` pairs, so a parent whose
+/// encoding has no kernels (every pure compression encoding) skips the per-child lookups.
+pub(crate) type ParentExecutionParents = HashMap<Id, ()>;
+
 #[derive(Debug)]
 struct ExecuteParentFnKernel(ExecuteParentFn);
 
@@ -185,6 +191,7 @@ type ExecuteParentRegistry = ArcSwapMap<ExecuteParentFnId, Arc<[ExecuteParentKer
 pub struct ArrayKernels {
     reduce_parent: ReduceParentRegistry,
     execute_parent: ExecuteParentRegistry,
+    execute_parent_parents: ArcSwapMap<Id, ()>,
 }
 
 impl Default for ArrayKernels {
@@ -201,6 +208,7 @@ impl ArrayKernels {
         Self {
             reduce_parent: ReduceParentRegistry::default(),
             execute_parent: ExecuteParentRegistry::default(),
+            execute_parent_parents: ArcSwapMap::default(),
         }
     }
 
@@ -250,6 +258,7 @@ impl ArrayKernels {
             .collect();
         self.execute_parent
             .extend(hash_fn_id(parent, child).into(), kernels.as_slice());
+        self.execute_parent_parents.insert_if_absent(parent, ());
     }
 
     /// Register a typed [`ExecuteParentKernel`] for `(parent, child.id())`.
@@ -273,6 +282,7 @@ impl ArrayKernels {
                 kernel,
             }) as ExecuteParentKernelRef,
         );
+        self.execute_parent_parents.insert_if_absent(parent, ());
     }
 
     /// Returns true when one or more execute-parent kernels are registered for `(parent, child)`.
@@ -285,6 +295,11 @@ impl ArrayKernels {
     /// Return the currently published execute-parent kernel snapshot.
     pub(crate) fn execute_parent_snapshot(&self) -> Arc<ParentExecutionKernels> {
         self.execute_parent.snapshot()
+    }
+
+    /// Return the currently published set of parent ids with execute-parent kernels.
+    pub(crate) fn execute_parent_parents_snapshot(&self) -> Arc<ParentExecutionParents> {
+        self.execute_parent_parents.snapshot()
     }
 }
 
