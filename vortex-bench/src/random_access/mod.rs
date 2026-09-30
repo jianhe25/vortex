@@ -10,6 +10,9 @@ use arrow_array::RecordBatch;
 use arrow_ipc::writer::FileWriter;
 use async_trait::async_trait;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::Compression;
+use parquet::basic::ZstdLevel;
+use parquet::file::properties::WriterProperties;
 use vortex::array::ArrayRef;
 
 use crate::Format;
@@ -72,6 +75,35 @@ pub fn parquet_to_arrow_file(parquet_path: PathBuf, arrow_path: String) -> Resul
     })
 }
 
+/// Rows per row group in the synthetic random-access datasets.
+///
+/// The parquet-rs default of 1Mi rows is more than every dataset here holds, so each file would
+/// end up as one row group. Readers select row groups before rows, so a single-row-group file
+/// forces a point lookup to fetch and decode the whole file: cheap from page cache, ruinous over
+/// an object store.
+///
+/// This is a whole multiple of the 1024-row Arrow batches the Parquet-to-Vortex conversion reads,
+/// so the derived Vortex files are unaffected by the Parquet layout.
+const ROW_GROUP_ROWS: usize = 32 * 1024;
+
+/// Rows per data page.
+///
+/// Finer pages than the 20k-row default give the page index enough resolution to be useful for
+/// point lookups, at the cost of a slightly larger index.
+const DATA_PAGE_ROWS: usize = 1024;
+
+/// Parquet writer properties for the synthetic random-access datasets.
+///
+/// Compression is zstd level 3, matching every other benchmark data generator; parquet-rs would
+/// otherwise write these files uncompressed.
+pub fn random_access_writer_properties() -> Result<WriterProperties> {
+    Ok(WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
+        .set_data_page_row_count_limit(DATA_PAGE_ROWS)
+        .build())
+}
+
 /// Trait for a benchmark dataset that knows how to prepare data files.
 #[async_trait]
 pub trait BenchDataset: Send + Sync {
@@ -107,4 +139,24 @@ pub trait RandomAccessor: Send + Sync {
 
     /// Take rows at the given indices, returning the handle.
     async fn take(&self, indices: &[u64]) -> Result<RandomAccessorRet>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_properties_split_a_million_row_dataset() -> Result<()> {
+        let props = random_access_writer_properties()?;
+        let rows_per_group = props.max_row_group_row_count().unwrap_or(usize::MAX);
+
+        assert!(rows_per_group < 1_000_000);
+        // Row group boundaries stay aligned to the Arrow batches the Vortex conversion reads.
+        assert_eq!(rows_per_group % 1024, 0);
+        assert_eq!(
+            props.compression(&"embedding".into()),
+            Compression::ZSTD(ZstdLevel::try_new(3)?)
+        );
+        Ok(())
+    }
 }
