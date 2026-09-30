@@ -19,7 +19,6 @@ use crate::scalar::Scalar;
 use crate::scalar_fn::fns::between::BetweenKernel;
 use crate::scalar_fn::fns::between::BetweenOptions;
 use crate::scalar_fn::fns::between::StrictComparison;
-use crate::scalar_fn::fns::between::all_false;
 
 impl BetweenKernel for Decimal {
     fn between(
@@ -83,7 +82,10 @@ fn between_unpack<T: NativeDecimalType>(
         Some(v) => Some(v),
         None => {
             if lower_dv.as_i256() >= i256::ZERO {
-                return all_false(arr.array(), nullability).map(Some);
+                let validity = arr.validity()?.union_nullability(nullability);
+                return Ok(Some(
+                    BoolArray::new(BitBuffer::new_unset(arr.len()), validity).into_array(),
+                ));
             }
             None
         }
@@ -93,7 +95,10 @@ fn between_unpack<T: NativeDecimalType>(
         Some(v) => Some(v),
         None => {
             if upper_dv.as_i256() < i256::ZERO {
-                return all_false(arr.array(), nullability).map(Some);
+                let validity = arr.validity()?.union_nullability(nullability);
+                return Ok(Some(
+                    BoolArray::new(BitBuffer::new_unset(arr.len()), validity).into_array(),
+                ));
             }
             None
         }

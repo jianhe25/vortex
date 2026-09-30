@@ -5,6 +5,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
@@ -13,7 +14,7 @@ use vortex_array::scalar::ScalarValue;
 use vortex_array::scalar_fn::fns::between::BetweenKernel;
 use vortex_array::scalar_fn::fns::between::BetweenOptions;
 use vortex_array::scalar_fn::fns::between::StrictComparison;
-use vortex_array::scalar_fn::fns::between::all_false;
+use vortex_buffer::BitBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
@@ -62,7 +63,10 @@ impl BetweenKernel for DecimalByteParts {
             Ok(value) => (value, options.lower_strict),
             Err(Sign::Negative) => (ptype.min_value().into(), StrictComparison::NonStrict),
             Err(Sign::Positive) => {
-                return all_false(array.array(), nullability).map(Some);
+                let validity = array.validity()?.union_nullability(nullability);
+                return Ok(Some(
+                    BoolArray::new(BitBuffer::new_unset(array.len()), validity).into_array(),
+                ));
             }
         };
         let (upper_value, upper_strict) = match decimal_value_wrapper_to_primitive(upper_dv, ptype)
@@ -70,7 +74,10 @@ impl BetweenKernel for DecimalByteParts {
             Ok(value) => (value, options.upper_strict),
             Err(Sign::Positive) => (ptype.max_value().into(), StrictComparison::NonStrict),
             Err(Sign::Negative) => {
-                return all_false(array.array(), nullability).map(Some);
+                let validity = array.validity()?.union_nullability(nullability);
+                return Ok(Some(
+                    BoolArray::new(BitBuffer::new_unset(array.len()), validity).into_array(),
+                ));
             }
         };
 
