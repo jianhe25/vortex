@@ -222,7 +222,6 @@ jobs:
             Benchmark `${{ inputs.benchmark_name }}` failed! Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
           comment-tag: bench-pr-comment-${{ inputs.benchmark_id }}${{ inputs.variant_id }}
 
-
       - name: Delete benchmark data from S3
         if: always() && inputs.remote_data_dir != '' && github.event.pull_request.head.repo.fork == false
         shell: bash
