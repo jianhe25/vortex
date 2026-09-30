@@ -80,7 +80,3 @@ harness = false
 [[bench]]
 name = "for_decode"
 harness = false
-
-[[bench]]
-name = "for_filter"
-harness = false
