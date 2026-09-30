@@ -14,13 +14,14 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/default/default_functions.hpp"
 #include "duckdb/common/insertion_order_preserving_map.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
-#include "duckdb/function/table_function.hpp"
-#include "duckdb/main/capi/capi_internal.hpp"
-#include "duckdb/logging/logger.hpp"
-#include "duckdb/main/connection.hpp"
 #include "duckdb/function/partition_stats.hpp"
+#include "duckdb/function/scalar_macro_function.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/main/capi/capi_internal.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/storage_index.hpp"
@@ -268,14 +269,15 @@ extern "C" duckdb_state duckdb_vx_register_version_function(duckdb_database ffi_
     const DatabaseWrapper &wrapper = *reinterpret_cast<DatabaseWrapper *>(ffi_db);
     DatabaseInstance &db = *wrapper.database->instance;
 
-    const string definition = StringUtil::Format("() AS %s", SQLString::ToString(version));
-    const DefaultMacro macro {DEFAULT_SCHEMA, "vortex_version", definition.c_str()};
+    unique_ptr<ParsedExpression> expr = ConstantExpression::FromValue(version);
+    CreateMacroInfo info(CatalogType::MACRO_ENTRY);
+    info.macros.emplace_back(make_uniq<ScalarMacroFunction>(std::move(expr)));
+    info.SetQualifiedName({{DEFAULT_SCHEMA}, "vortex_version"});
+    info.internal = true; // only internals allowed in system catalog
 
     try {
-        auto info = DefaultFunctionGenerator::CreateInternalMacroInfo(macro);
-        auto &system_catalog = Catalog::GetSystemCatalog(db);
         auto data = CatalogTransaction::GetSystemTransaction(db);
-        system_catalog.CreateFunction(data, *info);
+        Catalog::GetSystemCatalog(db).CreateFunction(data, info);
     } catch (const std::exception &e) {
         ErrorData data(e);
         DUCKDB_LOG_ERROR(db, "Failed to create the vortex_version macro:\t" + data.Message());
