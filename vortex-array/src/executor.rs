@@ -170,6 +170,8 @@ impl ArrayRef {
         let mut current_array = self;
         let mut current_builder: Option<Box<dyn ArrayBuilder>> = None;
         let mut stack: Vec<StackFrame> = Vec::new();
+        // PROTOTYPE: slot index a parent was just re-entered from via pop_frame, if any.
+        let mut resume_slot: Option<usize> = None;
         let execute_parent_kernels = Arc::clone(&ctx.execute_parent_kernels);
         let kernels = execute_parent_kernels.as_ref();
         let max_iterations = max_iterations();
@@ -206,6 +208,7 @@ impl ArrayRef {
                     }
                     Some(frame) => {
                         let _slot_idx = frame.slot_idx;
+                        resume_slot = Some(frame.slot_idx);
                         (current_array, current_builder) = pop_frame(frame, current_array)?;
                         trace_op!(record_execute_until_pop_frame(_slot_idx, &current_array));
                         continue;
@@ -241,6 +244,7 @@ impl ArrayRef {
                 trace_op!(record_execute_optimized(&result, &optimized));
                 current_array = optimized;
                 current_builder = frame.parent_builder;
+                resume_slot = None;
                 continue;
             }
             if current_builder.is_none() && stack.last().is_some() {
@@ -257,6 +261,7 @@ impl ArrayRef {
                 let optimized = rewritten.optimize_ctx(ctx.session())?;
                 trace_op!(record_execute_optimized(&rewritten, &optimized));
                 current_array = optimized;
+                resume_slot = None;
                 continue;
             }
             if current_builder.is_none() {
@@ -271,8 +276,10 @@ impl ArrayRef {
             let stats = current_array.statistics().to_array_stats();
             let encoding_id = current_array.encoding_id();
             trace_op!(record_execute_encoding(&current_array));
-            let result = current_array.execute_encoding_unchecked(ctx)?;
-            let (array, step) = result.into_parts();
+            ctx.resume_slot = resume_slot.take();
+            let result = current_array.execute_encoding_unchecked(ctx);
+            ctx.resume_slot = None;
+            let (array, step) = result?.into_parts();
             match step {
                 ExecutionStep::ExecuteSlot(i, done) => {
                     let (parent, child) = unsafe { array.take_slot_unchecked(i) }?;
@@ -354,6 +361,9 @@ pub struct ExecutionCtx {
     // OnceLock avoids cloning the session allocator when a context does not allocate.
     allocator: OnceLock<BufferAllocatorRef>,
     execute_parent_kernels: Arc<ParentExecutionKernels>,
+    /// PROTOTYPE: set by the executor while re-entering a parent right after the child in this
+    /// slot finished executing. Encodings may skip checks for slots up to and including it.
+    resume_slot: Option<usize>,
     #[cfg(debug_assertions)]
     id: usize,
     #[cfg(debug_assertions)]
@@ -372,6 +382,7 @@ impl ExecutionCtx {
             session,
             allocator: OnceLock::new(),
             execute_parent_kernels,
+            resume_slot: None,
             #[cfg(debug_assertions)]
             id: {
                 static EXEC_CTX_ID: AtomicUsize = AtomicUsize::new(0);
@@ -385,6 +396,13 @@ impl ExecutionCtx {
     /// Get the session associated with this execution context.
     pub fn session(&self) -> &VortexSession {
         &self.session
+    }
+
+    /// PROTOTYPE: the slot whose child just finished executing, when the current `execute` call
+    /// is a re-entry of a parent that requested it via `ExecuteSlot`.
+    #[inline]
+    pub fn resume_slot(&self) -> Option<usize> {
+        self.resume_slot
     }
 
     /// Get the allocator for this execution context.

@@ -71,3 +71,8 @@ harness = false
 name = "cast_bitpacked"
 harness = false
 required-features = ["_test-harness"]
+
+[[bench]]
+name = "execute_reentry"
+harness = false
+required-features = ["_test-harness"]

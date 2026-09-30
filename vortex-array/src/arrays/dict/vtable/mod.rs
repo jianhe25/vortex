@@ -193,23 +193,35 @@ impl VTable for Dict {
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        if array.is_empty() {
+        // PROTOTYPE: `resume` is the slot that just finished executing; every check up to the
+        // `require_child!` for that slot already passed on the previous entry.
+        let resume = ctx.resume_slot();
+
+        if resume.is_none() && array.is_empty() {
             let result_dtype = array
                 .dtype()
                 .union_nullability(array.codes().dtype().nullability());
             return Ok(ExecutionResult::done(Canonical::empty(&result_dtype)));
         }
 
-        let array = require_child!(array, array.codes(), DictSlots::CODES => Primitive);
+        let array = if resume >= Some(DictSlots::CODES) {
+            array
+        } else {
+            require_child!(array, array.codes(), DictSlots::CODES => Primitive)
+        };
 
-        if array.codes().validity()?.definitely_all_null() {
+        if resume < Some(DictSlots::VALUES) && array.codes().validity()?.definitely_all_null() {
             return Ok(ExecutionResult::done(ConstantArray::new(
                 Scalar::null(array.dtype().as_nullable()),
                 array.codes().len(),
             )));
         }
 
-        let array = require_child!(array, array.values(), DictSlots::VALUES => AnyCanonical);
+        let array = if resume >= Some(DictSlots::VALUES) {
+            array
+        } else {
+            require_child!(array, array.values(), DictSlots::VALUES => AnyCanonical)
+        };
 
         let DictParts { values, codes, .. } = array.into_parts();
 

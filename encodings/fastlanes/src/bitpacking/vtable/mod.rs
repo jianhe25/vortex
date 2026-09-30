@@ -25,7 +25,6 @@ use vortex_array::match_each_integer_ptype;
 use vortex_array::patches::Patches;
 use vortex_array::patches::PatchesData;
 use vortex_array::patches::PatchesMetadata;
-use vortex_array::require_patches;
 use vortex_array::require_validity;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::validity::Validity;
@@ -277,13 +276,32 @@ impl VTable for BitPacked {
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        require_patches!(
-            array,
-            BitPackedSlots::PATCH_INDICES,
-            BitPackedSlots::PATCH_VALUES,
-            BitPackedSlots::PATCH_CHUNK_OFFSETS
-        );
-        require_validity!(array, BitPackedSlots::VALIDITY_CHILD);
+        // PROTOTYPE: skip checks for slots at or before the one that just finished executing.
+        let resume = ctx.resume_slot();
+        if resume < Some(BitPackedSlots::PATCH_INDICES) {
+            vortex_array::require_opt_child!(
+                array,
+                array.slots()[BitPackedSlots::PATCH_INDICES].as_ref(),
+                BitPackedSlots::PATCH_INDICES => vortex_array::arrays::Primitive
+            );
+        }
+        if resume < Some(BitPackedSlots::PATCH_VALUES) {
+            vortex_array::require_opt_child!(
+                array,
+                array.slots()[BitPackedSlots::PATCH_VALUES].as_ref(),
+                BitPackedSlots::PATCH_VALUES => vortex_array::arrays::Primitive
+            );
+        }
+        if resume < Some(BitPackedSlots::PATCH_CHUNK_OFFSETS) {
+            vortex_array::require_opt_child!(
+                array,
+                array.slots()[BitPackedSlots::PATCH_CHUNK_OFFSETS].as_ref(),
+                BitPackedSlots::PATCH_CHUNK_OFFSETS => vortex_array::arrays::Primitive
+            );
+        }
+        if resume < Some(BitPackedSlots::VALIDITY_CHILD) {
+            require_validity!(array, BitPackedSlots::VALIDITY_CHILD);
+        }
 
         Ok(ExecutionResult::done(
             unpack_array(array.as_view(), ctx)?.into_array(),
