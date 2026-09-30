@@ -93,7 +93,7 @@ pub async fn feature_vectors_parquet() -> Result<PathBuf> {
             let mut writer = ArrowWriter::try_new(
                 file,
                 Arc::clone(&schema),
-                Some(random_access_writer_properties(APPROX_ROW_BYTES)),
+                Some(random_access_writer_properties(APPROX_ROW_BYTES)?),
             )?;
             let mut rng = StdRng::seed_from_u64(42);
 

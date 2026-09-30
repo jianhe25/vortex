@@ -14,6 +14,8 @@ use async_trait::async_trait;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::Compression;
+use parquet::basic::ZstdLevel;
 use parquet::file::properties::WriterProperties;
 use url::Url;
 use vortex::array::ArrayRef;
@@ -108,14 +110,18 @@ const DATA_PAGE_ROWS: usize = PARQUET_READ_BATCH_SIZE;
 /// than every dataset here holds, so each file ends up as one row group. Readers select row groups
 /// before rows, so a single-row-group file forces a point lookup to fetch and decode the whole
 /// file — cheap from page cache, ruinous over an object store.
-pub fn random_access_writer_properties(approx_row_bytes: usize) -> WriterProperties {
+///
+/// Compression is zstd level 3, matching every other benchmark data generator; parquet-rs would
+/// otherwise write these files uncompressed.
+pub fn random_access_writer_properties(approx_row_bytes: usize) -> Result<WriterProperties> {
     let batches = (TARGET_ROW_GROUP_BYTES / approx_row_bytes / PARQUET_READ_BATCH_SIZE)
         .clamp(MIN_BATCHES_PER_ROW_GROUP, MAX_BATCHES_PER_ROW_GROUP);
 
-    WriterProperties::builder()
+    Ok(WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
         .set_max_row_group_row_count(Some(batches * PARQUET_READ_BATCH_SIZE))
         .set_data_page_row_count_limit(DATA_PAGE_ROWS)
-        .build()
+        .build())
 }
 
 /// A remote directory holding the same layout as the local benchmark data directory.
@@ -277,8 +283,8 @@ mod tests {
     #[case::feature_vectors(FEATURE_VECTORS_ROW_BYTES)]
     #[case::nested_lists(NESTED_LISTS_ROW_BYTES)]
     #[case::nested_structs(NESTED_STRUCTS_ROW_BYTES)]
-    fn row_groups_split_a_million_row_dataset(#[case] approx_row_bytes: usize) {
-        let props = random_access_writer_properties(approx_row_bytes);
+    fn row_groups_split_a_million_row_dataset(#[case] approx_row_bytes: usize) -> Result<()> {
+        let props = random_access_writer_properties(approx_row_bytes)?;
         let rows_per_group = rows_per_row_group(&props);
 
         // The whole point: a million-row dataset must not land in a single row group.
@@ -290,16 +296,29 @@ mod tests {
         // so the derived Vortex files are unaffected by this layout.
         assert_eq!(rows_per_group % PARQUET_READ_BATCH_SIZE, 0);
         assert!(rows_per_group * approx_row_bytes <= TARGET_ROW_GROUP_BYTES);
+        Ok(())
     }
 
     #[test]
-    fn wide_rows_get_smaller_row_groups_than_narrow_rows() {
-        let wide = rows_per_row_group(&random_access_writer_properties(FEATURE_VECTORS_ROW_BYTES));
-        let narrow = rows_per_row_group(&random_access_writer_properties(NESTED_STRUCTS_ROW_BYTES));
+    fn generated_parquet_is_zstd_level_3() -> Result<()> {
+        let props = random_access_writer_properties(FEATURE_VECTORS_ROW_BYTES)?;
+        assert_eq!(
+            props.compression(&"embedding".into()),
+            Compression::ZSTD(ZstdLevel::try_new(3)?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wide_rows_get_smaller_row_groups_than_narrow_rows() -> Result<()> {
+        let wide = rows_per_row_group(&random_access_writer_properties(FEATURE_VECTORS_ROW_BYTES)?);
+        let narrow =
+            rows_per_row_group(&random_access_writer_properties(NESTED_STRUCTS_ROW_BYTES)?);
         assert!(
             wide < narrow,
             "wide {wide} should be smaller than narrow {narrow}"
         );
+        Ok(())
     }
 
     #[test]
