@@ -31,8 +31,6 @@ use vortex::expr::BoundExpression;
 use vortex::expr::Expression;
 use vortex::metrics::tracing::get_global_labels;
 use vortex::scalar::Scalar;
-use vortex::scalar_fn::fns::binary::Binary;
-use vortex::scalar_fn::fns::operators::Operator;
 use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::convert::PushedAggregate;
