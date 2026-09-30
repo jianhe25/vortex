@@ -49,6 +49,7 @@ mod bytes;
 mod decimal;
 mod nested;
 mod primitive;
+mod stats;
 #[cfg(test)]
 mod tests;
 
@@ -121,6 +122,10 @@ where
             ));
         }
 
+        if let Some(result) = stats::compare_from_stats(array.as_ref(), other, cmp_op, ctx)? {
+            return Ok(Some(result));
+        }
+
         V::compare(array, other, cmp_op, ctx)
     }
 }
@@ -128,7 +133,8 @@ where
 /// Execute a compare operation between two arrays.
 ///
 /// This is the entry point for compare operations from the binary expression.
-/// Handles empty, constant-null, and constant-constant directly, otherwise dispatches to a
+/// Handles empty, constant-null, and constant-constant directly, answers comparisons against a
+/// constant from cached min/max statistics when they decide every row, otherwise dispatches to a
 /// native per-dtype kernel.
 pub(crate) fn execute_compare(
     lhs: &ArrayRef,
@@ -163,6 +169,11 @@ pub(crate) fn execute_compare(
     {
         let result = scalar_cmp(lhs_const.scalar(), rhs_const.scalar(), op)?;
         return Ok(ConstantArray::new(result, lhs.len()).into_array());
+    }
+
+    // Cached min/max statistics can decide a comparison against a constant without a scan.
+    if let Some(result) = stats::compare_from_stats(lhs, rhs, op, ctx)? {
+        return Ok(result);
     }
 
     compare_arrays(lhs, rhs, op, ctx)

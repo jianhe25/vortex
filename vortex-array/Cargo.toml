@@ -136,6 +136,10 @@ name = "compare"
 harness = false
 
 [[bench]]
+name = "compare_stats"
+harness = false
+
+[[bench]]
 name = "binary_ops"
 harness = false
 

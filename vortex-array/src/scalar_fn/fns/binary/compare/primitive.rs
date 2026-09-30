@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Native comparison of primitive arrays with specialized bitmap packing for 8-bit inputs.
+//! Native comparison of primitive arrays with specialized bitmap packing for 8-bit inputs, and a
+//! binary-search path for arrays whose cached statistics mark them as sorted.
 
 use vortex_buffer::BitBuffer;
+use vortex_buffer::BitBufferMut;
 use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::BufferMut;
 use vortex_buffer::collect_bool_word;
@@ -19,6 +21,9 @@ use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
+use crate::expr::stats::Precision;
+use crate::expr::stats::Stat;
+use crate::expr::stats::StatsProviderExt;
 use crate::match_each_native_ptype;
 use crate::scalar::Scalar;
 use crate::scalar_fn::fns::binary::compare::bit_buffer_from_words;
@@ -27,6 +32,7 @@ use crate::scalar_fn::fns::binary::compare::collect_zip_bits;
 use crate::scalar_fn::fns::binary::compare::compare_validity;
 use crate::scalar_fn::fns::binary::primitive_operand::PrimitiveOperand;
 use crate::scalar_fn::fns::operators::CompareOperator;
+use crate::validity::Validity;
 
 /// Compare two primitive arrays of the same [`PType`].
 ///
@@ -53,6 +59,8 @@ fn compare_primitive_typed<T: NativePType>(
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     let len = lhs.len();
+    let lhs_sorted = is_sorted_cached(lhs);
+    let rhs_sorted = is_sorted_cached(rhs);
     let lhs = PrimitiveOperand::<T>::try_new(lhs, ctx)?;
     let rhs = PrimitiveOperand::<T>::try_new(rhs, ctx)?;
     if lhs.len() != rhs.len() {
@@ -71,13 +79,31 @@ fn compare_primitive_typed<T: NativePType>(
             PrimitiveOperand::Array { values: rhs, .. },
         ) => compare_slices(lhs, rhs, op, ctx.allocator()),
         (
-            PrimitiveOperand::Array { values: lhs, .. },
+            PrimitiveOperand::Array {
+                values: lhs,
+                validity: lhs_validity,
+            },
             PrimitiveOperand::Constant { value: rhs, .. },
-        ) => compare_slice_constant(lhs, *rhs, op, ctx.allocator()),
+        ) => {
+            if lhs_sorted {
+                compare_sorted_constant(lhs, lhs_validity, *rhs, op, ctx)?
+            } else {
+                compare_slice_constant(lhs, *rhs, op, ctx.allocator())
+            }
+        }
         (
             PrimitiveOperand::Constant { value: lhs, .. },
-            PrimitiveOperand::Array { values: rhs, .. },
-        ) => compare_slice_constant(rhs, *lhs, op.swap(), ctx.allocator()),
+            PrimitiveOperand::Array {
+                values: rhs,
+                validity: rhs_validity,
+            },
+        ) => {
+            if rhs_sorted {
+                compare_sorted_constant(rhs, rhs_validity, *lhs, op.swap(), ctx)?
+            } else {
+                compare_slice_constant(rhs, *lhs, op.swap(), ctx.allocator())
+            }
+        }
         (
             PrimitiveOperand::Constant { value: lhs, .. },
             PrimitiveOperand::Constant { value: rhs, .. },
@@ -95,6 +121,59 @@ fn compare_primitive_typed<T: NativePType>(
     };
 
     Ok(BoolArray::try_new(bits, validity)?.into_array())
+}
+
+/// Whether the array is known to be sorted from its cached statistics.
+///
+/// Sortedness is never computed here: that is a full pass, which the sorted path exists to avoid.
+fn is_sorted_cached(array: &ArrayRef) -> bool {
+    let stats = array.statistics();
+    matches!(stats.get_as::<bool>(Stat::IsSorted), Precision::Exact(true))
+        || matches!(
+            stats.get_as::<bool>(Stat::IsStrictSorted),
+            Precision::Exact(true)
+        )
+}
+
+/// Compare a sorted slice against a constant by binary searching for the run of values equal to
+/// the constant. Every comparison operator selects at most two contiguous runs of positions, so
+/// the result is written with range fills instead of one predicate evaluation per element.
+///
+/// Sortedness orders nulls first and values with the same total ordering the linear kernel uses,
+/// so the valid values are the sorted suffix after the leading nulls. Result bits at null
+/// positions are masked by the validity and left unset.
+fn compare_sorted_constant<T: NativePType>(
+    values: &[T],
+    validity: &Validity,
+    constant: T,
+    op: CompareOperator,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<BitBuffer> {
+    let len = values.len();
+    let first_valid = match validity {
+        Validity::NonNullable | Validity::AllValid => 0,
+        Validity::AllInvalid => len,
+        Validity::Array(_) => len - validity.execute_mask(len, ctx)?.true_count(),
+    };
+
+    let sorted = &values[first_valid..];
+    let lower = first_valid + sorted.partition_point(|v| v.is_lt(constant));
+    let upper = first_valid + sorted.partition_point(|v| v.is_le(constant));
+
+    let (first, second) = match op {
+        CompareOperator::Eq => (lower..upper, 0..0),
+        CompareOperator::NotEq => (first_valid..lower, upper..len),
+        CompareOperator::Lt => (first_valid..lower, 0..0),
+        CompareOperator::Lte => (first_valid..upper, 0..0),
+        CompareOperator::Gt => (upper..len, 0..0),
+        CompareOperator::Gte => (lower..len, 0..0),
+    };
+
+    let mut bits = BitBufferMut::with_capacity_in(len, ctx.allocator().clone());
+    bits.append_n(false, len);
+    bits.fill_range(first.start, first.end, true);
+    bits.fill_range(second.start, second.end, true);
+    Ok(bits.freeze())
 }
 
 #[allow(clippy::inline_always)]
