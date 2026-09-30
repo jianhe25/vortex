@@ -9,6 +9,28 @@ optional buffer compression, so it provides the established constant-time access
 Parquet provides the established reference for a compressed columnar representation. Together,
 they let the suite compare Vortex and Lance against both ends of the storage trade-off.
 
+## Keeping the comparison fair
+
+Every format is read the way an expert would read it from local disk, and each `take` returns
+fully decoded Arrow-equivalent rows:
+
+- **Arrow IPC** memory-maps the file and decodes record batches zero-copy with
+  `FileDecoder`, then takes the requested rows. Only the pages holding those rows are touched.
+  The file carries per-batch row offsets in its custom metadata so lookups go straight to the
+  right batch.
+- **Parquet** loads the footer and page index once, then reads with a `RowSelection` so the
+  offset index fetches and decodes only the pages that hold the requested rows, never a whole
+  row group. Page reads use `pread` on a shared descriptor, the same syscall profile Vortex uses.
+  The synthetic inputs are written with zstd level 3, the repository's convention for generated
+  Parquet, and the default page limits.
+- **Lance** uses `Dataset::take` on a v2.1 dataset, its native point-lookup API.
+- **Vortex** runs a scan restricted to the requested row indices, then canonicalizes the result so
+  it is as decoded as the Arrow batches the other formats return.
+
+The Lance, Arrow IPC, and Vortex files are all converted from the same Parquet source, so every
+format sees identical data. Cached mode reuses one open handle per format and warms it for a
+second before timing; reopen mode pays each format's footer or manifest parse on every iteration.
+
 Two access patterns are generated with a fixed seed (see [`src/main.rs`](./src/main.rs)):
 
 - **correlated**: several clusters of consecutive indices scattered across the dataset,

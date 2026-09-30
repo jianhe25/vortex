@@ -10,6 +10,9 @@ use arrow_array::RecordBatch;
 use arrow_ipc::writer::FileWriter;
 use async_trait::async_trait;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::Compression;
+use parquet::basic::ZstdLevel;
+use parquet::file::properties::WriterProperties;
 use vortex::array::ArrayRef;
 
 use crate::Format;
@@ -34,6 +37,17 @@ pub fn data_path(dataset: &str, format: Format) -> String {
         Format::VortexCompact => format!("random_access/{dataset}/{dataset}-compact.{ext}"),
         _ => format!("random_access/{dataset}/{dataset}.{ext}"),
     }
+}
+
+/// Writer properties for the synthetic Parquet inputs of the random-access datasets.
+///
+/// Pages are zstd level 3 compressed, the repository's convention for generated Parquet, and the
+/// default page size limits are kept so that the offset index lets a point lookup decode a single
+/// page per column rather than a whole row group.
+pub fn synthetic_parquet_writer_properties() -> Result<WriterProperties> {
+    Ok(WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .build())
 }
 
 /// Convert a Parquet input into an uncompressed Arrow IPC file.

@@ -106,6 +106,8 @@ fn generate_indices(dataset: &dyn BenchDataset, pattern: AccessPattern) -> Vec<u
                 }
                 indices.push(idx);
             }
+            // Sub-row gaps can repeat an index; every accessor expects strictly increasing indices.
+            indices.dedup();
             indices
         }
     }
