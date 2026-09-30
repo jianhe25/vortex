@@ -308,6 +308,9 @@ async fn open_accessor(
     );
     match format {
         Format::ArrowIpc => {
+            if remote.is_some() {
+                anyhow::bail!("Arrow IPC random access is only supported from local disk");
+            }
             let path = dataset.path(format).await?;
             Ok(Box::new(ArrowIpcRandomAccessor::open(path, name)?))
         }

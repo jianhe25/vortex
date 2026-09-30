@@ -46,7 +46,8 @@ cargo run -p random-access-bench --profile release_debug --features lance -- \
 Credentials and region come from the environment (`AWS_REGION`, `AWS_PROFILE`, ...).
 
 Remote measurements are named `...-tokio-s3` instead of `...-tokio-local-disk` and are
-reported with `s3` storage, so they form a series separate from the local-disk numbers. In CI
+reported with `s3` storage, so they form a series separate from the local-disk numbers. Arrow
+IPC has no object store reader and is skipped for remote runs. In CI
 the variant runs from
 [`pr-bench-random-access-s3.yml`](../../.github/workflows/pr-bench-random-access-s3.yml)
 (label `action/bench-random-access-s3`) and from the `Random Access (S3)` matrix entry in

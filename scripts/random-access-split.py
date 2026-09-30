@@ -37,9 +37,11 @@ def drop_os_caches() -> None:
 
 def run_combinations(emit_ingest_records: bool, remote_data_dir: str | None) -> None:
     PARTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Arrow IPC has no object store reader, so a remote run would silently read local disk.
+    formats = [f for f in FORMATS if not (remote_data_dir and f == "arrow-ipc")]
     i = 0
     for dataset in DATASETS:
-        for fmt in FORMATS:
+        for fmt in formats:
             for pattern in PATTERNS:
                 for open_mode in OPEN_MODES:
                     drop_os_caches()
