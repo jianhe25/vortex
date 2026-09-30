@@ -10,6 +10,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::varbin::VarBinArrayExt;
@@ -76,11 +77,15 @@ impl FsstDecodePlan {
         fsst_array: ArrayView<'_, FSST>,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Self> {
-        let codes = fsst_array.codes().sliced_bytes();
-        let lengths = fsst_array
-            .uncompressed_lengths()
-            .clone()
-            .execute::<PrimitiveArray>(ctx)?;
+        let codes = fsst_array.codes();
+        let last_offset = codes.offset_at(codes.len());
+        vortex_ensure!(
+            last_offset <= codes.bytes().len(),
+            "FSST last codes offset {last_offset} exceeds codes bytes length {}",
+            codes.bytes().len()
+        );
+        let codes = codes.sliced_bytes();
+        let lengths = primitive_child(fsst_array.uncompressed_lengths(), ctx)?;
 
         let total_size = match_each_integer_ptype!(lengths.ptype(), |P| {
             lengths
@@ -123,6 +128,16 @@ impl FsstDecodePlan {
             self.total_size
         );
         Ok(len)
+    }
+}
+
+/// A child as a primitive array. `FSST::execute` requires its children to be primitive before
+/// decoding, so this executes only for callers that come in another way, such as a builder
+/// append.
+fn primitive_child(child: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
+    match child.as_opt::<Primitive>() {
+        Some(primitive) => Ok(primitive.into_owned()),
+        None => child.clone().execute::<PrimitiveArray>(ctx),
     }
 }
 

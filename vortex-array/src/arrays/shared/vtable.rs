@@ -5,10 +5,12 @@ use std::hash::Hasher;
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::AnyCanonical;
 use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::ArrayParts;
@@ -25,10 +27,12 @@ use crate::array::VTable;
 use crate::array::ValidityVTable;
 use crate::array::with_empty_buffers;
 use crate::arrays::shared::SharedArrayExt;
+use crate::arrays::shared::SharedArraySlotsExt;
 use crate::arrays::shared::SharedData;
 use crate::arrays::shared::SharedSlots;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
+use crate::require_child;
 use crate::scalar::Scalar;
 use crate::validity::Validity;
 
@@ -118,9 +122,20 @@ impl VTable for Shared {
         vortex_error::vortex_bail!("Shared array is not serializable")
     }
 
-    fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+    fn execute(array: Array<Self>, _ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        if let Some(cached) = array.cached_array_ref() {
+            return Ok(ExecutionResult::done(cached.clone()));
+        }
+        // The source is executed by the scheduler, not here; once it comes back canonical it is
+        // kept, so every handle sharing this cache sees it.
+        let array = require_child!(array, array.source(), SharedSlots::SOURCE => AnyCanonical);
         array
-            .get_or_compute(|source| source.clone().execute::<Canonical>(ctx))
+            .get_or_compute(|source| {
+                source
+                    .as_opt::<AnyCanonical>()
+                    .map(Canonical::from)
+                    .ok_or_else(|| vortex_err!("Shared source was required to be canonical"))
+            })
             .map(ExecutionResult::done)
     }
 }

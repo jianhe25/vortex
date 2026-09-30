@@ -10,6 +10,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::DecimalArray;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DecimalDType;
@@ -82,6 +83,15 @@ pub fn assemble_decimal(
     assemble_wide_decimal_from_arrays(msp, lower_parts, validity, decimal_dtype, exec_ctx)
 }
 
+/// A part as a primitive array. `DecimalByteParts::execute` requires its parts to be primitive
+/// before assembling, so this executes only for callers that come in another way.
+fn primitive_part(part: &ArrayRef, exec_ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
+    match part.as_opt::<Primitive>() {
+        Some(primitive) => Ok(primitive.into_owned()),
+        None => part.clone().execute::<PrimitiveArray>(exec_ctx),
+    }
+}
+
 fn assemble_narrow_decimal(
     msp: &ArrayRef,
     validity: Validity,
@@ -89,7 +99,7 @@ fn assemble_narrow_decimal(
     exec_ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     // TODO(mk): Broadcast a constant MSP directly instead of materializing its buffer.
-    let msp = msp.clone().execute::<PrimitiveArray>(exec_ctx)?;
+    let msp = primitive_part(msp, exec_ctx)?;
     Ok(match_each_signed_integer_ptype!(msp.ptype(), |P| {
         DecimalArray::new(msp.to_buffer::<P>(), decimal_dtype, validity).into_array()
     }))
@@ -106,7 +116,7 @@ fn assemble_wide_decimal_from_arrays(
     exec_ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     // TODO(mk): Broadcast constant parts directly instead of materializing their buffers.
-    let msp = msp.clone().execute::<PrimitiveArray>(exec_ctx)?;
+    let msp = primitive_part(msp, exec_ctx)?;
     // TODO(mk): Revisit dispatching on lower-part dtypes and widening values during assembly.
     // Casting narrowed parts allocates temporary buffers and adds passes over the data.
     // Nested dtype dispatch is significantly in benchmarks, but adds code and generic instantiations.

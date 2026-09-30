@@ -31,7 +31,8 @@ use crate::OnPair;
 use crate::OnPairArraySlotsExt;
 use crate::array::dict_view;
 use crate::decode::code_boundary_at;
-use crate::decode::collect_widened;
+use crate::decode::collect_widened_range;
+use crate::decode::primitive_child;
 
 pub(super) fn canonicalize_onpair(
     array: ArrayView<'_, OnPair>,
@@ -64,10 +65,7 @@ pub(crate) struct OnPairDecodePlan<'a> {
 
 impl<'a> OnPairDecodePlan<'a> {
     pub(crate) fn new(array: ArrayView<'a, OnPair>, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
-        let lengths = array
-            .uncompressed_lengths()
-            .clone()
-            .execute::<PrimitiveArray>(ctx)?;
+        let lengths = primitive_child(array.uncompressed_lengths(), ctx)?;
 
         let total_size = match_each_integer_ptype!(lengths.ptype(), |P| {
             lengths
@@ -110,7 +108,7 @@ impl<'a> OnPairDecodePlan<'a> {
         // array materialises only its own codes rather than the whole column's. The
         // contiguous decoder walks `codes` in order and never reads the per-row
         // boundaries, so an empty boundary slice is sound.
-        let codes = collect_widened::<u16>(&array.codes().slice(code_start..code_end)?, ctx)?;
+        let codes = collect_widened_range::<u16>(array.codes(), code_start..code_end, ctx)?;
         let dict = dict_view(array, ctx)?;
 
         Ok(Self {

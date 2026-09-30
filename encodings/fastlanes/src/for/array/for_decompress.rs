@@ -8,8 +8,10 @@ use fastlanes::FoR;
 use itertools::Itertools;
 use num_traits::PrimInt;
 use num_traits::WrappingAdd;
+use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::builders::PrimitiveBuilder;
 use vortex_array::dtype::NativePType;
@@ -80,8 +82,7 @@ fn decompress_one_ref(
         });
     }
 
-    // TODO(ngates): Do we need this to be into_encoded() somehow?
-    let encoded = array.encoded().clone().execute::<PrimitiveArray>(ctx)?;
+    let encoded = primitive_child(array.encoded(), ctx)?;
     let validity = encoded.validity()?;
 
     Ok(match_each_integer_ptype!(ptype, |T| {
@@ -105,12 +106,12 @@ fn decompress_many_refs<T: NativePType + WrappingAdd + PrimInt>(
     array: &FoRArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<PrimitiveArray> {
-    let encoded = array.encoded().clone().execute::<PrimitiveArray>(ctx)?;
+    let encoded = primitive_child(array.encoded(), ctx)?;
     if encoded.is_empty() {
         return Ok(encoded);
     }
     let validity = encoded.validity()?;
-    let references = array.references().clone().execute::<PrimitiveArray>(ctx)?;
+    let references = primitive_child(array.references(), ctx)?;
     let references = references.as_slice::<T>();
 
     // The first chunk may be partial when the array was sliced.
@@ -186,6 +187,15 @@ pub(crate) fn fused_decompress<
     }
 
     Ok(builder.finish_into_primitive())
+}
+
+/// A child as a primitive array. `FoR::execute` requires its children to be primitive before
+/// decoding, so this executes only for callers that come in another way.
+fn primitive_child(child: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
+    match child.as_opt::<Primitive>() {
+        Some(primitive) => Ok(primitive.into_owned()),
+        None => child.clone().execute::<PrimitiveArray>(ctx),
+    }
 }
 
 fn decompress_primitive<T: NativePType + WrappingAdd + PrimInt>(

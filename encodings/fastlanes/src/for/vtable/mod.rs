@@ -17,9 +17,11 @@ use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
+use vortex_array::require_child;
 use vortex_array::scalar::Scalar;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::smallvec::smallvec;
@@ -32,7 +34,10 @@ use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
+use crate::BitPacked;
 use crate::FoRData;
+use crate::r#for::array::FoRArrayExt;
+use crate::r#for::array::FoRArraySlotsExt;
 use crate::r#for::array::FoRSlots;
 use crate::r#for::array::FoRSlotsView;
 use crate::r#for::array::for_decompress::decompress;
@@ -138,6 +143,20 @@ impl VTable for FoR {
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        // The fused unpack reads the bit-packed child's buffers directly, so it needs no child
+        // executed first.
+        if array.ptype().is_unsigned_int()
+            && array.constant_reference().is_some()
+            && array.encoded().is::<BitPacked>()
+        {
+            return Ok(ExecutionResult::done(decompress(&array, ctx)?.into_array()));
+        }
+        let array = require_child!(array, array.encoded(), FoRSlots::ENCODED => Primitive);
+        let array = if array.constant_reference().is_some() {
+            array
+        } else {
+            require_child!(array, array.references(), FoRSlots::REFERENCES => Primitive)
+        };
         Ok(ExecutionResult::done(decompress(&array, ctx)?.into_array()))
     }
 }

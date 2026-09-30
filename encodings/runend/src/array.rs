@@ -8,6 +8,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use prost::Message;
+use vortex_array::AnyCanonical;
 use vortex_array::Array;
 use vortex_array::ArrayEq;
 use vortex_array::ArrayHash;
@@ -22,17 +23,20 @@ use vortex_array::IntoArray;
 use vortex_array::TypedArrayRef;
 use vortex_array::VortexSessionExecute;
 use vortex_array::array_slots;
-use vortex_array::arrays::DecimalArray;
+use vortex_array::arrays::Bool;
+use vortex_array::arrays::Decimal;
+use vortex_array::arrays::ListView;
 use vortex_array::arrays::ListViewArray;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::VarBinViewArray;
+use vortex_array::arrays::VarBinView;
 use vortex_array::arrays::listview::ListViewArraySlotsExt;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::legacy_session;
+use vortex_array::require_child;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::VTable;
@@ -41,6 +45,7 @@ use vortex_error::VortexExpect as _;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -182,6 +187,8 @@ impl VTable for RunEnd {
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
+        let array = require_child!(array, array.ends(), RunEndSlots::ENDS => Primitive);
+        let array = require_child!(array, array.values(), RunEndSlots::VALUES => AnyCanonical);
         run_end_canonicalize(&array, ctx).map(ExecutionResult::done)
     }
 }
@@ -476,44 +483,52 @@ impl ValidityVTable<RunEnd> for RunEnd {
     }
 }
 
+/// Decode the runs from the children `RunEnd::execute` has required: primitive ends and
+/// canonical values.
 pub(super) fn run_end_canonicalize(
     array: &RunEndArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
-    let pends = array.ends().clone().execute_as("ends", ctx)?;
+    let pends = required_child::<Primitive>(array.ends(), "ends")?;
+    let values = array.values();
 
     Ok(match array.dtype() {
         DType::Bool(_) => {
-            let bools = array.values().clone().execute_as("values", ctx)?;
+            let bools = required_child::<Bool>(values, "values")?;
             runend_decode_bools(pends, bools, array.offset(), array.len(), ctx)?
         }
         DType::Primitive(..) => {
-            let pvalues = array.values().clone().execute_as("values", ctx)?;
+            let pvalues = required_child::<Primitive>(values, "values")?;
             runend_decode_primitive(pends, pvalues, array.offset(), array.len(), ctx)?.into_array()
         }
         DType::Decimal(..) => {
-            let values = array
-                .values()
-                .clone()
-                .execute_as::<DecimalArray>("values", ctx)?;
+            let values = required_child::<Decimal>(values, "values")?;
             runend_decode_decimal(pends, values, array.offset(), array.len(), ctx)?.into_array()
         }
         DType::Utf8(_) | DType::Binary(_) => {
-            let values = array
-                .values()
-                .clone()
-                .execute_as::<VarBinViewArray>("values", ctx)?;
+            let values = required_child::<VarBinView>(values, "values")?;
             runend_decode_varbinview(pends, values, array.offset(), array.len(), ctx)?.into_array()
         }
         DType::List(..) => {
-            let values = array
-                .values()
-                .clone()
-                .execute_as::<ListViewArray>("values", ctx)?;
+            let values = required_child::<ListView>(values, "values")?;
             runend_decode_listview(pends, values, array.offset(), array.len())?.into_array()
         }
         _ => vortex_bail!("Unsupported RunEnd value type: {}", array.dtype()),
     })
+}
+
+/// A child that `RunEnd::execute` has already required to be `V`.
+fn required_child<V: VTable>(child: &ArrayRef, name: &str) -> VortexResult<Array<V>> {
+    child
+        .as_opt::<V>()
+        .map(ArrayView::into_owned)
+        .ok_or_else(|| {
+            vortex_err!(
+                "RunEnd {name} must be executed to {} before decoding, got {}",
+                std::any::type_name::<V>(),
+                child.encoding_id()
+            )
+        })
 }
 
 fn runend_decode_listview(
