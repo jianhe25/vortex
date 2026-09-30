@@ -14,6 +14,8 @@
 //! Run with `cargo bench -p vortex-fastlanes --bench for_filter`.
 
 #![expect(clippy::unwrap_used)]
+// The benchmarks are kept out of CodSpeed, which leaves their helpers unused there.
+#![cfg_attr(codspeed, allow(dead_code, unused_imports))]
 
 use std::sync::LazyLock;
 
@@ -139,16 +141,19 @@ fn run(bencher: Bencher, array: ArrayRef, percent: f64, decode_first: bool) {
         });
 }
 
+#[cfg(not(codspeed))]
 #[divan::bench(args = ARGS)]
 fn unblocked_kernel(bencher: Bencher, (dataset, percent): (&str, f64)) {
     run(bencher, unblocked(dataset), percent, false);
 }
 
+#[cfg(not(codspeed))]
 #[divan::bench(args = ARGS)]
 fn blocked_kernel(bencher: Bencher, (dataset, percent): (&str, f64)) {
     run(bencher, blocked(dataset), percent, false);
 }
 
+#[cfg(not(codspeed))]
 #[divan::bench(args = ARGS)]
 fn blocked_decode(bencher: Bencher, (dataset, percent): (&str, f64)) {
     run(bencher, blocked(dataset), percent, true);
