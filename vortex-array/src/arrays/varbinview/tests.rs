@@ -190,7 +190,10 @@ pub fn validate_view_char_boundaries(
     // "ż" is two bytes, so the buffer is 18 bytes. The first view covers the whole buffer, so the
     // second view is checked against a buffer range that is valid UTF-8 as a whole.
     let buffer = "żaaaaaaaaaaaaaaż".as_bytes();
-    let views = vec![view_of(buffer, 0, buffer.len()), view_of(buffer, start, end)];
+    let views = vec![
+        view_of(buffer, 0, buffer.len()),
+        view_of(buffer, start, end),
+    ];
 
     assert_eq!(
         validate_utf8_views(buffer, views, Validity::AllValid).is_ok(),
