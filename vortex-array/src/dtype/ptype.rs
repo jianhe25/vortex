@@ -18,6 +18,7 @@ use num_traits::NumCast;
 use num_traits::PrimInt;
 use num_traits::ToPrimitive;
 use num_traits::Unsigned;
+use num_traits::bounds::LowerBounded;
 use num_traits::bounds::UpperBounded;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
@@ -28,6 +29,7 @@ use crate::dtype::DType;
 use crate::dtype::FromPrimitiveOrF16;
 use crate::dtype::half::f16;
 use crate::dtype::nullability::Nullability::NonNullable;
+use crate::scalar::PValue;
 
 /// Physical type enum, represents the in-memory physical layout but might represent a different logical type.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, prost::Enumeration)]
@@ -785,6 +787,18 @@ impl PType {
         })
     }
 
+    /// Returns the smallest value of this PType.
+    #[inline]
+    pub fn min_value(&self) -> PValue {
+        match_each_native_ptype!(self, |T| { PValue::from(<T as LowerBounded>::min_value()) })
+    }
+
+    /// Returns the largest value of this PType.
+    #[inline]
+    pub fn max_value(&self) -> PValue {
+        match_each_native_ptype!(self, |T| { PValue::from(<T as UpperBounded>::max_value()) })
+    }
+
     /// Returns the PType that corresponds to the signed version of this PType
     #[inline]
     pub const fn to_signed(self) -> Self {
@@ -1033,6 +1047,16 @@ mod tests {
             f64::try_from_le_bytes(&42.0_f64.to_le_bytes()).unwrap(),
             42.0
         );
+    }
+
+    #[test]
+    fn min_max_value() {
+        assert_eq!(PType::U8.min_value(), PValue::U8(0));
+        assert_eq!(PType::U64.max_value(), PValue::U64(u64::MAX));
+        assert_eq!(PType::I8.min_value(), PValue::I8(i8::MIN));
+        assert_eq!(PType::I64.max_value(), PValue::I64(i64::MAX));
+        assert_eq!(PType::F32.min_value(), PValue::F32(f32::MIN));
+        assert_eq!(PType::F64.max_value(), PValue::F64(f64::MAX));
     }
 
     #[test]

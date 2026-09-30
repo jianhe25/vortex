@@ -8,6 +8,7 @@ use std::fmt::Formatter;
 
 pub use kernel::*;
 use prost::Message;
+use vortex_buffer::BitBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_session::VortexSession;
@@ -17,6 +18,7 @@ use crate::ArrayRef;
 use crate::Canonical;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
 use crate::arrays::Decimal;
 use crate::arrays::Primitive;
@@ -24,6 +26,7 @@ use crate::arrays::ScalarFnArray;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::DType::Bool;
+use crate::dtype::Nullability;
 use crate::expr::display::ExprDisplay;
 use crate::expr::expression::Expression;
 use crate::proto::expr as pb;
@@ -122,6 +125,15 @@ pub(super) fn short_circuit(
     }
 
     Ok(None)
+}
+
+/// The between result when a bound excludes every value: false for every valid row of `arr`.
+///
+/// Kernels use this once a constant bound is known to lie outside the range the array's storage
+/// type can hold, so no row can satisfy it while nulls still propagate.
+pub fn all_false(arr: &ArrayRef, nullability: Nullability) -> VortexResult<ArrayRef> {
+    let validity = arr.validity()?.union_nullability(nullability);
+    Ok(BoolArray::new(BitBuffer::new_unset(arr.len()), validity).into_array())
 }
 
 /// The two compares that `Between` stands for, combined with Kleene `AND`.
