@@ -96,11 +96,13 @@ fn buffer_zeroing_invalid<T: Copy + Default>(
     values: impl TrustedLen<Item = T>,
     validity: &ValidityRef<'_>,
 ) -> Buffer<T> {
-    Buffer::from_trusted_len_iter(
-        values
-            .enumerate()
-            .map(|(i, v)| if validity.is_valid(i) { v } else { T::default() }),
-    )
+    Buffer::from_trusted_len_iter(values.enumerate().map(|(i, v)| {
+        if validity.is_valid(i) {
+            v
+        } else {
+            T::default()
+        }
+    }))
 }
 
 fn vector_mapped<T, P: NativePType, F: Fn(&T) -> P>(
