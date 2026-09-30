@@ -140,6 +140,10 @@ name = "compare_stats"
 harness = false
 
 [[bench]]
+name = "take_strict_sorted"
+harness = false
+
+[[bench]]
 name = "binary_ops"
 harness = false
 
