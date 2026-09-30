@@ -97,14 +97,12 @@ pub fn is_root(expr: &Expression) -> bool {
 /// assert_eq!(scalar, &Scalar::primitive(34i32, Nullability::NonNullable));
 /// ```
 pub fn lit(value: impl Into<Scalar>) -> Expression {
-    Literal.new_expr(value.into(), [])
+    Literal::expr(value.into())
 }
 
 /// Creates a bound literal expression.
 pub fn bound_lit(value: impl Into<Scalar>) -> BoundExpression {
-    Literal
-        .try_new_bound_expr(value.into(), [])
-        .vortex_expect("literal expressions are always well-typed")
+    Literal::bound_expr(value.into())
 }
 
 // ---- GetItem / Col ----

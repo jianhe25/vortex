@@ -171,7 +171,7 @@ impl ScalarFnVTable for GetItem {
             if pack.nullability.is_nullable() {
                 field = node.new_node(
                     Mask.bind(EmptyOptions),
-                    &[field, node.new_node(Literal.bind(true.into()), &[])?],
+                    &[field, node.new_node(Literal::scalar_fn(true.into()), &[])?],
                 )?;
             }
 
