@@ -473,6 +473,26 @@ fn test_mask_from_indices_out_of_bounds() {
     Mask::from_indices(5, vec![0, 2, 5]); // 5 is out of bounds
 }
 
+/// Out of bounds with as many indices as positions, which takes the all-true shortcut.
+#[test]
+#[should_panic(expected = "index 5 exceeds len 3")]
+fn test_mask_from_indices_out_of_bounds_full_count() {
+    Mask::from_indices(3, vec![0, 1, 5]);
+}
+
+#[rstest]
+#[case::empty(vec![], Mask::new_false(5))]
+#[case::every_position(vec![0, 1, 2, 3, 4], Mask::new_true(5))]
+#[case::partial(
+    vec![0, 3, 4],
+    Mask::from_buffer(BitBuffer::from_iter([true, false, false, true, true]))
+)]
+fn test_mask_from_indices_true_count(#[case] indices: Vec<usize>, #[case] expected: Mask) {
+    let mask = Mask::from_indices(5, indices.clone());
+    assert_eq!(mask.true_count(), indices.len());
+    assert_eq!(mask, expected);
+}
+
 #[test]
 #[should_panic]
 fn test_mask_from_slices_invalid_range() {

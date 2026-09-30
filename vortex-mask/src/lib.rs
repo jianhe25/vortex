@@ -217,16 +217,21 @@ impl Mask {
             indices.windows(2).all(|w| w[0] != w[1]),
             "Mask indices must be unique"
         );
-        let buffer = BitBuffer::from_indices(len, indices.iter().copied());
-        debug_assert_eq!(buffer.len(), len);
-        let true_count = buffer.true_count();
-
-        if true_count == 0 {
+        // Sorted, unique, in-bounds indices set exactly one bit each, so the true count is the
+        // number of indices and needs no pass over the buffer.
+        let true_count = indices.len();
+        let Some(&last) = indices.last() else {
             return Self::AllFalse(len);
-        }
+        };
         if true_count == len {
+            // `len` unique indices below `len` cover every position.
+            assert!(last < len, "index {last} exceeds len {len}");
             return Self::AllTrue(len);
         }
+
+        let buffer = BitBuffer::from_indices(len, indices.iter().copied());
+        debug_assert_eq!(buffer.len(), len);
+        debug_assert_eq!(buffer.true_count(), true_count);
 
         Self::Values(Arc::new(MaskValues {
             buffer,
