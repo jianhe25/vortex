@@ -22,7 +22,11 @@ fully decoded Arrow-equivalent rows:
   offset index fetches and decodes only the pages that hold the requested rows, never a whole
   row group. Page reads use `pread` on a shared descriptor, the same syscall profile Vortex uses.
   The synthetic inputs are written with zstd level 3, the repository's convention for generated
-  Parquet, and the default page limits.
+  Parquet, in 32Ki-row row groups with 1024-row data pages, so a lookup decompresses one small
+  page per column. Selecting by page rather than by row group is what keeps the cost of a
+  lookup proportional to the rows fetched, not to the row group size: without it, a
+  single-row-group file decodes the whole file per lookup, and smaller zstd row groups still
+  decode every row group a pattern touches.
 - **Lance** uses `Dataset::take` on a v2.1 dataset, its native point-lookup API.
 - **Vortex** runs a scan restricted to the requested row indices, then canonicalizes the result so
   it is as decoded as the Arrow batches the other formats return.
