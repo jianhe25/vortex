@@ -611,3 +611,87 @@ execute whole chunks, and a 30% cut of that 2% is invisible at query level. The 
 only show where `execute_until` runs on small arrays or many activations (section 4), which the
 TPC-H scan path does not do. The kernel-side items in section 7 (filter over FSST/OnPair,
 `Between` on decimals, `Like` over `Dict`, `RunEnd` slices) are the ones that would move queries.
+
+## 10. Existing `vortex-array` divan benches
+
+Ten of the repository's own benches that call `execute` were run on `develop` and on the branch
+(`cargo bench -p vortex-array --bench <name>`, same target dir). `binary_ops`, `compare`,
+`take_primitive` and `filter_fixed_width` were run twice interleaved; those cells are the best of
+the two medians. The single-run cells for the other six carry the usual ±5% noise of this box.
+
+| bench | develop (best of 2 medians) | branch | delta |
+|---|---:|---:|---:|
+| binary_ops/add_decimal_i64_nonnull | 7.20 µs | 7.14 µs | -0.8% |
+| binary_ops/add_decimal_i128_nullable | 24.09 µs | 18.19 µs | -24.5% ** |
+| binary_ops/add_i32_nonnull | 13.48 µs | 13.56 µs | +0.6% |
+| binary_ops/add_i64_nonnull | 15.36 µs | 15.33 µs | -0.2% |
+| binary_ops/add_i64_nullable | 16.44 µs | 16.30 µs | -0.9% |
+| binary_ops/add_u32_nonnull | 12.86 µs | 12.78 µs | -0.6% |
+| binary_ops/and_bool_nullable | 1.85 µs | 1.79 µs | -3.7% |
+| binary_ops/div_decimal_i64_nonnull | 12.59 µs | 12.44 µs | -1.2% |
+| binary_ops/div_decimal_i128_nullable | 59.38 µs | 58.16 µs | -2.1% |
+| binary_ops/div_i64_nonnull | 69.71 µs | 69.65 µs | -0.1% |
+| binary_ops/div_i64_nullable | 56.56 µs | 56.63 µs | +0.1% |
+| binary_ops/lt_i64_nullable | 5.70 µs | 5.57 µs | -2.3% |
+| binary_ops/mul_decimal_i64_nonnull | 2.44 µs | 2.28 µs | -6.5% ** |
+| binary_ops/mul_decimal_i128_nullable | 16.26 µs | 15.86 µs | -2.5% |
+| binary_ops/mul_i8_nonnull | 54.33 µs | 54.06 µs | -0.5% |
+| binary_ops/mul_i16_nonnull | 27.13 µs | 27.16 µs | +0.1% |
+| binary_ops/mul_i32_nonnull | 47.01 µs | 47.12 µs | +0.2% |
+| binary_ops/mul_i32_nullable | 48.22 µs | 47.81 µs | -0.9% |
+| binary_ops/mul_i64_nonnull | 24.75 µs | 24.41 µs | -1.4% |
+| binary_ops/mul_u8_nonnull | 40.04 µs | 39.78 µs | -0.6% |
+| binary_ops/mul_u16_nonnull | 12.93 µs | 12.77 µs | -1.2% |
+| binary_ops/mul_u32_nonnull | 24.22 µs | 24.15 µs | -0.3% |
+| binary_ops/mul_u64_nonnull | 18.55 µs | 18.51 µs | -0.2% |
+| binary_ops/subtract_shapes/32768, | 15.67 µs | 16.22 µs | +3.5% |
+| compare/compare_bool | 1.39 µs | 1.24 µs | -10.8% ** |
+| compare/compare_bool_constant | 1.18 µs | 1.02 µs | -13.7% ** |
+| compare/compare_bool_nullable | 1.75 µs | 1.54 µs | -11.7% ** |
+| compare/compare_decimal | 8.47 µs | 8.33 µs | -1.7% |
+| compare/compare_f32 | 9.46 µs | 9.39 µs | -0.8% |
+| compare/compare_float | 13.26 µs | 13.18 µs | -0.6% |
+| compare/compare_int | 7.03 µs | 6.90 µs | -1.8% |
+| compare/compare_int_constant | 6.39 µs | 6.29 µs | -1.6% |
+| compare/compare_int_eq | 7.09 µs | 6.92 µs | -2.4% |
+| compare/compare_int_nullable | 7.46 µs | 7.34 µs | -1.7% |
+| compare/compare_string_constant | 7.33 µs | 7.19 µs | -1.9% |
+| compare/compare_string_eq | 7.26 µs | 7.14 µs | -1.7% |
+| compare/compare_string_lt | 10.13 µs | 7.56 µs | -25.4% ** |
+| compare/compare_struct_eq | 33.18 µs | 33.76 µs | +1.7% |
+| compare/compare_struct_lt | 33.26 µs | 35.38 µs | +6.4% ** |
+| compare/compare_u8 | 1.45 µs | 1.31 µs | -9.6% ** |
+| compare/compare_u64 | 7.03 µs | 6.93 µs | -1.4% |
+| take_primitive/primitive_take_u32 | 12.18 µs | 12.23 µs | +0.4% |
+| take_primitive/1000 | 997 ns | 855 ns | -14.2% ** |
+| take_primitive/10000 | 3.15 µs | 3.04 µs | -3.6% |
+| take_primitive/25000 | 6.61 µs | 6.51 µs | -1.5% |
+| filter_fixed_width/0.01 | 1.03 µs | 913 ns | -11.3% ** |
+| filter_fixed_width/0.5 | 3.41 µs | 3.31 µs | -2.8% |
+| filter_fixed_width/0.8 | 4.72 µs | 4.59 µs | -2.8% |
+| filter_fixed_width/0.95 | 3.25 µs | 3.11 µs | -4.5% |
+
+Single-run benches:
+
+| bench | develop median | branch median | delta |
+|---|---:|---:|---:|
+| cast_primitive/8192 | 7.78 µs | 7.66 µs | -1.5% |
+| dict_compare/bench_compare_varbinview/10000, | 10.63 µs | 11.86 µs | +11.6% ** |
+| dict_compare/bench_compare_varbinview/50000, | 26.29 µs | 27.64 µs | +5.1% ** |
+| dict_mask/bench_dict_mask/0.1, | 28.39 µs | 29.57 µs | +4.2% |
+| dict_mask/bench_dict_mask/0.01, | 27.91 µs | 25.64 µs | -8.1% ** |
+| dict_mask/bench_dict_mask/0.5, | 27.11 µs | 30.20 µs | +11.4% ** |
+| dict_mask/bench_dict_mask/0.9, | 31.06 µs | 29.02 µs | -6.6% ** |
+| scalar_subtract/scalar_subtract | 10.75 µs | 10.06 µs | -6.4% ** |
+| slice_dict_primitive/10000 | 45.17 µs | 41.79 µs | -7.5% ** |
+| take_patches/take_search_chunked/0.1, | 57.78 µs | 55.61 µs | -3.8% |
+| take_patches/take_search_chunked/0.01, | 44.63 µs | 39.88 µs | -10.6% ** |
+| take_patches/take_search_chunked/0.005, | 36.38 µs | 35.45 µs | -2.6% |
+
+Reading: benches that execute a small array or expression per iteration (about 1µs) gain 10 to
+14% (`compare_bool*`, `compare_u8`, `take_primitive/1000`, `filter_fixed_width/0.01`,
+`scalar_subtract`, `slice_dict_primitive`, `take_patches/0.01`); benches dominated by a
+multi-microsecond kernel move 1 to 3%. Two cells stayed outside noise in both rounds without an
+obvious loop-side explanation (`add_decimal_i128_nullable` -24%, `compare_string_lt` -25%) and one
+went the other way (`compare_struct_lt` +6%, plausibly the 70ns heavier `create_execution_ctx`
+if the bench creates a context per field); they are worth a dedicated rerun before being quoted.
