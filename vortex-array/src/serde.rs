@@ -957,7 +957,8 @@ mod tests {
         let expected_sorted = array
             .aggregations()
             .compute_result(&sorted, &mut execution)?;
-        let ctx = restricted_context(&[old_primitive_id()]);
+        let validity_id = array.validity()?.to_array(array.len()).encoding_id();
+        let ctx = restricted_context(&[old_primitive_id(), validity_id]);
         let serialized = SerializedArray::try_from(serialize_blob(&array, &ctx, &session)?)?;
         let decoded = serialized.decode(
             array.dtype(),

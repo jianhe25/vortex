@@ -29,6 +29,7 @@ use crate::VortexSessionExecute;
 use crate::aggregate_fn::AggregateFn;
 use crate::aggregate_fn::fns::is_sorted::IsSorted;
 use crate::aggregate_fn::fns::is_sorted::IsSortedOptions;
+#[cfg(debug_assertions)]
 use crate::aggregate_fn::fns::is_sorted::is_sorted;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::VarBin;
