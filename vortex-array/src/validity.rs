@@ -665,6 +665,7 @@ mod tests {
     use crate::array_session;
     use crate::arrays::Bool;
     use crate::arrays::DecimalArray;
+    use crate::arrays::MaskedArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::bool::BoolArrayExt;
     use crate::builtins::ArrayBuiltins;
@@ -711,6 +712,7 @@ mod tests {
         // The mask rejection above prevents reaching unchecked decimal construction with a
         // newly valid value outside the precision range if this regression returns.
         let array = PrimitiveArray::new(buffer![1000i32, 1], validity).into_array();
+        assert!(MaskedArray::try_new(array.clone(), Validity::AllValid).is_err());
         let dtype = DType::Decimal(DecimalDType::new(2, 0), Nullability::NonNullable);
         assert!(
             array
