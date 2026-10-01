@@ -78,10 +78,10 @@ impl ArrayInput {
         Ok(input)
     }
 
-    /// Slice this input, retaining only guarantees that hold for the subset.
+    /// Slice this input, retaining integer guarantees that hold for the subset.
     ///
-    /// Exact integer extrema become bounds. Positive sortedness keeps its original strictness;
-    /// negative sortedness and other aggregate results are omitted. Integer ordering places nulls
+    /// For integer inputs, exact extrema become bounds and positive sortedness keeps its original
+    /// strictness. Negative sortedness and other aggregate results are omitted. Ordering places nulls
     /// first, and strict ordering excludes duplicate values and repeated nulls. A complete slice
     /// shares its owner's store. No values are read to propagate guarantees. Nonempty subsets
     /// drop the private cast proof because external transformation kernels do not establish native
@@ -99,11 +99,12 @@ impl ArrayInput {
         self.subset(array)
     }
 
-    /// Apply a stable filter, retaining integer bounds and positive sortedness.
+    /// Apply a stable filter, retaining integer bounds and positive integer sortedness.
     ///
     /// The mask must match the input length. Relative order and null placement of retained rows
-    /// are unchanged. An all-true mask shares the owner. Other selections get fresh stores and
-    /// retain no private cast proof.
+    /// are unchanged. An all-true mask shares the owner. Other selections get fresh stores. Only
+    /// integer inputs propagate bounds and positive ordering, including strict ordering. Nonempty
+    /// selections retain no private cast proof.
     pub fn filter(&self, mask: Mask) -> VortexResult<Self> {
         let array = self.array().filter(mask)?;
         if ArrayRef::ptr_eq(&array, self.array()) {
