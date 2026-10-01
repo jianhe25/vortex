@@ -7,6 +7,7 @@ import os
 import polars as pl
 import pyarrow as pa
 import pytest
+from polars.testing import assert_frame_equal
 
 import vortex as vx
 import vortex.expr as ve
@@ -73,8 +74,19 @@ def test_to_polars_with_projection_and_filter(vxf: vx.VortexFile) -> None:
     assert len(df) == 100
 
 
-def test_polars_conditional():
-    frame = pl.DataFrame({"p": [True, False, None], "x": [1, 2, 3], "y": [4, 5, 6]})
-    expr = pl.when(pl.col("p")).then(pl.col("x")).otherwise(pl.col("y"))
-    actual = vx.array(frame.to_arrow()).apply(polars_to_vortex(expr)).to_arrow_array()
-    assert actual.equals(frame.select(expr).to_series().to_arrow())
+def test_polars_conditional(tmp_path):
+    frame = pl.DataFrame(
+        {
+            "id": [0, 1, 2, 3],
+            "p": [True, False, None, False],
+            "x": [1, 2, 3, 4],
+            "y": [4, 5, 6, None],
+        }
+    )
+    expr = pl.when(pl.col("p")).then(pl.col("x")).otherwise(pl.col("y")) >= 5
+    path = tmp_path / "conditional.vortex"
+    vx.io.write(vx.array(frame.to_arrow()), str(path))
+    expected_frame = frame.lazy().filter(expr).collect()
+    actual = vx.open(str(path)).to_polars().filter(expr).collect()
+    assert_frame_equal(actual, expected_frame)
+    assert actual["id"].to_list() == [1, 2]
