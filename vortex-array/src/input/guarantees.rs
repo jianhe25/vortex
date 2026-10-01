@@ -83,7 +83,8 @@ impl ArrayInput {
     /// Exact integer extrema become bounds. Positive sortedness keeps its original strictness;
     /// negative sortedness and other aggregate results are omitted. Integer ordering places nulls
     /// first, and strict ordering excludes duplicate values and repeated nulls. A complete slice shares its
-    /// owner's store. No values are read to propagate guarantees.
+    /// owner's store. No values are read to propagate guarantees. Nonempty subsets drop the
+    /// private cast proof because external transformation kernels do not establish native bounds.
     pub fn slice(&self, range: Range<usize>) -> VortexResult<Self> {
         let array = match self.cache_mode {
             AggregateCacheMode::Array => self.array().slice(range)?,
@@ -100,7 +101,8 @@ impl ArrayInput {
     /// Apply a stable filter, retaining integer bounds and positive sortedness.
     ///
     /// The mask must match the input length. Relative order and null placement of retained rows
-    /// are unchanged. An all-true mask shares the owner; other selections get fresh stores.
+    /// are unchanged. An all-true mask shares the owner. Other selections get fresh stores and
+    /// retain no private cast proof.
     pub fn filter(&self, mask: Mask) -> VortexResult<Self> {
         let array = self.array().filter(mask)?;
         if ArrayRef::ptr_eq(&array, self.array()) {
@@ -245,9 +247,6 @@ impl ArrayInput {
                     Precision::Inexact(bounds.max.into_nullable()),
                 )?;
             }
-        }
-        if let Some(proof) = self.verified_bounds() {
-            output.inner.verified_bounds.set(proof.clone()).ok();
         }
         Ok(output)
     }

@@ -356,3 +356,20 @@ fn an_empty_slice_does_not_inherit_constantness(
     assert_eq!(empty.compute_result(&constant, &mut ctx)?, false.into());
     Ok(())
 }
+
+#[test]
+fn private_cast_proof_does_not_follow_nonempty_subsets() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let input = ArrayInput::new(buffer![1i16, 2, 3].into_array());
+    input.validate_integer_bounds(&mut ctx)?;
+    assert!(input.verified_bounds().is_some());
+    assert!(input.slice(1..3)?.verified_bounds().is_none());
+    assert!(
+        input
+            .filter(Mask::from_indices(3, [0, 2]))?
+            .verified_bounds()
+            .is_none()
+    );
+    assert!(input.slice(0..0)?.verified_bounds().is_some());
+    Ok(())
+}

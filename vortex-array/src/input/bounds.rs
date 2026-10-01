@@ -17,9 +17,8 @@ use crate::scalar::Scalar;
 
 /// Value-range evidence produced by direct core validation or the mask index producer.
 ///
-/// The enclosing owner binds this private token to its immutable input. Stable subsets may carry
-/// its conservative range, but aggregate kernels, imported metadata, and scalar seeds cannot mint it.
-#[derive(Clone)]
+/// The enclosing owner binds this private token to its immutable input. Aggregate kernels,
+/// transformations, imported metadata, and scalar seeds cannot mint or propagate it.
 pub(super) struct VerifiedIntegerBounds {
     values: Option<MinMaxResult>,
 }
