@@ -19,6 +19,13 @@ pub use expr::stat;
 pub use expr::sum;
 pub use stats_set::*;
 
+mod aggregations;
+pub use aggregations::Aggregations;
+pub use aggregations::AggregationsRef;
+
+mod results;
+pub use results::AggregateResults;
+
 mod array;
 pub mod bind;
 pub mod expr;

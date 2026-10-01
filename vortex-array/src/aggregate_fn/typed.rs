@@ -41,6 +41,12 @@ pub(super) trait DynAggregateFn: 'static + Send + Sync + super::sealed::Sealed {
 
     fn can_satisfy(&self, requested: &AggregateFnRef) -> AggregateFnSatisfaction;
     fn return_dtype(&self, input_dtype: &DType) -> Option<DType>;
+    fn is_representation_invariant(&self) -> bool;
+    fn partial_from_result(
+        &self,
+        input_dtype: &DType,
+        result: &crate::scalar::Scalar,
+    ) -> VortexResult<Option<crate::scalar::Scalar>>;
     fn state_dtype(&self, input_dtype: &DType) -> Option<DType>;
     fn accumulator(&self, input_dtype: &DType) -> VortexResult<AccumulatorRef>;
     fn accumulator_grouped(&self, input_dtype: &DType) -> VortexResult<GroupedAccumulatorRef>;
@@ -85,6 +91,36 @@ impl<V: AggregateFnVTable> DynAggregateFn for AggregateFnInner<V> {
 
     fn return_dtype(&self, input_dtype: &DType) -> Option<DType> {
         V::return_dtype(&self.vtable, &self.options, input_dtype)
+    }
+
+    fn is_representation_invariant(&self) -> bool {
+        V::is_representation_invariant(&self.vtable, &self.options)
+    }
+
+    fn partial_from_result(
+        &self,
+        input_dtype: &DType,
+        result: &crate::scalar::Scalar,
+    ) -> VortexResult<Option<crate::scalar::Scalar>> {
+        if self.return_dtype(input_dtype).is_none() || self.state_dtype(input_dtype).is_none() {
+            return Ok(None);
+        }
+        let dtypes = crate::aggregate_fn::AggregateDTypes::try_new(
+            &self.vtable,
+            &self.options,
+            input_dtype.clone(),
+        )?;
+        vortex_error::vortex_ensure!(
+            result.dtype() == &dtypes.return_dtype,
+            "Aggregate {} requires result dtype {}, got {}",
+            self.id(),
+            dtypes.return_dtype,
+            result.dtype()
+        );
+        self.vtable
+            .partial_from_result(dtypes.args(&self.options), result.clone())?
+            .map(|partial| self.vtable.to_scalar(dtypes.args(&self.options), &partial))
+            .transpose()
     }
 
     fn state_dtype(&self, input_dtype: &DType) -> Option<DType> {
