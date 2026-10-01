@@ -184,3 +184,27 @@ fn fsst_compress_offsets_overflow_i32() {
     // Prove the regression condition was exercised: compressed bytes crossed i32::MAX.
     assert!(compressed.codes_bytes().len() > i32::MAX as usize);
 }
+
+/// Nulls and values come back through the codes offsets and validity probes, on the one-off
+/// and the retained path, in any read order.
+#[test]
+fn probe_reads_nulls_and_values() -> vortex_error::VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let input = VarBinViewArray::from_iter_nullable_str([
+        Some("hello world, hello world"),
+        None,
+        Some(""),
+        Some("hello again, hello again"),
+    ])
+    .into_array();
+    let compressor = fsst_train_compressor(&input, &mut ctx)?;
+    let fsst = fsst_compress(&input, &compressor, &mut ctx)?.into_array();
+    let mut probe = fsst.repeated_probe();
+    for index in [3, 1, 0, 2, 1, 3] {
+        let expected = input.execute_scalar(index, &mut ctx)?;
+        assert_eq!(fsst.execute_scalar(index, &mut ctx)?, expected);
+        assert_eq!(probe.execute_scalar(index, &mut ctx)?, expected);
+    }
+    assert!(probe.execute_scalar(4, &mut ctx).is_err());
+    Ok(())
+}

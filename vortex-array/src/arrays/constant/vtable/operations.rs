@@ -4,6 +4,7 @@
 use vortex_error::VortexResult;
 
 use crate::ExecutionCtx;
+use crate::ProbeState;
 use crate::array::ArrayView;
 use crate::array::OperationsVTable;
 use crate::arrays::Constant;
@@ -11,6 +12,15 @@ use crate::scalar::Scalar;
 
 impl OperationsVTable<Constant> for Constant {
     type ProbeState = ();
+
+    /// The scalar already carries the row's nullness, so no validity is resolved.
+    fn probe_scalar(
+        state: &mut ProbeState<'_, Constant>,
+        _index: usize,
+        _ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        Ok(state.array().scalar.clone())
+    }
 
     fn scalar_at(
         array: ArrayView<'_, Constant>,

@@ -5,6 +5,7 @@ use std::hash::Hasher;
 
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -17,6 +18,8 @@ use crate::Canonical;
 use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
+use crate::ProbeState;
+use crate::RepeatedArrayProbe;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
@@ -124,15 +127,46 @@ impl VTable for Shared {
             .map(ExecutionResult::done)
     }
 }
+
+/// The probe over the materialised array, kept by a repeated read once the source has been
+/// computed. Until then the read goes through the source slot's probe.
+#[derive(Default)]
+pub struct SharedProbeState {
+    cached: Option<RepeatedArrayProbe>,
+}
+
 impl OperationsVTable<Shared> for Shared {
-    type ProbeState = ();
+    type ProbeState = SharedProbeState;
+
+    fn probe_scalar(
+        state: &mut ProbeState<'_, Shared>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        let array = state.array();
+        // Source and cached array both carry the outer dtype, so the row's nullness passes
+        // through from whichever is read.
+        let Some(cached) = array.cached_array_ref() else {
+            return state
+                .slot(SharedSlots::SOURCE)?
+                .ok_or_else(|| vortex_err!("Shared source slot is missing"))?
+                .execute_scalar(index, ctx);
+        };
+        match state.retained() {
+            None => cached.execute_scalar(index, ctx),
+            Some(retained) => retained
+                .cached
+                .get_or_insert_with(|| RepeatedArrayProbe::new(cached.clone()))
+                .execute_scalar(index, ctx),
+        }
+    }
 
     fn scalar_at(
         array: ArrayView<'_, Shared>,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
-        array.current_array_ref().execute_scalar(index, ctx)
+        Self::probe_scalar(&mut ProbeState::once(array), index, ctx)
     }
 }
 

@@ -3,6 +3,7 @@
 
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
+use vortex_array::ProbeState;
 use vortex_array::scalar::Scalar;
 use vortex_array::vtable::OperationsVTable;
 use vortex_error::VortexResult;
@@ -13,15 +14,26 @@ use crate::SparseExt as _;
 impl OperationsVTable<Sparse> for Sparse {
     type ProbeState = ();
 
-    fn scalar_at(
-        array: ArrayView<'_, Sparse>,
+    /// A patched value or the fill scalar already carries the row's nullness, so no validity
+    /// is resolved.
+    fn probe_scalar(
+        state: &mut ProbeState<'_, Sparse>,
         index: usize,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
+        let array = state.array();
         Ok(array
             .patches()
             .get_patched(index)?
             .unwrap_or_else(|| array.fill_scalar().clone()))
+    }
+
+    fn scalar_at(
+        array: ArrayView<'_, Sparse>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        Self::probe_scalar(&mut ProbeState::once(array), index, ctx)
     }
 }
 

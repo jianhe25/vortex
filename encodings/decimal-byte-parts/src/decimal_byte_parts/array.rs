@@ -17,6 +17,7 @@ use vortex_array::ArrayView;
 use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
+use vortex_array::ProbeState;
 use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
 use vortex_array::buffer::BufferHandle;
@@ -34,6 +35,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
@@ -346,47 +348,61 @@ impl<T: TypedArrayRef<DecimalByteParts>> DecimalBytePartsArrayExt for T {}
 impl OperationsVTable<DecimalByteParts> for DecimalByteParts {
     type ProbeState = ();
 
+    fn probe_scalar(
+        state: &mut ProbeState<'_, DecimalByteParts>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        let array = state.array();
+        // The array's validity is the MSP's, so a null MSP is the null row. The MSP's signed
+        // value (i8/i16/i32/i64) widens to i64 for reconstruction; the array keeps its storage
+        // type.
+        let msp = state
+            .slot(DecimalBytePartsSlots::MSP)?
+            .ok_or_else(|| vortex_err!("DecimalByteParts msp slot is missing"))?
+            .execute_scalar(index, ctx)?;
+        let Some(msp) = msp.as_primitive().as_::<i64>() else {
+            return Ok(Scalar::null(array.dtype().clone()));
+        };
+
+        // Zero-extend each narrowed lower value to its 64-bit window.
+        let nparts = array.lower_parts().len();
+        vortex_ensure!(
+            nparts <= MAX_LOWER_PARTS,
+            "at most {MAX_LOWER_PARTS} lower parts are supported, got {nparts}"
+        );
+        let mut lower_parts = [0u64; MAX_LOWER_PARTS];
+        for (part, value) in lower_parts.iter_mut().take(nparts).enumerate() {
+            *value = state
+                .slot(DecimalBytePartsSlots::LOWER_PARTS_OFFSET + part)?
+                .ok_or_else(|| vortex_err!("DecimalByteParts lower part {part} slot is missing"))?
+                .execute_scalar(index, ctx)?
+                .as_primitive()
+                .as_::<u64>()
+                .ok_or_else(|| vortex_err!("DecimalByteParts lower part {part} is null"))?;
+        }
+
+        let value = match lower_parts[..nparts] {
+            [] => DecimalValue::I64(msp),
+            [first] => DecimalValue::I128(assemble_wide_decimal_value(msp, [first])),
+            [first, second] => {
+                DecimalValue::I256(assemble_wide_decimal_value(msp, [first, second]))
+            }
+            [first, second, third] => {
+                DecimalValue::I256(assemble_wide_decimal_value(msp, [first, second, third]))
+            }
+            _ => vortex_bail!("at most {MAX_LOWER_PARTS} lower parts are supported, got {nparts}"),
+        };
+
+        Scalar::try_new(array.dtype().clone(), Some(ScalarValue::Decimal(value)))
+    }
+
     fn scalar_at(
         array: ArrayView<'_, DecimalByteParts>,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
-        let scalar = array.msp().execute_scalar(index, ctx)?;
-
-        // Widen the MSP's signed value (i8/i16/i32/i64) to i64 for scalar reconstruction.
-        // The array retains its original MSP storage type.
-        let primitive_scalar = scalar.as_primitive();
-        let msp = primitive_scalar.as_::<i64>().vortex_expect("non-null");
-
-        // Zero-extend each narrowed lower value to its 64-bit window.
-        let lower_parts = array
-            .lower_parts()
-            .iter()
-            .map(|part| {
-                Ok(part
-                    .execute_scalar(index, ctx)?
-                    .as_primitive()
-                    .as_::<u64>()
-                    .vortex_expect("lower parts are non-nullable"))
-            })
-            .collect::<VortexResult<Vec<_>>>()?;
-
-        let value = match lower_parts.as_slice() {
-            [] => DecimalValue::I64(msp),
-            [first] => DecimalValue::I128(assemble_wide_decimal_value(msp, [*first])),
-            [first, second] => {
-                DecimalValue::I256(assemble_wide_decimal_value(msp, [*first, *second]))
-            }
-            [first, second, third] => {
-                DecimalValue::I256(assemble_wide_decimal_value(msp, [*first, *second, *third]))
-            }
-            _ => vortex_bail!(
-                "at most {MAX_LOWER_PARTS} lower parts are supported, got {}",
-                lower_parts.len()
-            ),
-        };
-
-        Scalar::try_new(array.dtype().clone(), Some(ScalarValue::Decimal(value)))
+        Self::probe_scalar(&mut ProbeState::once(array), index, ctx)
     }
 }
 
@@ -431,6 +447,27 @@ mod tests {
     use crate::decimal_byte_parts::MAX_LOWER_PARTS;
     use crate::decimal_byte_parts::testing::i128_parts;
     use crate::decimal_byte_parts::testing::i256_parts;
+
+    /// Nulls and values come back through the MSP and lower part probes, on the one-off and the
+    /// retained path, for one and for three lower parts.
+    #[rstest]
+    #[case::i128(i128_parts(vec![i128::MAX / 3, 0, -7], Validity::from_iter([true, false, true])).into_array())]
+    #[case::i256(i256_parts(vec![i256::from_parts((7u128 << 64) | 8, (5i128 << 64) | 6), i256::ZERO, i256::from_parts(1, -1)], Validity::from_iter([true, false, true])).into_array())]
+    fn probe_reads_nulls_and_values(#[case] array: ArrayRef) -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let canonical = array
+            .clone()
+            .execute::<DecimalArray>(&mut ctx)?
+            .into_array();
+        let mut probe = array.repeated_probe();
+        for index in [2, 1, 0, 1, 2] {
+            let expected = canonical.execute_scalar(index, &mut ctx)?;
+            assert_eq!(array.execute_scalar(index, &mut ctx)?, expected);
+            assert_eq!(probe.execute_scalar(index, &mut ctx)?, expected);
+        }
+        assert!(probe.execute_scalar(3, &mut ctx).is_err());
+        Ok(())
+    }
 
     #[test]
     fn test_scalar_at_decimal_parts() {

@@ -16,6 +16,7 @@ use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
+use vortex_array::ProbeState;
 use vortex_array::TypedArrayRef;
 use vortex_array::array_slots;
 use vortex_array::buffer::BufferHandle;
@@ -33,6 +34,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -233,14 +235,19 @@ impl Default for ZigZagData {
 impl OperationsVTable<ZigZag> for ZigZag {
     type ProbeState = ();
 
-    fn scalar_at(
-        array: ArrayView<'_, ZigZag>,
+    fn probe_scalar(
+        state: &mut ProbeState<'_, ZigZag>,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
-        let scalar = array.encoded().execute_scalar(index, ctx)?;
+        let array = state.array();
+        // The array's validity is its encoded child's, so a null encoded value is the null row.
+        let scalar = state
+            .slot(ZigZagSlots::ENCODED)?
+            .ok_or_else(|| vortex_err!("ZigZag encoded slot is missing"))?
+            .execute_scalar(index, ctx)?;
         if scalar.is_null() {
-            return scalar.primitive_reinterpret_cast(ZigZagArrayExt::ptype(&array));
+            return Ok(Scalar::null(array.dtype().clone()));
         }
 
         let pscalar = scalar.as_primitive();
@@ -254,6 +261,14 @@ impl OperationsVTable<ZigZag> for ZigZag {
                 array.dtype().nullability(),
             )
         }))
+    }
+
+    fn scalar_at(
+        array: ArrayView<'_, ZigZag>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        Self::probe_scalar(&mut ProbeState::once(array), index, ctx)
     }
 }
 
@@ -274,6 +289,21 @@ mod test {
 
     use super::*;
     use crate::zigzag_encode;
+
+    #[test]
+    fn probe_reads_nulls_and_values() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let expected = [Some(1i32), None, Some(-5), Some(0), None];
+        let zigzag =
+            zigzag_encode(PrimitiveArray::from_option_iter(expected).as_view())?.into_array();
+        let mut probe = zigzag.repeated_probe();
+        for index in [4, 2, 1, 0, 3, 1] {
+            let scalar = Scalar::from(expected[index]);
+            assert_eq!(zigzag.execute_scalar(index, &mut ctx)?, scalar);
+            assert_eq!(probe.execute_scalar(index, &mut ctx)?, scalar);
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_compute_statistics() -> VortexResult<()> {

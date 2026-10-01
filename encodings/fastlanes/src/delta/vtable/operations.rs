@@ -1,28 +1,72 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::ProbeState;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::scalar::Scalar;
 use vortex_array::vtable::OperationsVTable;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 
 use super::Delta;
+use crate::FL_CHUNK_SIZE;
+use crate::delta::DeltaArrayExt;
+
+/// The last decoded 1,024-element chunk, retained so reads in the same chunk skip the decode.
+#[derive(Default)]
+pub struct DeltaProbeState {
+    chunk: Option<(usize, ArrayRef)>,
+}
+
 impl OperationsVTable<Delta> for Delta {
-    type ProbeState = ();
+    type ProbeState = DeltaProbeState;
+
+    fn probe_scalar(
+        state: &mut ProbeState<'_, Delta>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        let array = state.array();
+        let Some(retained) = state.retained() else {
+            // A one-off read decodes just this element.
+            return array
+                .array()
+                .slice(index..index + 1)?
+                .execute::<PrimitiveArray>(ctx)?
+                .into_array()
+                .execute_scalar(0, ctx);
+        };
+        // Every element of a chunk is the running sum of its lane's deltas, so decoding one
+        // costs as much as decoding the chunk. Decode the whole chunk once and keep it.
+        let physical = array.offset() + index;
+        let chunk = physical / FL_CHUNK_SIZE;
+        let chunk_start = (chunk * FL_CHUNK_SIZE).saturating_sub(array.offset());
+        if !matches!(&retained.chunk, Some((kept, _)) if *kept == chunk) {
+            let chunk_end = ((chunk + 1) * FL_CHUNK_SIZE - array.offset()).min(array.len());
+            let decoded = array
+                .array()
+                .slice(chunk_start..chunk_end)?
+                .execute::<PrimitiveArray>(ctx)?
+                .into_array();
+            retained.chunk = Some((chunk, decoded));
+        }
+        let (_, decoded) = retained
+            .chunk
+            .as_ref()
+            .ok_or_else(|| vortex_err!("Delta chunk was just decoded"))?;
+        decoded.execute_scalar(index - chunk_start, ctx)
+    }
 
     fn scalar_at(
         array: ArrayView<'_, Delta>,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
-        let decompressed = array
-            .array()
-            .slice(index..index + 1)?
-            .execute::<PrimitiveArray>(ctx)?;
-        decompressed.into_array().execute_scalar(0, ctx)
+        Self::probe_scalar(&mut ProbeState::once(array), index, ctx)
     }
 }
 
@@ -38,9 +82,11 @@ mod tests {
     use vortex_array::assert_arrays_eq;
     use vortex_array::compute::conformance::binary_numeric::test_binary_numeric_array;
     use vortex_array::compute::conformance::consistency::test_array_consistency;
+    use vortex_array::scalar::Scalar;
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
+    use vortex_error::VortexResult;
     use vortex_session::VortexSession;
 
     use crate::Delta;
@@ -55,6 +101,32 @@ mod tests {
     fn da(array: &PrimitiveArray) -> DeltaArray {
         Delta::try_from_primitive_array(array, &mut SESSION.create_execution_ctx())
             .vortex_expect("Delta array construction should succeed")
+    }
+
+    /// A retained probe keeps one decoded chunk; reads that cross chunks, come back, and go
+    /// through a sliced offset all agree with one-off reads, nulls included.
+    #[test]
+    fn probe_reads_across_chunks_and_offsets() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let expected: Vec<Option<u32>> = (0u32..2500)
+            .map(|i| (i % 7 != 3).then_some(i * 3))
+            .collect();
+        let delta = da(&PrimitiveArray::from_option_iter(expected.iter().copied())).into_array();
+        let sliced = delta.slice(1000..2200)?;
+        let mut whole = delta.repeated_probe();
+        let mut part = sliced.repeated_probe();
+        for index in [0, 1023, 1024, 2499, 1024, 5, 2048, 2047, 3] {
+            let scalar = Scalar::from(expected[index]);
+            assert_eq!(delta.execute_scalar(index, &mut ctx)?, scalar);
+            assert_eq!(whole.execute_scalar(index, &mut ctx)?, scalar);
+        }
+        for index in [0, 23, 24, 1199, 1048, 1047, 0] {
+            let scalar = Scalar::from(expected[1000 + index]);
+            assert_eq!(sliced.execute_scalar(index, &mut ctx)?, scalar);
+            assert_eq!(part.execute_scalar(index, &mut ctx)?, scalar);
+        }
+        assert!(part.execute_scalar(1200, &mut ctx).is_err());
+        Ok(())
     }
 
     #[test]

@@ -658,3 +658,59 @@ fn test_onpair_rejects_impossible_uncompressed_lengths() -> vortex_error::Vortex
     }
     Ok(())
 }
+
+/// A `codes_offsets` boundary past the end of `codes` is an error on both paths, never an
+/// allocation of that size.
+#[test]
+fn test_onpair_rejects_code_offsets_past_codes() -> vortex_error::VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let valid = compress_onpair(&sample_input().into_array(), &mut ctx)?;
+    let view = valid.as_view();
+    let codes_len = view.codes().len() as u64;
+    let invalid = OnPair::try_new(
+        view.dtype().clone(),
+        view.dict_bytes_handle().clone(),
+        view.dict_offsets().clone(),
+        view.codes().clone(),
+        PrimitiveArray::from_iter([0u64, 1 << 60, codes_len, codes_len, codes_len, codes_len])
+            .into_array(),
+        view.uncompressed_lengths().clone(),
+        view.array_validity(),
+    )?
+    .into_array();
+    assert!(invalid.execute_scalar(0, &mut ctx).is_err());
+    assert!(
+        invalid
+            .repeated_probe()
+            .execute_scalar(0, &mut ctx)
+            .is_err()
+    );
+    Ok(())
+}
+
+/// Nulls and values come back through the validity, offsets and codes probes, on the one-off
+/// and the retained path, in any read order.
+#[test]
+fn probe_reads_nulls_and_values() -> vortex_error::VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let input = VarBinArray::from_iter(
+        [
+            Some("https://www.example.com/page"),
+            None,
+            Some(""),
+            Some("https://www.example.com/data"),
+            Some("ftp://files.example.com/x"),
+        ],
+        DType::Utf8(Nullability::Nullable),
+    )
+    .into_array();
+    let encoded = compress_onpair(&input, &mut ctx)?.into_array();
+    let mut probe = encoded.repeated_probe();
+    for index in [4, 1, 0, 2, 3, 1, 4] {
+        let expected = input.execute_scalar(index, &mut ctx)?;
+        assert_eq!(encoded.execute_scalar(index, &mut ctx)?, expected);
+        assert_eq!(probe.execute_scalar(index, &mut ctx)?, expected);
+    }
+    assert!(probe.execute_scalar(5, &mut ctx).is_err());
+    Ok(())
+}

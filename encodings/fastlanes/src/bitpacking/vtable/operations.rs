@@ -3,6 +3,7 @@
 
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
+use vortex_array::ProbeState;
 use vortex_array::scalar::Scalar;
 use vortex_array::vtable::OperationsVTable;
 use vortex_error::VortexResult;
@@ -13,11 +14,16 @@ use crate::bitpacking::array::BitPackedArrayExt;
 impl OperationsVTable<BitPacked> for BitPacked {
     type ProbeState = ();
 
-    fn scalar_at(
-        array: ArrayView<'_, BitPacked>,
+    fn probe_scalar(
+        state: &mut ProbeState<'_, BitPacked>,
         index: usize,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
+        let array = state.array();
+        // The validity is the validity child, which a repeated read resolves once.
+        if !state.is_valid(index, ctx)? {
+            return Ok(Scalar::null(array.dtype().clone()));
+        }
         Ok(
             if let Some(patches) = array.patches()
                 && let Some(patch) = patches.get_patched(index)?
@@ -27,6 +33,14 @@ impl OperationsVTable<BitPacked> for BitPacked {
                 bitpack_decompress::unpack_single(array, index)
             },
         )
+    }
+
+    fn scalar_at(
+        array: ArrayView<'_, BitPacked>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        Self::probe_scalar(&mut ProbeState::once(array), index, ctx)
     }
 }
 
@@ -61,6 +75,26 @@ mod test {
 
     fn bp(array: &ArrayRef, bit_width: u8) -> BitPackedArray {
         BitPackedData::encode(array, bit_width, &mut SESSION.create_execution_ctx()).unwrap()
+    }
+
+    /// Nulls, packed values and patched values come back on the one-off and the retained path.
+    #[test]
+    fn probe_reads_nulls_values_and_patches() {
+        let mut ctx = SESSION.create_execution_ctx();
+        let expected: Vec<Option<u32>> = (0u32..3000)
+            .map(|i| (i % 5 != 0).then_some(if i % 500 == 1 { 100_000 } else { i % 64 }))
+            .collect();
+        let packed = bp(
+            &PrimitiveArray::from_option_iter(expected.iter().copied()).into_array(),
+            6,
+        )
+        .into_array();
+        let mut probe = packed.repeated_probe();
+        for index in [0, 1, 5, 501, 1024, 2999, 2, 1501] {
+            let scalar = Scalar::from(expected[index]);
+            assert_eq!(packed.execute_scalar(index, &mut ctx).unwrap(), scalar);
+            assert_eq!(probe.execute_scalar(index, &mut ctx).unwrap(), scalar);
+        }
     }
 
     fn slice_via_reduce(array: &BitPackedArray, range: Range<usize>) -> BitPackedArray {
