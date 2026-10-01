@@ -85,43 +85,62 @@ def test_polars_struct_field(tmp_path):
     assert actual["id"].to_list() == [2]
 
 
-@pytest.mark.parametrize(
-    "depth, leaf_is_null, expected_values, expected_ids",
-    [
-        (1, False, [None, 20, 30, 40, 50], [1, 2, 3, 4]),
-        (2, False, [None, None, 30, 40, 50], [2, 3, 4]),
-        (3, False, [None, None, None, 40, 50], [3, 4]),
-        (1, True, [None, 20, 30, 40, None], [1, 2, 3]),
-        (2, True, [None, None, 30, 40, None], [2, 3]),
-        (3, True, [None, None, None, 40, None], [3]),
-    ],
-)
-def test_polars_struct_field_parent_nulls(tmp_path, depth, leaf_is_null, expected_values, expected_ids):
-    leaf_values = [10, 20, 30, 40, None if leaf_is_null else 50]
-    leaf = pa.array(leaf_values, type=pa.int64())
-    parents = leaf
-    for level in reversed(range(depth)):
-        parents = pa.StructArray.from_arrays(
-            [parents],
-            names=["value" if level == depth - 1 else "child"],
-            mask=pa.array([row == level for row in range(5)]),
-        )
-    table = pa.table({"id": range(5), "x": parents})
+def _assert_struct_field_scan(tmp_path, parents, field, expected_values, expected_ids):
+    table = pa.table({"id": range(len(parents)), "x": parents})
     frame = pl.from_arrow(table)
-    field = pl.col("x")
-    physical_child = parents
-    for level in range(depth):
-        name = "value" if level == depth - 1 else "child"
-        field = field.struct.field(name)
-        physical_child = physical_child.field(name)
-    assert physical_child.to_pylist() == leaf_values
-    assert physical_child.slice(0, depth).null_count == 0
     assert frame.select(field).to_series().to_list() == expected_values
-
     path = tmp_path / "struct_parent_nulls.vortex"
     vx.io.write(vx.array(table), str(path))
     predicate = field >= 0
-    expected_frame = frame.lazy().filter(predicate).collect()
     actual = vx.open(str(path)).to_polars().filter(predicate).collect()
-    assert_frame_equal(actual, expected_frame)
+    assert_frame_equal(actual, frame.lazy().filter(predicate).collect())
     assert actual["id"].to_list() == expected_ids
+
+
+def test_polars_struct_field_null_parent(tmp_path):
+    leaf = pa.array([10, 20])
+    parent = pa.StructArray.from_arrays([leaf], names=["value"], mask=pa.array([True, False]))
+    assert parent.field("value").to_pylist() == [10, 20]
+    field = pl.col("x").struct.field("value")
+    _assert_struct_field_scan(tmp_path, parent, field, [None, 20], [1])
+
+
+def test_polars_struct_field_null_inner_parent(tmp_path):
+    leaf = pa.array([10, 20])
+    inner = pa.StructArray.from_arrays([leaf], names=["value"], mask=pa.array([True, False]))
+    outer = pa.StructArray.from_arrays([inner], names=["child"])
+    assert outer.field("child").field("value").to_pylist() == [10, 20]
+    field = pl.col("x").struct.field("child").struct.field("value")
+    _assert_struct_field_scan(tmp_path, outer, field, [None, 20], [1])
+
+
+def test_polars_struct_field_null_outer_parent(tmp_path):
+    leaf = pa.array([10, 20])
+    inner = pa.StructArray.from_arrays([leaf], names=["value"])
+    outer = pa.StructArray.from_arrays([inner], names=["child"], mask=pa.array([True, False]))
+    assert outer.field("child").field("value").to_pylist() == [10, 20]
+    field = pl.col("x").struct.field("child").struct.field("value")
+    _assert_struct_field_scan(tmp_path, outer, field, [None, 20], [1])
+
+
+def test_polars_struct_field_null_middle_parent(tmp_path):
+    leaf = pa.array([10, 20])
+    inner = pa.StructArray.from_arrays([leaf], names=["value"])
+    middle = pa.StructArray.from_arrays([inner], names=["child"], mask=pa.array([True, False]))
+    outer = pa.StructArray.from_arrays([middle], names=["child"])
+    assert outer.field("child").field("child").field("value").to_pylist() == [10, 20]
+    field = pl.col("x").struct.field("child").struct.field("child").struct.field("value")
+    _assert_struct_field_scan(tmp_path, outer, field, [None, 20], [1])
+
+
+def test_polars_struct_field_null_parents_and_leaf(tmp_path):
+    leaf = pa.array([10, 20, 30, None, 50])
+    inner = pa.StructArray.from_arrays(
+        [leaf], names=["value"], mask=pa.array([True, False, True, False, False])
+    )
+    outer = pa.StructArray.from_arrays(
+        [inner], names=["child"], mask=pa.array([False, True, True, False, False])
+    )
+    assert outer.field("child").field("value").to_pylist() == [10, 20, 30, None, 50]
+    field = pl.col("x").struct.field("child").struct.field("value")
+    _assert_struct_field_scan(tmp_path, outer, field, [None, None, None, None, 50], [4])
