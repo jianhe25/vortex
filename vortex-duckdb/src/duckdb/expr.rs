@@ -11,6 +11,8 @@ use crate::cpp::duckdb_vx_expr_class;
 use crate::duckdb::AggregateFunction;
 use crate::duckdb::AggregateFunctionRef;
 use crate::duckdb::DDBString;
+use crate::duckdb::DynamicFilter;
+use crate::duckdb::DynamicFilterData;
 use crate::duckdb::LogicalType;
 use crate::duckdb::LogicalTypeRef;
 use crate::duckdb::ScalarFunction;
@@ -151,8 +153,10 @@ impl ExpressionRef {
                         let children =
                             unsafe { std::slice::from_raw_parts(out.children, out.children_count) };
 
+                        let expr = self;
                         ExpressionClass::BoundFunction(BoundFunction {
                             children,
+                            expr,
                             scalar_function: unsafe { ScalarFunction::borrow(out.scalar_function) },
                         })
                     }
@@ -250,6 +254,7 @@ impl<'a> BoundOperator<'a> {
 
 pub struct BoundFunction<'a> {
     children: &'a [cpp::duckdb_vx_expr],
+    expr: &'a ExpressionRef,
     pub scalar_function: &'a ScalarFunctionRef,
 }
 
@@ -259,5 +264,32 @@ impl<'a> BoundFunction<'a> {
         self.children
             .iter()
             .map(|&child| unsafe { Expression::borrow(child) })
+    }
+
+    /// If this bound function is an "optional" or "selectivity optional"
+    /// filter, return child expression inside optional filter.
+    pub fn optional(&self) -> Option<&'a ExpressionRef> {
+        let ptr = unsafe { cpp::duckdb_vx_expr_get_bound_optional(self.expr.as_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { Expression::borrow(ptr) })
+    }
+
+    /// If this bound function is an dynamic filter, return child expression
+    /// inside dynamic filter.
+    pub fn dynamic(&self) -> Option<DynamicFilter> {
+        let mut out = cpp::duckdb_vx_table_filter_dynamic {
+            data: ptr::null_mut(),
+            comparison_type: cpp::DUCKDB_VX_EXPR_TYPE::DUCKDB_VX_EXPR_TYPE_INVALID,
+        };
+        unsafe { cpp::duckdb_vx_expr_get_bound_dynamic(self.expr.as_ptr(), &raw mut out) };
+        if out.data.is_null() {
+            return None;
+        }
+        Some(DynamicFilter {
+            data: unsafe { DynamicFilterData::own(out.data) },
+            operator: out.comparison_type,
+        })
     }
 }

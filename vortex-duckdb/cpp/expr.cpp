@@ -4,15 +4,16 @@
 #include "expr.h"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/aggregate_function.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
-#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 
 using namespace duckdb;
 
@@ -88,6 +89,26 @@ extern "C" void duckdb_vx_expr_get_bound_comparison(duckdb_vx_expr ffi_expr,
     out->left = reinterpret_cast<duckdb_vx_expr>(BoundComparisonExpression::LeftMutable(expr).get());
     out->right = reinterpret_cast<duckdb_vx_expr>(BoundComparisonExpression::RightMutable(expr).get());
     out->type = static_cast<duckdb_vx_expr_type>(expr.GetExpressionType());
+}
+
+extern "C" duckdb_vx_expr duckdb_vx_expr_get_bound_optional(duckdb_vx_expr ffi) {
+    D_ASSERT(ffi);
+    auto &expr = reinterpret_cast<Expression *>(ffi)->Cast<BoundFunctionExpression>();
+    const Identifier &name = expr.Function().GetName();
+    // In DuckDB an optional filter may have no bind info.
+    // See optimizer/expression_heuristics.cpp as an example.
+    if (!expr.BindInfo()) {
+        return nullptr;
+    }
+    if (name == OptionalFilterScalarFun::NAME) {
+        auto &data = expr.BindInfo()->Cast<OptionalFilterFunctionData>();
+        return reinterpret_cast<duckdb_vx_expr>(data.child_filter_expr.get());
+    }
+    if (name == SelectivityOptionalFilterScalarFun::NAME) {
+        auto &data = expr.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>();
+        return reinterpret_cast<duckdb_vx_expr>(data.child_filter_expr.get());
+    }
+    return nullptr;
 }
 
 extern "C" bool duckdb_vx_expr_is_comparison(duckdb_vx_expr ffi_expr) {

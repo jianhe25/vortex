@@ -96,19 +96,33 @@ struct DynamicFilterDataWrapper {
 };
 } // namespace
 
-extern "C" void duckdb_vx_table_filter_get_dynamic(duckdb_vx_table_filter ffi_filter,
-                                                   duckdb_vx_table_filter_dynamic *out) {
-    if (!ffi_filter || !out) {
+void populateDynamicFilter(shared_ptr<DynamicFilterData> &data, duckdb_vx_table_filter_dynamic *out) {
+    if (!data) {
         return;
     }
-    auto &filter = reinterpret_cast<TableFilter *>(ffi_filter)->Cast<LegacyDynamicFilter>();
+    std::lock_guard lock(data->lock);
+    auto wrapper = make_uniq<DynamicFilterDataWrapper>(data);
+    out->data = reinterpret_cast<duckdb_vx_dynamic_filter_data>(wrapper.release());
+    out->comparison_type = static_cast<duckdb_vx_expr_type>(data->comparison_type);
+}
 
-    // Hold the lock while accessing the filter data.
-    std::lock_guard<std::mutex> lock(filter.filter_data->lock);
+extern "C" void duckdb_vx_table_filter_get_dynamic(duckdb_vx_table_filter ffi,
+                                                   duckdb_vx_table_filter_dynamic *out) {
+    D_ASSERT(ffi);
+    D_ASSERT(out);
+    auto &filter = reinterpret_cast<TableFilter *>(ffi)->Cast<LegacyDynamicFilter>();
+    populateDynamicFilter(filter.filter_data, out);
+}
 
-    auto data_wrapper = make_uniq<DynamicFilterDataWrapper>(filter.filter_data);
-    out->data = reinterpret_cast<duckdb_vx_dynamic_filter_data>(data_wrapper.release());
-    out->comparison_type = static_cast<duckdb_vx_expr_type>(filter.filter_data->comparison_type);
+extern "C" void duckdb_vx_expr_get_bound_dynamic(duckdb_vx_expr ffi, duckdb_vx_table_filter_dynamic *out) {
+    D_ASSERT(ffi);
+    D_ASSERT(out);
+    auto &expr = reinterpret_cast<Expression *>(ffi)->Cast<BoundFunctionExpression>();
+    if (!expr.BindInfo() || expr.Function().GetName() != DynamicFilterScalarFun::NAME) {
+        return;
+    }
+    auto &filter = expr.BindInfo()->Cast<DynamicFilterFunctionData>();
+    populateDynamicFilter(filter.filter_data, out);
 }
 
 extern "C" void duckdb_vx_dynamic_filter_data_free(duckdb_vx_dynamic_filter_data *ffi_data) {
