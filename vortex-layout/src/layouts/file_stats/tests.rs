@@ -20,6 +20,7 @@ use vortex_array::aggregate_fn::fns::null_count::NullCount;
 use vortex_array::aggregate_fn::fns::sum::Sum;
 use vortex_array::array_session;
 use vortex_array::arrays::ListArray;
+use vortex_array::arrays::NullArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::TemporalArray;
 use vortex_array::builders::ArrayBuilder;
@@ -283,5 +284,36 @@ fn omits_maximum_when_truncation_has_no_upper_bound() -> VortexResult<()> {
             .get_result(&Min.bind(NumericalAggregateOpts::skip_nans()))
             .is_exact()
     );
+    Ok(())
+}
+
+#[rstest]
+#[case::constant(IsConstant.bind(EmptyOptions))]
+#[case::sorted(IsSorted.bind(IsSortedOptions { strict: false }))]
+#[case::strict_sorted(IsSorted.bind(IsSortedOptions { strict: true }))]
+fn unsupported_null_flags_are_omitted(#[case] aggregate: AggregateFnRef) -> VortexResult<()> {
+    let array = NullArray::new(3).into_array();
+    let mut acc = FieldAccumulator::new(array.dtype(), slice::from_ref(&aggregate), 64)?;
+    acc.push_chunk(&array, &mut array_session().create_execution_ctx())?;
+    assert_eq!(acc.results()?.get_result(&aggregate), Precision::Absent);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::sorted(false)]
+#[case::strict_sorted(true)]
+fn unsupported_list_sortedness_is_omitted(#[case] strict: bool) -> VortexResult<()> {
+    let array = ListArray::try_new(
+        buffer![1i32, 2].into_array(),
+        buffer![0u32, 2].into_array(),
+        Validity::NonNullable,
+    )?
+    .into_array();
+    let aggregate = IsSorted.bind(IsSortedOptions { strict });
+    let mut acc = FieldAccumulator::new(array.dtype(), slice::from_ref(&aggregate), 64)?;
+    acc.push_chunk(&array, &mut array_session().create_execution_ctx())?;
+    assert_eq!(acc.results()?.get_result(&aggregate), Precision::Absent);
+
     Ok(())
 }

@@ -33,7 +33,6 @@ use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::dtype::TryFromBytes;
 use crate::flatbuffers::FlatBuffer;
-use crate::flatbuffers::WriteFlatBuffer;
 use crate::flatbuffers::array as fba;
 use crate::flatbuffers::array::Compression;
 use crate::session::ArraySessionExt;
@@ -805,9 +804,19 @@ mod tests {
     use crate::ArraySerialization;
     use crate::ArrayVTable;
     use crate::IntoArray;
+    use crate::VortexSessionExecute;
+    use crate::aggregate_fn::AggregateFnVTableExt;
+    use crate::aggregate_fn::NumericalAggregateOpts;
+    use crate::aggregate_fn::fns::is_sorted::IsSorted;
+    use crate::aggregate_fn::fns::is_sorted::IsSortedOptions;
+    use crate::aggregate_fn::fns::max::Max;
+    use crate::aggregate_fn::fns::min::Min;
     use crate::array_session;
     use crate::arrays::Primitive;
     use crate::arrays::PrimitiveArray;
+    use crate::arrays::VarBinView;
+    use crate::arrays::VarBinViewArray;
+    use crate::expr::stats::Precision;
 
     static SERIALIZER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -935,6 +944,121 @@ mod tests {
             blob.extend_from_slice(buffer.as_ref());
         }
         Ok(blob.freeze())
+    }
+
+    #[test]
+    fn node_hints_preserve_null_extrema_and_final_booleans() -> VortexResult<()> {
+        let session = array_session();
+        let mut execution = session.create_execution_ctx();
+        let array = PrimitiveArray::from_option_iter([None::<i32>, None]).into_array();
+        let min = Min.bind(NumericalAggregateOpts::skip_nans());
+        let sorted = IsSorted.bind(IsSortedOptions { strict: false });
+        let expected_min = array.aggregations().compute_result(&min, &mut execution)?;
+        let expected_sorted = array
+            .aggregations()
+            .compute_result(&sorted, &mut execution)?;
+        let ctx = restricted_context(&[old_primitive_id()]);
+        let serialized = SerializedArray::try_from(serialize_blob(&array, &ctx, &session)?)?;
+        let decoded = serialized.decode(
+            array.dtype(),
+            array.len(),
+            &ReadContext::new(ctx.to_ids()),
+            &session,
+        )?;
+
+        assert!(expected_min.is_null());
+        assert_eq!(
+            decoded.aggregations().get_result(&min),
+            Precision::Exact(expected_min)
+        );
+        assert_eq!(
+            decoded.aggregations().get_result(&sorted),
+            Precision::Exact(expected_sorted.clone())
+        );
+        assert!(
+            sorted
+                .partial_from_result(decoded.dtype(), &expected_sorted)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn node_truncation_preserves_exact_live_results() -> VortexResult<()> {
+        let session = array_session();
+        let mut execution = session.create_execution_ctx();
+        let array = VarBinViewArray::from_iter_str(["abcdefgh", "qrstuvwx"]).into_array();
+        let min = Min.bind(NumericalAggregateOpts::skip_nans());
+        let max = Max.bind(NumericalAggregateOpts::skip_nans());
+        let exact_min = array.aggregations().compute_result(&min, &mut execution)?;
+        let exact_max = array.aggregations().compute_result(&max, &mut execution)?;
+        let ctx = restricted_context(&[ArrayVTable::id(&VarBinView)]);
+        let mut blob = ByteBufferMut::empty();
+        for buffer in array.serialize(
+            &ctx,
+            &session,
+            &SerializeOptions {
+                max_variable_length_statistics_size: Some(3),
+                ..Default::default()
+            },
+        )? {
+            blob.extend_from_slice(buffer.as_ref());
+        }
+        let serialized = SerializedArray::try_from(blob.freeze())?;
+        let decoded = serialized.decode(
+            array.dtype(),
+            array.len(),
+            &ReadContext::new(ctx.to_ids()),
+            &session,
+        )?;
+        assert!(
+            decoded
+                .aggregations()
+                .get_result(&min)
+                .as_inexact()
+                .is_some()
+        );
+        assert!(
+            decoded
+                .aggregations()
+                .get_result(&max)
+                .as_inexact()
+                .is_some()
+        );
+        assert_eq!(
+            array.aggregations().get_result(&min),
+            Precision::Exact(exact_min)
+        );
+        assert_eq!(
+            array.aggregations().get_result(&max),
+            Precision::Exact(exact_max)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_root_preserves_hints_with_known_dtype() -> VortexResult<()> {
+        let writer = versioned_primitive_session();
+        let mut execution = writer.create_execution_ctx();
+        let array = PrimitiveArray::from_iter(0..8i32).into_array();
+        let min = Min.bind(NumericalAggregateOpts::skip_nans());
+        let result = array.aggregations().compute_result(&min, &mut execution)?;
+        let ctx = restricted_context(&[new_primitive_id()]);
+        let serialized = SerializedArray::try_from(serialize_blob(&array, &ctx, &writer)?)?;
+        let reader = array_session();
+        reader.allow_unknown();
+        let decoded = serialized.decode(
+            array.dtype(),
+            array.len(),
+            &ReadContext::new(ctx.to_ids()),
+            &reader,
+        )?;
+        assert_eq!(decoded.encoding_id(), new_primitive_id());
+        assert_eq!(
+            decoded.aggregations().get_result(&min),
+            Precision::Exact(result)
+        );
+        Ok(())
     }
 
     #[test]

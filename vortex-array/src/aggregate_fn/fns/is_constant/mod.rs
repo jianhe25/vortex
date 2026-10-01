@@ -496,6 +496,7 @@ mod tests {
     use crate::aggregate_fn::fns::is_constant::IsConstant;
     use crate::aggregate_fn::fns::is_constant::IsConstantPartial;
     use crate::aggregate_fn::fns::is_constant::is_constant;
+    use crate::aggregate_fn::fns::min_max::min_max;
     use crate::array_session;
     use crate::arrays::BoolArray;
     use crate::arrays::ChunkedArray;
@@ -560,19 +561,11 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
 
         let arr = buffer![0, 1].into_array();
-        crate::aggregate_fn::fns::min_max::min_max(
-            &arr,
-            &mut ctx,
-            NumericalAggregateOpts::skip_nans(),
-        )?;
+        min_max(&arr, &mut ctx, NumericalAggregateOpts::skip_nans())?;
         assert!(!is_constant(&arr, &mut ctx)?);
 
         let arr = buffer![0, 0].into_array();
-        crate::aggregate_fn::fns::min_max::min_max(
-            &arr,
-            &mut ctx,
-            NumericalAggregateOpts::skip_nans(),
-        )?;
+        min_max(&arr, &mut ctx, NumericalAggregateOpts::skip_nans())?;
         assert!(is_constant(&arr, &mut ctx)?);
 
         let arr = PrimitiveArray::from_option_iter([Some(0), Some(0)]).into_array();
@@ -585,21 +578,13 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
 
         let arr = PrimitiveArray::from_iter([0.0, 0.0, f32::NAN]).into_array();
-        crate::aggregate_fn::fns::min_max::min_max(
-            &arr,
-            &mut ctx,
-            NumericalAggregateOpts::skip_nans(),
-        )?;
+        min_max(&arr, &mut ctx, NumericalAggregateOpts::skip_nans())?;
         assert!(!is_constant(&arr, &mut ctx)?);
 
         let arr =
             PrimitiveArray::from_option_iter([Some(f32::NEG_INFINITY), Some(f32::NEG_INFINITY)])
                 .into_array();
-        crate::aggregate_fn::fns::min_max::min_max(
-            &arr,
-            &mut ctx,
-            NumericalAggregateOpts::skip_nans(),
-        )?;
+        min_max(&arr, &mut ctx, NumericalAggregateOpts::skip_nans())?;
         assert!(is_constant(&arr, &mut ctx)?);
         Ok(())
     }

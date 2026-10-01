@@ -33,6 +33,8 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
 fn sum_i32(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(1);
     let data: Vec<i32> = (0..N).map(|_| rng.random_range(-1000..1000)).collect();
+    let aggregate = AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -40,12 +42,7 @@ fn sum_i32(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<i64>(
-                &AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<i64>(&aggregate, ctx));
 }
 
 #[divan::bench]
@@ -66,6 +63,8 @@ fn sum_v2_i32(bencher: Bencher) {
 fn sum_u32(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(2);
     let data: Vec<u32> = (0..N).map(|_| rng.random_range(0..2000)).collect();
+    let aggregate = AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -73,12 +72,7 @@ fn sum_u32(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<u64>(
-                &AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<u64>(&aggregate, ctx));
 }
 
 #[divan::bench]
@@ -99,6 +93,8 @@ fn sum_v2_u32(bencher: Bencher) {
 fn sum_i64(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(3);
     let data: Vec<i64> = (0..N).map(|_| rng.random_range(-1000..1000)).collect();
+    let aggregate = AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -106,12 +102,7 @@ fn sum_i64(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<i64>(
-                &AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<i64>(&aggregate, ctx));
 }
 
 #[divan::bench]
@@ -132,6 +123,8 @@ fn sum_v2_i64(bencher: Bencher) {
 fn sum_f64(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(6);
     let data: Vec<f64> = (0..N).map(|_| rng.random_range(-1000.0..1000.0)).collect();
+    let aggregate = AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -139,12 +132,7 @@ fn sum_f64(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<f64>(
-                &AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<f64>(&aggregate, ctx));
 }
 
 #[divan::bench]
@@ -173,6 +161,8 @@ fn sum_f64_nulls_clustered(bencher: Bencher) {
             }
         })
         .collect();
+    let aggregate = AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -180,12 +170,7 @@ fn sum_f64_nulls_clustered(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<f64>(
-                &AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<f64>(&aggregate, ctx));
 }
 
 #[divan::bench]
@@ -224,6 +209,8 @@ fn sum_i32_nulls_clustered(bencher: Bencher) {
             }
         })
         .collect();
+    let aggregate = AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -231,12 +218,7 @@ fn sum_i32_nulls_clustered(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<i64>(
-                &AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<i64>(&aggregate, ctx));
 }
 
 #[divan::bench]
@@ -269,6 +251,8 @@ fn sum_i32_nulls_scattered(bencher: Bencher) {
     let data: Vec<Option<i32>> = (0..N)
         .map(|_| rng.random_bool(0.5).then(|| rng.random_range(-1000..1000)))
         .collect();
+    let aggregate = AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -276,12 +260,7 @@ fn sum_i32_nulls_scattered(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<i64>(
-                &AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<i64>(&aggregate, ctx));
 }
 
 #[divan::bench]

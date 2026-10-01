@@ -63,20 +63,42 @@ pub fn min_max(
             Precision::Exact(0) => cached_options = NumericalAggregateOpts::skip_nans(),
             Precision::Exact(_) => {
                 let result = Some(nan_minmax_result(array.dtype()));
-                cache_min_max_result(array, options, &result)?;
+                cache_min_max_result(array, options, result.as_ref())?;
                 return Ok(result);
             }
             _ => {}
         }
     }
 
-    let cached_min = aggregations
+    let mut cached_extrema = aggregations
         .get_result(&Min.bind(cached_options))
-        .as_exact();
-    let cached_max = aggregations
-        .get_result(&Max.bind(cached_options))
-        .as_exact();
-    if let Some((min, max)) = cached_min.zip(cached_max) {
+        .as_exact()
+        .zip(
+            aggregations
+                .get_result(&Max.bind(cached_options))
+                .as_exact(),
+        );
+
+    // These logical types cannot contain NaNs, so either option computes the same extrema.
+    // Extensions keep their own options because their storage type can contain NaNs.
+    let nan_options_are_equivalent = match array.dtype() {
+        DType::Primitive(ptype, _) => !ptype.is_float(),
+        DType::Bool(_) | DType::Decimal(..) | DType::Utf8(_) | DType::Binary(_) => true,
+        _ => false,
+    };
+    if cached_extrema.is_none() && nan_options_are_equivalent {
+        let other_options = if cached_options.skip_nans {
+            NumericalAggregateOpts::include_nans()
+        } else {
+            NumericalAggregateOpts::skip_nans()
+        };
+        cached_extrema = aggregations
+            .get_result(&Min.bind(other_options))
+            .as_exact()
+            .zip(aggregations.get_result(&Max.bind(other_options)).as_exact());
+    }
+
+    if let Some((min, max)) = cached_extrema {
         if min.is_null() || max.is_null() {
             return Ok(None);
         }
@@ -98,7 +120,7 @@ pub fn min_max(
 
     let result =
         MinMaxResult::from_scalar(aggregations.compute_result(&MinMax.bind(options), ctx)?)?;
-    cache_min_max_result(array, options, &result)?;
+    cache_min_max_result(array, options, result.as_ref())?;
 
     Ok(result)
 }
@@ -106,7 +128,7 @@ pub fn min_max(
 fn cache_min_max_result(
     array: &ArrayRef,
     options: NumericalAggregateOpts,
-    result: &Option<MinMaxResult>,
+    result: Option<&MinMaxResult>,
 ) -> VortexResult<()> {
     let dtype = array.dtype().as_nullable();
     let (min, max) = match result {
@@ -849,6 +871,51 @@ mod tests {
         let result = MinMaxResult::from_scalar(acc.finish()?)?.vortex_expect("should have result");
         assert_eq!(f64::try_from(&result.min)?, 1.0);
         assert_eq!(f64::try_from(&result.max)?, 3.0);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::skipping_first(NumericalAggregateOpts::skip_nans())]
+    #[case::including_first(NumericalAggregateOpts::include_nans())]
+    fn non_float_extrema_reuse_equivalent_options(
+        #[case] cached_options: NumericalAggregateOpts,
+    ) -> VortexResult<()> {
+        let array = buffer![1i32, 2, 3].into_array();
+        let aggregations = array.aggregations();
+        aggregations.insert_result(
+            Min.bind(cached_options),
+            Precision::Exact(Scalar::primitive(-10i32, Nullability::Nullable)),
+        )?;
+        aggregations.insert_result(
+            Max.bind(cached_options),
+            Precision::Exact(Scalar::primitive(10i32, Nullability::Nullable)),
+        )?;
+        let requested_options = if cached_options.skip_nans {
+            NumericalAggregateOpts::include_nans()
+        } else {
+            NumericalAggregateOpts::skip_nans()
+        };
+
+        let mut ctx = SESSION.create_execution_ctx();
+        let result = min_max(&array, &mut ctx, requested_options)?;
+        assert_eq!(
+            result,
+            Some(MinMaxResult {
+                min: Scalar::from(-10i32),
+                max: Scalar::from(10i32),
+            })
+        );
+        assert!(
+            aggregations
+                .get_result(&Min.bind(requested_options))
+                .is_absent()
+        );
+        assert!(
+            aggregations
+                .get_result(&Max.bind(requested_options))
+                .is_absent()
+        );
+
         Ok(())
     }
 

@@ -32,6 +32,8 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(array_session);
 fn max_i32(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(1);
     let data: Vec<i32> = (0..N).map(|_| rng.random::<i32>()).collect();
+    let aggregate = AggregateFn::new(Max, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -39,18 +41,15 @@ fn max_i32(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<i32>(
-                &AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<i32>(&aggregate, ctx));
 }
 
 #[divan::bench]
 fn max_i64(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(2);
     let data: Vec<i64> = (0..N).map(|_| rng.random::<i64>()).collect();
+    let aggregate = AggregateFn::new(Max, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -58,18 +57,15 @@ fn max_i64(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<i64>(
-                &AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<i64>(&aggregate, ctx));
 }
 
 #[divan::bench]
 fn max_f64(bencher: Bencher) {
     let mut rng = StdRng::seed_from_u64(3);
     let data: Vec<f64> = (0..N).map(|_| rng.random::<f64>()).collect();
+    let aggregate = AggregateFn::new(Max, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -77,12 +73,7 @@ fn max_f64(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<f64>(
-                &AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<f64>(&aggregate, ctx));
 }
 
 // Clustered nulls: long valid runs broken up by null blocks (run-based path's best case).
@@ -98,6 +89,8 @@ fn max_i32_nulls_clustered(bencher: Bencher) {
             }
         })
         .collect();
+    let aggregate = AggregateFn::new(Max, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -105,12 +98,7 @@ fn max_i32_nulls_clustered(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<i32>(
-                &AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<i32>(&aggregate, ctx));
 }
 
 // Scattered nulls: ~50% random nulls producing many short runs (run-based path's worst case).
@@ -120,6 +108,8 @@ fn max_i32_nulls_scattered(bencher: Bencher) {
     let data: Vec<Option<i32>> = (0..N)
         .map(|_| rng.random_bool(0.5).then(|| rng.random::<i32>()))
         .collect();
+    let aggregate = AggregateFn::new(Max, NumericalAggregateOpts::default()).erased();
+
     bencher
         .with_inputs(|| {
             (
@@ -127,10 +117,5 @@ fn max_i32_nulls_scattered(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| {
-            a.aggregations().compute_as::<i32>(
-                &AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
-                ctx,
-            )
-        });
+        .bench_refs(|(a, ctx)| a.aggregations().compute_as::<i32>(&aggregate, ctx));
 }

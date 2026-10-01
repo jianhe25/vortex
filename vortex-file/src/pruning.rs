@@ -5,12 +5,6 @@ use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnRef;
-use vortex_array::aggregate_fn::fns::max::Max;
-use vortex_array::aggregate_fn::fns::min::Min;
-use vortex_array::aggregate_fn::fns::nan_count::NanCount;
-use vortex_array::aggregate_fn::fns::null_count::NullCount;
-use vortex_array::aggregate_fn::fns::sum::Sum;
-use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::NullArray;
 use vortex_array::dtype::DType;
@@ -76,21 +70,10 @@ impl StatBinder for FileStatsBinder<'_> {
         aggregate_fn: &AggregateFnRef,
         stat_dtype: &DType,
     ) -> VortexResult<Option<BoundExpression>> {
-        // These aggregates have identical state and result semantics. Matching dtypes alone
-        // does not establish that a finalized result can satisfy a reference to aggregate state.
-        if !(aggregate_fn.is::<Min>()
-            || aggregate_fn.is::<Max>()
-            || aggregate_fn.is::<Sum>()
-            || aggregate_fn.is::<NullCount>()
-            || aggregate_fn.is::<NanCount>()
-            || aggregate_fn.is::<UncompressedSizeInBytes>())
-        {
-            return Ok(None);
-        }
         let Some(field_path) = direct_field_path(input) else {
             return Ok(None);
         };
-        Ok(self.stat_ref(&field_path, aggregate_fn, stat_dtype))
+        self.stat_ref(&field_path, aggregate_fn, stat_dtype)
     }
 }
 
@@ -100,21 +83,34 @@ impl FileStatsBinder<'_> {
         field_path: &FieldPath,
         aggregate: &AggregateFnRef,
         stat_dtype: &DType,
-    ) -> Option<BoundExpression> {
-        // FileStats currently only holds top-level field statistics.
-        if field_path.parts().len() != 1 {
-            return None;
+    ) -> VortexResult<Option<BoundExpression>> {
+        // File summaries cover only top-level fields.
+        let [field] = field_path.parts() else {
+            return Ok(None);
+        };
+        let Some(field_name) = field.as_name() else {
+            return Ok(None);
+        };
+        let Some(field_idx) = self.struct_fields.find(field_name) else {
+            return Ok(None);
+        };
+        let Some(field_stats) = self.file_stats.fields().get(field_idx) else {
+            return Ok(None);
+        };
+        let Some(field_dtype) = self.struct_fields.field_by_index(field_idx) else {
+            return Ok(None);
+        };
+        let Some(result) = field_stats.get_result(aggregate).as_exact() else {
+            return Ok(None);
+        };
+        let Some(partial) = aggregate.partial_from_result(&field_dtype, &result)? else {
+            return Ok(None);
+        };
+        if !partial.dtype().eq_ignore_nullability(stat_dtype) {
+            return Ok(None);
         }
 
-        let field_name = field_path.parts()[0].as_name()?;
-        let field_idx = self.struct_fields.find(field_name)?;
-        let field_stats = self.file_stats.fields().get(field_idx)?;
-
-        let value = field_stats.get_result(aggregate).as_exact()?;
-        if !value.dtype().eq_ignore_nullability(stat_dtype) {
-            return None;
-        }
-        Some(lit(value.cast(stat_dtype).ok()?))
+        Ok(Some(lit(partial.cast(stat_dtype)?)))
     }
 }
 

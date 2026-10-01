@@ -28,6 +28,8 @@ use crate::expr::stats::Precision;
 use crate::scalar::Scalar;
 use crate::stats::AggregateResults;
 
+type CachedResults = Vec<(AggregateFnRef, Precision<Scalar>)>;
+
 /// Shared finalized results for one immutable input.
 ///
 /// Keys include the function and all of its options. Cloning this handle shares its cache; only
@@ -35,7 +37,7 @@ use crate::stats::AggregateResults;
 /// store and inherits only representation-invariant results.
 #[derive(Clone, Debug, Default)]
 pub struct Aggregations {
-    entries: Arc<RwLock<Vec<(AggregateFnRef, Precision<Scalar>)>>>,
+    entries: Arc<RwLock<CachedResults>>,
 }
 
 /// Borrowed access to an input and its finalized aggregate cache.
@@ -234,11 +236,7 @@ impl AggregationsRef<'_> {
     }
 }
 
-fn insert(
-    entries: &mut Vec<(AggregateFnRef, Precision<Scalar>)>,
-    aggregate: AggregateFnRef,
-    result: Precision<Scalar>,
-) {
+fn insert(entries: &mut CachedResults, aggregate: AggregateFnRef, result: Precision<Scalar>) {
     if result.is_absent() {
         return;
     }

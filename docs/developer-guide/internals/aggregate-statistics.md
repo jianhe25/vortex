@@ -67,3 +67,7 @@ Node serialization projects cache snapshots into representable fields. Footer se
 functions or options that the existing format cannot represent. Variable-length truncation changes
 only a snapshot, leaving exact live cache entries intact. Legacy sortedness and constantness flags
 remain final results and never become aggregate partials.
+
+The decoder also preserves hints on an unknown root encoding when the caller supplies its dtype and
+length. Opaque foreign children retain the previous decode behavior because their logical types
+cannot be recovered without the missing encoding plugin.

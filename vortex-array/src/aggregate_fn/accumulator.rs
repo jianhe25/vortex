@@ -103,17 +103,6 @@ impl<V: AggregateFnVTable> Accumulator<V> {
         }
     }
 
-    /// Accumulate an array without substituting its cached finalized result.
-    ///
-    /// Encoding kernels and aggregate helpers may still use metadata for their own inputs.
-    pub fn accumulate_uncached(
-        &mut self,
-        batch: &ArrayRef,
-        ctx: &mut ExecutionCtx,
-    ) -> VortexResult<()> {
-        self.accumulate_impl(batch, ctx, false)
-    }
-
     fn accumulate_impl(
         &mut self,
         batch: &ArrayRef,
@@ -147,7 +136,7 @@ impl<V: AggregateFnVTable> Accumulator<V> {
 
         // 1. Kernel registry first: a registered `(encoding, aggregate_fn)` kernel is strictly
         //    more specific than the vtable's `try_accumulate` short-circuit. Checking the
-        //    registry first gives kernels for `Combined<V>` aggregates a chance to fire ,
+        //    registry first gives kernels for `Combined<V>` aggregates a chance to fire;
         //    `Combined::try_accumulate` always returns true, so a later kernel check would be
         //    unreachable.
         {

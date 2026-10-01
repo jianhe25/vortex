@@ -400,7 +400,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
 
-    use itertools::Itertools;
     use rstest::rstest;
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;

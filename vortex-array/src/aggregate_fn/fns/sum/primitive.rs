@@ -400,7 +400,7 @@ mod tests {
         )?;
         arr.aggregations().insert_result(
             Sum.bind(NumericalAggregateOpts::skip_nans()),
-            Precision::Exact(Scalar::primitive(42.0f64, Nullability::Nullable)),
+            Precision::Exact(Scalar::primitive(42.0f64, Nullable)),
         )?;
         let result = sum_with_options(&arr, NumericalAggregateOpts::include_nans())?;
         assert_eq!(result.as_primitive().typed_value::<f64>(), Some(42.0));

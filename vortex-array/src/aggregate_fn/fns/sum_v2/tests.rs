@@ -161,7 +161,7 @@ fn ignores_other_aggregate_result() -> VortexResult<()> {
     let array = PrimitiveArray::from_option_iter([None::<i32>, None]).into_array();
     array.aggregations().insert_result(
         Sum.bind(NumericalAggregateOpts::skip_nans()),
-        Precision::Exact(Scalar::primitive(42i64, Nullability::Nullable)),
+        Precision::Exact(Scalar::primitive(42i64, Nullable)),
     )?;
 
     assert!(sum_v2(&array, &mut array_session().create_execution_ctx())?.is_null());

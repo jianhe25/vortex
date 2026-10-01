@@ -6,9 +6,9 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use num_traits::AsPrimitive;
+use num_traits::ToPrimitive;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 
 use crate::ArrayRef;
@@ -217,11 +217,11 @@ impl ListData {
             let min = values[0];
             let max = values[values.len() - 1];
             vortex_ensure!(
-                usize::try_from(min).is_ok(),
+                min.to_usize().is_some(),
                 InvalidArgument: "offsets minimum {min} outside valid range [0, {max}]"
             );
             vortex_ensure!(
-                usize::try_from(max).ok().is_some_and(|max| max <= elements.len()),
+                max.to_usize().is_some_and(|max| max <= elements.len()),
                 InvalidArgument: "Max offset {max} is beyond the length of the elements array {}",
                 elements.len()
             );
