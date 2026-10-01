@@ -29,6 +29,7 @@ _OPS = {
     "GtEq": operator.ge,
     "And": operator.and_,
     "Or": operator.or_,
+    "Xor": lambda lhs, rhs: (lhs | rhs) & ~(lhs & rhs),
     "LogicalAnd": operator.and_,
     "LogicalOr": operator.or_,
 }
