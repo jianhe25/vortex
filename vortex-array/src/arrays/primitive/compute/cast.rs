@@ -19,6 +19,10 @@ use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::aggregate_fn;
+use crate::aggregate_fn::AggregateFn;
+use crate::aggregate_fn::NumericalAggregateOpts;
+use crate::aggregate_fn::fns::max::Max;
+use crate::aggregate_fn::fns::min::Min;
 use crate::array::ArrayView;
 use crate::arrays::DecimalArray;
 use crate::arrays::Primitive;
@@ -35,8 +39,6 @@ use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::dtype::ToI256;
 use crate::dtype::i256;
-use crate::expr::stats::Stat;
-use crate::expr::stats::StatsProvider;
 use crate::match_each_decimal_value_type;
 use crate::match_each_integer_ptype;
 use crate::match_each_native_ptype;
@@ -174,15 +176,12 @@ where
     S: IntegerPType + NativeDecimalType + ToI256,
 {
     let values = array.as_slice::<S>();
-    let target_dtype = DType::Decimal(decimal_dtype, Nullability::NonNullable);
-    if !cached_values_fit_in(array, &target_dtype).unwrap_or(false) {
-        let valid_values = source_validity.execute_mask(array.len(), ctx)?;
-        validate_unscaled_signed_integer_values_to_decimal(values, decimal_dtype, &valid_values)
-            .map_err(|idx| primitive_to_decimal_cast_error(values[idx], decimal_dtype))?;
-    }
+    let valid_values = source_validity.execute_mask(array.len(), ctx)?;
+    validate_unscaled_signed_integer_values_to_decimal(values, decimal_dtype, &valid_values)
+        .map_err(|idx| primitive_to_decimal_cast_error(values[idx], decimal_dtype))?;
 
     // SAFETY: `S::DECIMAL_TYPE` has the same physical representation as the source ptype, and
-    // either exact min/max statistics or the validation above prove every valid value fits.
+    // the validation above proves every valid value fits the requested decimal precision.
     Ok(unsafe {
         DecimalArray::new_unchecked_handle(
             array.buffer_handle().clone(),
@@ -635,9 +634,13 @@ fn values_fit_in(
 /// Cached-only check: returns `Some(fits)` if both `Min` and `Max` are present as `Exact` in the
 /// stats cache, otherwise `None`.
 fn cached_values_fit_in(array: ArrayView<'_, Primitive>, target_dtype: &DType) -> Option<bool> {
-    let stats = array.array().statistics();
-    let min = stats.get(Stat::Min).as_exact()?;
-    let max = stats.get(Stat::Max).as_exact()?;
+    let stats = array.array().aggregations();
+    let min = stats
+        .get_result(&AggregateFn::new(Min, NumericalAggregateOpts::default()).erased())
+        .as_exact()?;
+    let max = stats
+        .get_result(&AggregateFn::new(Max, NumericalAggregateOpts::default()).erased())
+        .as_exact()?;
     Some(min.cast(target_dtype).is_ok() && max.cast(target_dtype).is_ok())
 }
 
@@ -653,6 +656,11 @@ mod test {
     use crate::ArrayRef;
     use crate::IntoArray;
     use crate::VortexSessionExecute;
+    use crate::aggregate_fn::AggregateFn;
+    use crate::aggregate_fn::NumericalAggregateOpts;
+    use crate::aggregate_fn::fns::max::Max;
+    use crate::aggregate_fn::fns::min::Min;
+    use crate::aggregate_fn::fns::min_max::min_max;
     use crate::array_session;
     use crate::arrays::DecimalArray;
     use crate::arrays::PrimitiveArray;
@@ -665,7 +673,8 @@ mod test {
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::dtype::i256;
-    use crate::expr::stats::Stat;
+    use crate::expr::stats::Precision;
+    use crate::scalar::Scalar;
     use crate::validity::Validity;
 
     #[test]
@@ -790,9 +799,7 @@ mod test {
         let source = PrimitiveArray::from_iter([42i32, -7]);
         let source_ptr = source.as_slice::<i32>().as_ptr();
         let source = source.into_array();
-        source
-            .statistics()
-            .compute_all(&[Stat::Min, Stat::Max], &mut ctx)?;
+        min_max(&source, &mut ctx, NumericalAggregateOpts::default())?;
         let casted = source
             .cast(DType::Decimal(
                 DecimalDType::new(9, 0),
@@ -801,6 +808,31 @@ mod test {
             .execute::<DecimalArray>(&mut ctx)?;
 
         assert_eq!(casted.buffer::<i32>().as_ptr(), source_ptr);
+        Ok(())
+    }
+
+    #[test]
+    fn cast_same_width_signed_integer_to_decimal_checks_precision_with_cached_bounds()
+    -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let source = PrimitiveArray::from_iter([1_000_000_000i32]).into_array();
+        for aggregate in [
+            AggregateFn::new(Min, NumericalAggregateOpts::default()).erased(),
+            AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
+        ] {
+            source.aggregations().insert_result(
+                aggregate,
+                Precision::Exact(Scalar::primitive(0i32, Nullability::Nullable)),
+            )?;
+        }
+
+        let casted = source
+            .cast(DType::Decimal(
+                DecimalDType::new(9, 0),
+                Nullability::NonNullable,
+            ))?
+            .execute::<DecimalArray>(&mut ctx);
+        assert!(casted.is_err());
         Ok(())
     }
 

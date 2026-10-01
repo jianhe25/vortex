@@ -22,7 +22,18 @@ use vortex::layout::LayoutStrategy;
 use vortex::layout::layouts::flat::Flat;
 use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex_array::ExecutionCtx;
-use vortex_array::expr::stats::Stat;
+use vortex_array::aggregate_fn::AggregateFn;
+use vortex_array::aggregate_fn::EmptyOptions;
+use vortex_array::aggregate_fn::NumericalAggregateOpts;
+use vortex_array::aggregate_fn::fns::is_constant::IsConstant;
+use vortex_array::aggregate_fn::fns::is_sorted::IsSorted;
+use vortex_array::aggregate_fn::fns::is_sorted::IsSortedOptions;
+use vortex_array::aggregate_fn::fns::max::Max;
+use vortex_array::aggregate_fn::fns::min::Min;
+use vortex_array::aggregate_fn::fns::nan_count::NanCount;
+use vortex_array::aggregate_fn::fns::null_count::NullCount;
+use vortex_array::aggregate_fn::fns::sum::Sum;
+use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_buffer::ByteBuffer;
@@ -40,10 +51,23 @@ fn runtime() -> VortexResult<Runtime> {
 /// cached on each array node. This function walks the entire tree and forces computation of
 /// all stats so they are present in the serialized output.
 pub fn compute_all_stats(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<()> {
-    let all_stats: Vec<Stat> = Stat::all().collect();
+    let aggregates = [
+        AggregateFn::new(Min, NumericalAggregateOpts::default()).erased(),
+        AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
+        AggregateFn::new(Sum, NumericalAggregateOpts::default()).erased(),
+        AggregateFn::new(NullCount, EmptyOptions).erased(),
+        AggregateFn::new(NanCount, EmptyOptions).erased(),
+        AggregateFn::new(IsSorted, IsSortedOptions { strict: false }).erased(),
+        AggregateFn::new(IsSorted, IsSortedOptions { strict: true }).erased(),
+        AggregateFn::new(IsConstant, EmptyOptions).erased(),
+        AggregateFn::new(UncompressedSizeInBytes, EmptyOptions).erased(),
+    ];
     for node in array.depth_first_traversal() {
-        let computed = node.statistics().compute_all(&all_stats, ctx)?;
-        node.statistics().set_iter(computed.into_iter());
+        for aggregate in &aggregates {
+            if aggregate.return_dtype(node.dtype()).is_some() {
+                node.aggregations().compute_result(aggregate, ctx)?;
+            }
+        }
     }
     Ok(())
 }

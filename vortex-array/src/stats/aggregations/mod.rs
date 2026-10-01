@@ -61,11 +61,14 @@ impl Aggregations {
     }
 
     pub(crate) fn inherit_results(&self, results: &AggregateResults) {
+        let inherited = results
+            .iter()
+            .filter(|(aggregate, _)| aggregate.is_representation_invariant())
+            .map(|(aggregate, result)| (aggregate.clone(), result.clone()))
+            .collect::<Vec<_>>();
         let mut entries = self.entries.write();
-        for (aggregate, result) in results.iter() {
-            if aggregate.is_representation_invariant() {
-                insert(&mut entries, aggregate.clone(), result.clone());
-            }
+        for (aggregate, result) in inherited {
+            insert(&mut entries, aggregate, result);
         }
     }
 }
@@ -106,7 +109,7 @@ impl AggregationsRef<'_> {
         }
 
         let mut accumulator = aggregate.accumulator(self.array.dtype())?;
-        accumulator.accumulate(self.array, ctx)?;
+        accumulator.accumulate_uncached(self.array, ctx)?;
         let result = accumulator.finish()?;
         self.insert_result(aggregate.clone(), Precision::Exact(result.clone()))?;
 
@@ -182,16 +185,41 @@ impl AggregationsRef<'_> {
         Ok(())
     }
 
+    pub(crate) fn inherit_results(&self, results: &AggregateResults) {
+        self.aggregations.inherit_results(results);
+    }
+
     pub(crate) fn inherit_from(&self, source: AggregationsRef<'_>) -> VortexResult<()> {
         vortex_ensure!(
-            self.array.dtype() == source.array.dtype() && self.array.len() == source.array.len(),
-            "Aggregate inheritance requires matching input dtype and length"
+            self.array
+                .dtype()
+                .eq_ignore_nullability(source.array.dtype())
+                && self.array.len() == source.array.len(),
+            "Aggregate inheritance requires matching logical input dtype and length"
         );
         if !Arc::ptr_eq(&self.aggregations.entries, &source.aggregations.entries) {
             // Release the source lock before locking the destination. Opposite concurrent
             // inherit operations must not acquire both stores in opposite orders.
-            self.aggregations
-                .inherit_results(&source.snapshot_results());
+            let mut results = source.snapshot_results();
+            if self.array.dtype() != source.array.dtype() {
+                results = AggregateResults::from_validated(
+                    results
+                        .iter()
+                        .filter(|(aggregate, result)| {
+                            aggregate
+                                .return_dtype(self.array.dtype())
+                                .is_some_and(|dtype| {
+                                    result
+                                        .as_ref()
+                                        .into_inner()
+                                        .is_none_or(|value| value.dtype() == &dtype)
+                                })
+                        })
+                        .map(|(aggregate, result)| (aggregate.clone(), result.clone()))
+                        .collect(),
+                );
+            }
+            self.aggregations.inherit_results(&results);
         }
         Ok(())
     }

@@ -19,9 +19,11 @@ use std::hash::Hasher;
 use std::sync::Arc;
 
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 
 use crate::aggregate_fn::Accumulator;
 use crate::aggregate_fn::AccumulatorRef;
+use crate::aggregate_fn::AggregateDTypes;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnSatisfaction;
@@ -29,6 +31,7 @@ use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::GroupedAccumulator;
 use crate::aggregate_fn::GroupedAccumulatorRef;
 use crate::dtype::DType;
+use crate::scalar::Scalar;
 
 /// An object-safe, sealed trait for bound aggregate function dispatch.
 ///
@@ -45,8 +48,8 @@ pub(super) trait DynAggregateFn: 'static + Send + Sync + super::sealed::Sealed {
     fn partial_from_result(
         &self,
         input_dtype: &DType,
-        result: &crate::scalar::Scalar,
-    ) -> VortexResult<Option<crate::scalar::Scalar>>;
+        result: &Scalar,
+    ) -> VortexResult<Option<Scalar>>;
     fn state_dtype(&self, input_dtype: &DType) -> Option<DType>;
     fn accumulator(&self, input_dtype: &DType) -> VortexResult<AccumulatorRef>;
     fn accumulator_grouped(&self, input_dtype: &DType) -> VortexResult<GroupedAccumulatorRef>;
@@ -100,17 +103,13 @@ impl<V: AggregateFnVTable> DynAggregateFn for AggregateFnInner<V> {
     fn partial_from_result(
         &self,
         input_dtype: &DType,
-        result: &crate::scalar::Scalar,
-    ) -> VortexResult<Option<crate::scalar::Scalar>> {
+        result: &Scalar,
+    ) -> VortexResult<Option<Scalar>> {
         if self.return_dtype(input_dtype).is_none() || self.state_dtype(input_dtype).is_none() {
             return Ok(None);
         }
-        let dtypes = crate::aggregate_fn::AggregateDTypes::try_new(
-            &self.vtable,
-            &self.options,
-            input_dtype.clone(),
-        )?;
-        vortex_error::vortex_ensure!(
+        let dtypes = AggregateDTypes::try_new(&self.vtable, &self.options, input_dtype.clone())?;
+        vortex_ensure!(
             result.dtype() == &dtypes.return_dtype,
             "Aggregate {} requires result dtype {}, got {}",
             self.id(),

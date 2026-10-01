@@ -37,7 +37,9 @@ use crate::flatbuffers::WriteFlatBuffer;
 use crate::flatbuffers::array as fba;
 use crate::flatbuffers::array::Compression;
 use crate::session::ArraySessionExt;
-use crate::stats::StatsSet;
+use crate::stats::compat::read_summary;
+use crate::stats::compat::truncate_results;
+use crate::stats::compat::write_node_summary;
 
 /// Options for serializing an array.
 #[derive(Default, Debug)]
@@ -47,6 +49,9 @@ pub struct SerializeOptions {
     pub offset: usize,
     /// Whether to include sufficient zero-copy padding.
     pub include_padding: bool,
+    /// Maximum byte length for variable-length extrema in serialized hints.
+    /// Truncation changes only the serialized snapshot.
+    pub max_variable_length_statistics_size: Option<usize>,
 }
 
 impl ArrayRef {
@@ -68,7 +73,8 @@ impl ArrayRef {
     ) -> VortexResult<Vec<ByteBuffer>> {
         // Resolve the wire representation once. Serializers may choose historical IDs and may
         // provide downgraded buffers or children that differ from the in-memory array tree.
-        let root = ArrayNodeFlatBuffer::try_new(ctx, session, self)?;
+        let mut root = ArrayNodeFlatBuffer::try_new(ctx, session, self)?;
+        root.max_variable_length_statistics_size = options.max_variable_length_statistics_size;
         let array_buffers = root.array.buffers();
 
         // Allocate result buffers, including a possible padding buffer for each.
@@ -216,6 +222,7 @@ impl ArraySerializationTree {
 pub struct ArrayNodeFlatBuffer<'a> {
     ctx: &'a ArrayContext,
     array: ArraySerializationTree,
+    max_variable_length_statistics_size: Option<usize>,
 }
 
 impl<'a> ArrayNodeFlatBuffer<'a> {
@@ -232,7 +239,11 @@ impl<'a> ArrayNodeFlatBuffer<'a> {
                 n_buffers_recursive
             );
         };
-        Ok(Self { ctx, array })
+        Ok(Self {
+            ctx,
+            array,
+            max_variable_length_statistics_size: None,
+        })
     }
 
     pub fn try_write_flatbuffer<'fb>(
@@ -280,7 +291,12 @@ impl<'a> ArrayNodeFlatBuffer<'a> {
         let children = Some(fbb.create_vector(&children));
 
         let buffers = Some(fbb.create_vector_from_iter((0..nbuffers).map(|i| i + buffer_idx)));
-        let stats = Some(array.source.statistics().write_flatbuffer(fbb)?);
+        let results = array.source.aggregations().snapshot_results();
+        let results = match self.max_variable_length_statistics_size {
+            Some(limit) => truncate_results(&results, limit)?,
+            None => results,
+        };
+        let stats = Some(write_node_summary(&results, array.source.dtype(), fbb)?);
 
         Ok(fba::ArrayNode::create(
             fbb,
@@ -367,7 +383,9 @@ impl SerializedArray {
             .ok_or_else(|| vortex_err!("Unknown encoding index: {}", encoding_idx))?;
         let Some(plugin) = session.arrays().registry().get(&encoding_id) else {
             if session.allows_unknown() {
-                return self.decode_foreign(encoding_id, dtype, len, ctx);
+                let decoded = self.decode_foreign(encoding_id, dtype, len, ctx)?;
+                self.load_node_results(&decoded, session)?;
+                return Ok(decoded);
             }
             vortex_bail!("Unknown encoding: {}", encoding_id);
         };
@@ -416,14 +434,19 @@ impl SerializedArray {
             decoded.encoding_id(),
         );
 
-        // Populate statistics from the serialized array.
-        if let Some(stats) = self.flatbuffer().stats() {
-            decoded
-                .statistics()
-                .set_iter(StatsSet::from_flatbuffer(&stats, dtype, session)?.into_iter());
-        }
-
+        self.load_node_results(&decoded, session)?;
         Ok(decoded)
+    }
+
+    fn load_node_results(&self, array: &ArrayRef, session: &VortexSession) -> VortexResult<()> {
+        if let Some(stats) = self.flatbuffer().stats() {
+            array.aggregations().load_historical_results(read_summary(
+                &stats,
+                array.dtype(),
+                session,
+            )?);
+        }
+        Ok(())
     }
 
     fn decode_foreign(

@@ -7,6 +7,9 @@ use num_traits::PrimInt;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
+use vortex_array::aggregate_fn::AggregateFn;
+use vortex_array::aggregate_fn::NumericalAggregateOpts;
+use vortex_array::aggregate_fn::fns::min::Min;
 use vortex_array::arrays::Primitive;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
@@ -55,7 +58,14 @@ pub fn bitpack_encode(
     // Check array contains no negative values.
     if array.ptype().is_signed_int() {
         let has_negative_values = match_each_integer_ptype!(array.ptype(), |P| {
-            array.statistics().compute_min::<P>(ctx).unwrap_or_default() < 0
+            array
+                .aggregations()
+                .compute_as::<P>(
+                    &AggregateFn::new(Min, NumericalAggregateOpts::default()).erased(),
+                    ctx,
+                )
+                .unwrap_or_default()
+                < 0
         });
         if has_negative_values {
             vortex_bail!(InvalidArgument: "cannot bitpack_encode array containing negative integers")
@@ -88,7 +98,16 @@ pub fn bitpack_encode(
         array.len(),
         0,
     )?;
-    bitpacked.statistics().inherit_from(array.statistics());
+    for (aggregate, result) in array.aggregations().snapshot_results().iter() {
+        if aggregate.is_representation_invariant() {
+            // SAFETY: bitpacking preserves every logical value and the null positions.
+            unsafe {
+                bitpacked
+                    .aggregations()
+                    .seed_result(aggregate.clone(), result.clone())?;
+            }
+        }
+    }
     Ok(bitpacked)
 }
 
@@ -118,7 +137,16 @@ pub unsafe fn bitpack_encode_unchecked(
         0,
     )
     .vortex_expect("bitpacked array construction should succeed");
-    bitpacked.statistics().inherit_from(arr_ref.statistics());
+    for (aggregate, result) in arr_ref.aggregations().snapshot_results().iter() {
+        if aggregate.is_representation_invariant() {
+            // SAFETY: bitpacking preserves every logical value and the null positions.
+            unsafe {
+                bitpacked
+                    .aggregations()
+                    .seed_result(aggregate.clone(), result.clone())?;
+            }
+        }
+    }
     Ok(bitpacked)
 }
 

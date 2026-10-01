@@ -8,6 +8,9 @@ use mimalloc::MiMalloc;
 use rand::prelude::*;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::aggregate_fn::AggregateFn;
+use vortex_array::aggregate_fn::NumericalAggregateOpts;
+use vortex_array::aggregate_fn::fns::max::Max;
 use vortex_array::array_session;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_session::VortexSession;
@@ -36,7 +39,12 @@ fn max_i32(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| a.statistics().compute_max::<i32>(ctx));
+        .bench_refs(|(a, ctx)| {
+            a.aggregations().compute_as::<i32>(
+                &AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
+                ctx,
+            )
+        });
 }
 
 #[divan::bench]
@@ -50,7 +58,12 @@ fn max_i64(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| a.statistics().compute_max::<i64>(ctx));
+        .bench_refs(|(a, ctx)| {
+            a.aggregations().compute_as::<i64>(
+                &AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
+                ctx,
+            )
+        });
 }
 
 #[divan::bench]
@@ -64,7 +77,12 @@ fn max_f64(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| a.statistics().compute_max::<f64>(ctx));
+        .bench_refs(|(a, ctx)| {
+            a.aggregations().compute_as::<f64>(
+                &AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
+                ctx,
+            )
+        });
 }
 
 // Clustered nulls: long valid runs broken up by null blocks (run-based path's best case).
@@ -87,7 +105,12 @@ fn max_i32_nulls_clustered(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| a.statistics().compute_max::<i32>(ctx));
+        .bench_refs(|(a, ctx)| {
+            a.aggregations().compute_as::<i32>(
+                &AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
+                ctx,
+            )
+        });
 }
 
 // Scattered nulls: ~50% random nulls producing many short runs (run-based path's worst case).
@@ -104,5 +127,10 @@ fn max_i32_nulls_scattered(bencher: Bencher) {
                 SESSION.create_execution_ctx(),
             )
         })
-        .bench_refs(|(a, ctx)| a.statistics().compute_max::<i32>(ctx));
+        .bench_refs(|(a, ctx)| {
+            a.aggregations().compute_as::<i32>(
+                &AggregateFn::new(Max, NumericalAggregateOpts::default()).erased(),
+                ctx,
+            )
+        });
 }

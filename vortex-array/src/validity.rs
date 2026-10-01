@@ -25,6 +25,9 @@ use crate::Canonical;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
+use crate::aggregate_fn::AggregateFn;
+use crate::aggregate_fn::NumericalAggregateOpts;
+use crate::aggregate_fn::fns::min::Min;
 use crate::arrays::BoolArray;
 use crate::arrays::ChunkedArray;
 use crate::arrays::ConstantArray;
@@ -410,8 +413,11 @@ impl Validity {
             Self::AllInvalid => None,
             Self::Array(is_valid) => {
                 is_valid
-                    .statistics()
-                    .compute_min::<bool>(ctx)
+                    .aggregations()
+                    .compute_as::<bool>(
+                        &AggregateFn::new(Min, NumericalAggregateOpts::default()).erased(),
+                        ctx,
+                    )
                     .vortex_expect("validity array must support min")
                     .then(|| {
                         // min true => all true
