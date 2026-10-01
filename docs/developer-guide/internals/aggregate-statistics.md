@@ -5,9 +5,8 @@ Arrays retain finalized aggregate results in `Aggregations`. This replaces the f
 
 ## Cache API
 
-`array.aggregations()` returns an `AggregationsRef` bound to that immutable array. The store has no implicit
-strong reference to its input. The key is the full `AggregateFnRef`, including
-its options.
+`array.aggregations()` returns an `AggregationsRef` bound to that immutable array. The store has no
+implicit strong reference to its input. The key is the full `AggregateFnRef`, including its options.
 
 ```rust
 let aggregate = Sum.bind(NumericalAggregateOpts::skip_nans());
@@ -17,8 +16,8 @@ let snapshot: AggregateResults = array.aggregations().snapshot_results();
 ```
 
 `get_result` reads metadata without execution. `compute_result` returns an exact cached result or
-computes one outside the cache lock. Concurrent misses can compute the same result. Failed
-computations leave the cache unchanged.
+computes one outside the cache lock. Concurrent misses can compute the same result. A failed target
+result is not retained, although successful nested computations can retain their own results.
 
 `Precision::Absent` means unknown. `Precision::Exact` includes null, zero, and false results.
 `Precision::Inexact` carries a bound defined by the aggregate. An inexact value cannot answer an
