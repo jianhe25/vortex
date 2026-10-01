@@ -39,7 +39,7 @@ use crate::BitPackedArrayExt;
 use crate::BitPackedData;
 use crate::FL_CHUNK_SIZE;
 use crate::bitpacking::array::BitPackedSlots;
-use crate::bitpacking::array::uniform_block_offsets;
+use crate::bitpacking::array::block_offsets_from_constant_bit_width;
 
 #[derive(Clone, prost::Message)]
 pub struct BitPackedMetadata {
@@ -174,7 +174,7 @@ impl ArrayPlugin for BitPackedPlugin {
             PatchesData::push_slots(&mut s, patches.as_ref());
             s.push(validity_to_child(&validity, len));
             let num_chunks = (len + offset as usize).div_ceil(FL_CHUNK_SIZE);
-            s.push(Some(uniform_block_offsets(bit_width, num_chunks)));
+            s.push(Some(block_offsets_from_constant_bit_width(bit_width, num_chunks)?));
             s
         };
         let data = BitPackedData::try_new(packed, patches, offset)?;

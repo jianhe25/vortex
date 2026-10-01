@@ -47,7 +47,7 @@ use crate::bitpack_decompress::unpack_into_primitive_builder;
 use crate::bitpacking::array::BitPackedSlots;
 use crate::bitpacking::array::BitPackedSlotsView;
 use crate::bitpacking::array::PATCH_SLOTS;
-use crate::bitpacking::array::uniform_block_offsets;
+use crate::bitpacking::array::block_offsets_from_constant_bit_width;
 use crate::bitpacking::array::validate_block_offsets;
 use crate::bitpacking::vtable::rules::RULES;
 mod kernels;
@@ -234,7 +234,7 @@ impl BitPacked {
             PatchesData::push_slots(&mut s, patches.as_ref());
             s.push(validity_to_child(&validity, len));
             let num_chunks = (len + offset as usize).div_ceil(FL_CHUNK_SIZE);
-            s.push(Some(uniform_block_offsets(bit_width, num_chunks)));
+            s.push(Some(block_offsets_from_constant_bit_width(bit_width, num_chunks)?));
             s
         };
         let data = BitPackedData::try_new(packed, patches, offset)?;

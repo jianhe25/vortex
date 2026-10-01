@@ -23,7 +23,6 @@ use vortex_array::patches::Patches;
 use vortex_array::patches::PatchesData;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::child_to_validity;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
@@ -72,28 +71,32 @@ pub(crate) const BLOCK_OFFSETS_DTYPE: DType =
     DType::Primitive(PType::U64, Nullability::NonNullable);
 
 /// Byte boundaries for `num_chunks` chunks that are all packed at `bit_width`.
-pub(crate) fn uniform_block_offsets(bit_width: u8, num_chunks: usize) -> ArrayRef {
+pub(crate) fn block_offsets_from_constant_bit_width(
+    bit_width: u8,
+    num_chunks: usize,
+) -> VortexResult<ArrayRef> {
     let step = 128 * u64::from(bit_width);
-    let length = num_chunks
-        .checked_add(1)
-        .vortex_expect("block offsets length fits in usize");
-    u64::try_from(num_chunks)
-        .ok()
-        .and_then(|chunks| chunks.checked_mul(step))
-        .vortex_expect("uniform block offsets fit in u64");
+    vortex_ensure!(
+        num_chunks < usize::MAX,
+        "Block offsets length does not fit in usize"
+    );
+    vortex_ensure!(
+        u64::try_from(num_chunks).is_ok_and(|chunks| chunks.checked_mul(step).is_some()),
+        "Uniform block offsets do not fit in u64"
+    );
 
     // SAFETY: The sequence has at least one entry, an integer base of zero, and a nonnegative
     // integer step. Its final value fits u64 by the check above, so every boundary does too.
-    unsafe {
+    let offsets = unsafe {
         Sequence::new_unchecked(
             0u64.into(),
             step.into(),
             PType::U64,
             Nullability::NonNullable,
-            length,
+            num_chunks + 1,
         )
-    }
-    .into_array()
+    };
+    Ok(offsets.into_array())
 }
 
 /// Check that `offsets` holds `num_blocks + 1` boundaries spanning `packed_len` bytes, each block a
