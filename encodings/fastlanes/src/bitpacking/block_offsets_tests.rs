@@ -25,6 +25,8 @@ use crate::BitPacked;
 use crate::BitPackedArray;
 use crate::BitPackedArrayExt;
 use crate::BitPackedArraySlotsExt;
+#[cfg(target_pointer_width = "64")]
+use crate::bitpacking::array::uniform_block_offsets;
 use crate::bitpacking::bitpack_compress::bitpack_to_best_bit_width;
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
@@ -127,4 +129,11 @@ fn empty_and_zero_width_offsets() -> VortexResult<()> {
     );
     assert_arrays_eq!(zeros, PrimitiveArray::from_iter(vec![0u32; 2049]), &mut ctx);
     Ok(())
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+#[should_panic(expected = "uniform block offsets fit in u64")]
+fn uniform_block_offsets_reject_end_overflow() {
+    uniform_block_offsets(64, usize::MAX / (128 * 64) + 1);
 }

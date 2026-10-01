@@ -73,13 +73,26 @@ pub(crate) const BLOCK_OFFSETS_DTYPE: DType =
 
 /// Byte boundaries for `num_chunks` chunks that are all packed at `bit_width`.
 pub(crate) fn uniform_block_offsets(bit_width: u8, num_chunks: usize) -> ArrayRef {
-    Sequence::try_new_typed(
-        0u64,
-        128 * u64::from(bit_width),
-        Nullability::NonNullable,
-        num_chunks + 1,
-    )
-    .vortex_expect("uniform block offsets fit in u64")
+    let step = 128 * u64::from(bit_width);
+    let length = num_chunks
+        .checked_add(1)
+        .vortex_expect("block offsets length fits in usize");
+    u64::try_from(num_chunks)
+        .ok()
+        .and_then(|chunks| chunks.checked_mul(step))
+        .vortex_expect("uniform block offsets fit in u64");
+
+    // SAFETY: The sequence has at least one entry, an integer base of zero, and a nonnegative
+    // integer step. Its final value fits u64 by the check above, so every boundary does too.
+    unsafe {
+        Sequence::new_unchecked(
+            0u64.into(),
+            step.into(),
+            PType::U64,
+            Nullability::NonNullable,
+            length,
+        )
+    }
     .into_array()
 }
 
