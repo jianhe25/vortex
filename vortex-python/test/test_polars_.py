@@ -3,6 +3,7 @@
 
 import math
 import os
+from decimal import Decimal
 
 import polars as pl
 import pyarrow as pa
@@ -32,6 +33,10 @@ from vortex.polars_ import polars_to_vortex
         #         & (ve.column("SearchPhrase") != "")
         #     ),
         # ),
+        (
+            pl.col("x") >= Decimal("1.25"),
+            ve.column("x") >= ve.literal(vx.decimal(precision=38, scale=2), 125),
+        ),
         (pl.col("c") > 10000, ve.column("c") > 10000),
         #        (pl.col("EventDate") >= date(2013, 7, 1), ve.column("EventDate") >= date(2013, 7, 1)),
     ],
