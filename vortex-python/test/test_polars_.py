@@ -38,7 +38,8 @@ from vortex.polars_ import polars_to_vortex
     ],
 )
 def test_exprs(polars: pl.Expr, vortex: ve.Expr) -> None:
-    assert polars_to_vortex(polars).serialize() == vortex.serialize()
+    schema = pl.Schema({"AdvEngineID": pl.Int64, "MobilePhoneModel": pl.String, "UserID": pl.Int64, "c": pl.Int64})
+    assert polars_to_vortex(polars, schema=schema).serialize() == vortex.serialize()
 
 
 @pytest.fixture(scope="module")
@@ -112,12 +113,6 @@ def test_polars_xor_rejects_non_boolean_operands(schema):
         polars_to_vortex(pl.col("x") ^ pl.col("y"), schema=schema)
 
 
-def test_polars_xor_requires_column_schema():
-    with pytest.raises(NotImplementedError, match="require a schema"):
-        polars_to_vortex(pl.col("x") ^ pl.col("y"))
-
-
 def test_polars_xor_rejects_integer_literals():
     with pytest.raises(NotImplementedError, match="requires Boolean operands"):
-        polars_to_vortex(pl.lit(1) ^ pl.lit(2))
-
+        polars_to_vortex(pl.lit(1) ^ pl.lit(2), schema=pl.Schema())

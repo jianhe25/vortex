@@ -14,10 +14,10 @@ import vortex.expr as ve
 from ._lib import dtype as _dtype
 
 
-def polars_to_vortex(expr: pl.Expr, *, schema: pl.Schema | None = None) -> ve.Expr:
+def polars_to_vortex(expr: pl.Expr, *, schema: pl.Schema) -> ve.Expr:
     """Convert a Polars expression to a Vortex expression.
 
-    Supply the input schema to verify column operand types for Boolean XOR.
+    The input schema is required to verify operand types for Boolean XOR.
     """
     data = json.loads(expr.meta.serialize(format="json"))
     assert isinstance(data, dict)
@@ -58,15 +58,13 @@ _LITERAL_TYPES: dict[str, Callable[[Any | None], _dtype.DType]] = {
 }
 
 
-def _polars_to_vortex(expr: dict[str, Any], schema: pl.Schema | None = None) -> ve.Expr:
+def _polars_to_vortex(expr: dict[str, Any], schema: pl.Schema) -> ve.Expr:
     """Convert a Polars expression to a Vortex expression."""
     if "BinaryExpr" in expr:
         expr = expr["BinaryExpr"]
         if expr["op"] == "Xor":
             for child in (expr["left"], expr["right"]):
                 operand = pl.Expr.deserialize(StringIO(json.dumps(child)), format="json")
-                if schema is None and operand.meta.root_names():
-                    raise NotImplementedError("Polars XOR column operands require a schema to verify Boolean types")
                 dtype = pl.LazyFrame(schema=schema).select(operand).collect_schema().dtypes()[0]
                 if dtype != pl.Boolean:
                     raise NotImplementedError(f"Polars XOR requires Boolean operands, got {dtype}")
