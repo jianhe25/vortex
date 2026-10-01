@@ -896,7 +896,7 @@ mod tests {
         #[case] lhs: Validity,
         #[case] rhs: Validity,
         #[case] expected: bool,
-    ) -> vortex_error::VortexResult<()> {
+    ) -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
         assert_eq!(lhs.mask_eq(&rhs, 3, &mut ctx)?, expected);
         Ok(())
