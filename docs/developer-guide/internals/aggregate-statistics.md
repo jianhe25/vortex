@@ -5,8 +5,8 @@ Arrays retain finalized aggregate results in `Aggregations`. This replaces the f
 
 ## Cache API
 
-`array.aggregations()` returns an `AggregationsRef` bound to that immutable array. The store does not
-own the array, so it cannot form an ownership cycle. The key is the full `AggregateFnRef`, including
+`array.aggregations()` returns an `AggregationsRef` bound to that immutable array. The store has no implicit
+strong reference to its input. The key is the full `AggregateFnRef`, including
 its options.
 
 ```rust
