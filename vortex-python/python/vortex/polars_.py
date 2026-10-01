@@ -4,6 +4,7 @@
 import json
 import operator
 from collections.abc import Callable
+from io import StringIO
 from typing import Any, cast
 
 import polars as pl
@@ -13,11 +14,14 @@ import vortex.expr as ve
 from ._lib import dtype as _dtype
 
 
-def polars_to_vortex(expr: pl.Expr) -> ve.Expr:
-    """Convert a Polars expression to a Vortex expression."""
+def polars_to_vortex(expr: pl.Expr, *, schema: pl.Schema | None = None) -> ve.Expr:
+    """Convert a Polars expression to a Vortex expression.
+
+    Supply the input schema to verify column operand types for Boolean XOR.
+    """
     data = json.loads(expr.meta.serialize(format="json"))
     assert isinstance(data, dict)
-    return _polars_to_vortex(data)
+    return _polars_to_vortex(data, schema)
 
 
 _OPS = {
@@ -29,7 +33,7 @@ _OPS = {
     "GtEq": operator.ge,
     "And": operator.and_,
     "Or": operator.or_,
-    "Xor": lambda lhs, rhs: (lhs | rhs) & ~(lhs & rhs),
+    "Xor": operator.ne,
     "LogicalAnd": operator.and_,
     "LogicalOr": operator.or_,
 }
@@ -54,12 +58,20 @@ _LITERAL_TYPES: dict[str, Callable[[Any | None], _dtype.DType]] = {
 }
 
 
-def _polars_to_vortex(expr: dict[str, Any]) -> ve.Expr:
+def _polars_to_vortex(expr: dict[str, Any], schema: pl.Schema | None = None) -> ve.Expr:
     """Convert a Polars expression to a Vortex expression."""
     if "BinaryExpr" in expr:
         expr = expr["BinaryExpr"]
-        lhs = _polars_to_vortex(expr["left"])
-        rhs = _polars_to_vortex(expr["right"])
+        if expr["op"] == "Xor":
+            for child in (expr["left"], expr["right"]):
+                operand = pl.Expr.deserialize(StringIO(json.dumps(child)), format="json")
+                if schema is None and operand.meta.root_names():
+                    raise NotImplementedError("Polars XOR column operands require a schema to verify Boolean types")
+                dtype = pl.LazyFrame(schema=schema).select(operand).collect_schema().dtypes()[0]
+                if dtype != pl.Boolean:
+                    raise NotImplementedError(f"Polars XOR requires Boolean operands, got {dtype}")
+        lhs = _polars_to_vortex(expr["left"], schema)
+        rhs = _polars_to_vortex(expr["right"], schema)
         op = expr["op"]
 
         if op not in _OPS:
@@ -108,7 +120,7 @@ def _polars_to_vortex(expr: dict[str, Any]) -> ve.Expr:
         literal_type = next(iter(expr.keys()), None)
 
         if literal_type == "Scalar":
-            return _polars_to_vortex(expr)
+            return _polars_to_vortex(expr, schema)
 
         # Special-case Series
         if literal_type == "Series":
@@ -144,7 +156,7 @@ def _polars_to_vortex(expr: dict[str, Any]) -> ve.Expr:
 
     if "Function" in expr:
         expr = expr["Function"]
-        _inputs = [_polars_to_vortex(e) for e in expr["input"]]
+        _inputs = [_polars_to_vortex(e, schema) for e in expr["input"]]
 
         fn = expr["function"]
         if "Boolean" in fn:

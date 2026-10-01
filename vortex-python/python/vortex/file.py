@@ -248,7 +248,9 @@ class VortexFile:
             n_rows: int | None,
             _batch_size: int | None,
         ) -> Iterator[pl.DataFrame]:
-            vx_predicate: Expr | None = None if predicate is None else polars_to_vortex(predicate)
+            vx_predicate: Expr | None = (
+                None if predicate is None else polars_to_vortex(predicate, schema=pl.Schema(schema))
+            )
 
             reader = self.to_arrow(projection=with_columns, expr=vx_predicate, limit=n_rows)
 

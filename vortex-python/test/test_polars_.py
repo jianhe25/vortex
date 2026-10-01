@@ -89,3 +89,35 @@ def test_polars_boolean_xor(tmp_path):
     actual = vx.open(str(path)).to_polars().filter(expr).collect()
     assert_frame_equal(actual, expected_frame)
     assert actual["id"].to_list() == [1, 2]
+
+
+def test_polars_boolean_xor_maps_to_not_equal():
+    lhs = pl.col("x") > 0
+    rhs = pl.col("y") < 5
+    schema = pl.Schema({"x": pl.Int64, "y": pl.Int64})
+    expected = (ve.column("x") > 0) != (ve.column("y") < 5)
+    assert polars_to_vortex(lhs ^ rhs, schema=schema).serialize() == expected.serialize()
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        pl.Schema({"x": pl.Int64, "y": pl.Int64}),
+        pl.Schema({"x": pl.Boolean, "y": pl.Int64}),
+        pl.Schema({"x": pl.Int64, "y": pl.Boolean}),
+    ],
+)
+def test_polars_xor_rejects_non_boolean_operands(schema):
+    with pytest.raises(NotImplementedError, match="requires Boolean operands"):
+        polars_to_vortex(pl.col("x") ^ pl.col("y"), schema=schema)
+
+
+def test_polars_xor_requires_column_schema():
+    with pytest.raises(NotImplementedError, match="require a schema"):
+        polars_to_vortex(pl.col("x") ^ pl.col("y"))
+
+
+def test_polars_xor_rejects_integer_literals():
+    with pytest.raises(NotImplementedError, match="requires Boolean operands"):
+        polars_to_vortex(pl.lit(1) ^ pl.lit(2))
+
