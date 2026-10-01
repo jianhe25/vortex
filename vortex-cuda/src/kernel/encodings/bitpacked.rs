@@ -25,7 +25,7 @@ use vortex::dtype::NativePType;
 use vortex::encodings::fastlanes::BitPacked;
 use vortex::encodings::fastlanes::BitPackedArray;
 use vortex::encodings::fastlanes::BitPackedArrayExt;
-use vortex::encodings::fastlanes::BitPackedDataParts;
+use vortex::encodings::fastlanes::BitPackedParts;
 use vortex::encodings::fastlanes::unpack_iter::BitPacked as BitPackedUnpack;
 use vortex::error::VortexResult;
 use vortex::error::vortex_ensure;
@@ -168,7 +168,7 @@ where
     let bit_width = array.constant_bit_width_opt().ok_or_else(|| {
         vortex_err!("CUDA does not support BitPacked blocks with different bit widths")
     })?;
-    let BitPackedDataParts {
+    let BitPackedParts {
         offset,
         len,
         packed,

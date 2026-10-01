@@ -152,7 +152,7 @@ pub(crate) fn validate_block_offsets(
     Ok(())
 }
 
-pub struct BitPackedDataParts {
+pub struct BitPackedParts {
     pub offset: u16,
     /// Byte boundaries of the packed blocks, including the trailing end boundary.
     pub block_offsets: ArrayRef,
