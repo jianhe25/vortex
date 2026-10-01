@@ -378,11 +378,12 @@ impl PyVortexWriteOptions {
     ) -> PyVortexResult<()> {
         let session = session();
         py.detach(|| {
-            let mut strategy = WriteStrategyBuilder::default();
+            let mut compressor = BtrBlocksCompressorBuilder::from_session(session);
             if self.use_compact_encodings {
-                strategy = strategy
-                    .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact());
+                compressor = compressor.with_compact();
             }
+            let strategy =
+                WriteStrategyBuilder::from_session(session).with_btrblocks_builder(compressor);
             let strategy = strategy.build();
             current_runtime().block_on(async move {
                 match resolve_store(path, store.map(|x| x.into_inner()))? {

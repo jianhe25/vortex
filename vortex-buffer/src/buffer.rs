@@ -28,11 +28,38 @@ use crate::debug::TruncatedDebug;
 use crate::trusted_len::TrustedLen;
 
 /// An immutable buffer of items of `T`.
+///
+/// Zero-sized element types are rejected at compile time when constructing a buffer.
+///
+/// ```compile_fail
+/// use vortex_buffer::Buffer;
+/// let _ = Buffer::<()>::empty();
+/// ```
+///
+/// ```compile_fail
+/// use vortex_buffer::Buffer;
+/// let _ = Buffer::from(vec![(); 3]);
+/// ```
+///
+/// ```compile_fail
+/// use vortex_buffer::{Buffer, ByteBuffer};
+/// let _ = Buffer::<()>::from_byte_buffer(ByteBuffer::empty());
+/// ```
+///
+/// ```compile_fail
+/// use bytes::Bytes;
+/// use vortex_buffer::{Alignment, Buffer};
+/// let _ = Buffer::<()>::from_bytes_aligned(Bytes::new(), Alignment::none());
+/// ```
 #[derive(Clone)]
 pub struct Buffer<T> {
+    /// The first element in this view; may dangle for an empty buffer.
     pub(crate) ptr: NonNull<T>,
+    /// The number of initialized `T` values visible from `ptr`.
     pub(crate) length: usize,
+    /// The minimum alignment promised for `ptr` and preserved by aligned slices.
     pub(crate) alignment: Alignment,
+    /// Shared ownership of the storage containing `ptr`, if any; `Buffer::empty` has no backing.
     pub(crate) backing: Option<Arc<BufferBacking>>,
 }
 
@@ -100,22 +127,6 @@ impl<T> Buffer<T> {
         }
     }
 
-    fn from_owner(owner: impl crate::BufferOwner, alignment: Alignment) -> Self {
-        let owner: Box<dyn crate::BufferOwner> = Box::new(owner);
-        let length = owner.len() / size_of::<T>();
-        let ptr = if length == 0 {
-            empty_ptr()
-        } else {
-            NonNull::new(owner.as_ptr().cast_mut().cast()).vortex_expect("owner pointer is null")
-        };
-        Self {
-            ptr,
-            length,
-            alignment,
-            backing: Some(Arc::new(BufferBacking::External { _owner: owner })),
-        }
-    }
-
     fn from_bytes(bytes: Bytes, alignment: Alignment) -> Self {
         let length = bytes.len() / size_of::<T>();
         if length == 0 {
@@ -156,12 +167,18 @@ impl<T> Buffer<T> {
     /// of the provided `Vec<T>` while maintaining the ability to convert it back into a mutable
     /// buffer. We could fix this by forking `Bytes`, or in many other complex ways, but for now
     /// callers should prefer to construct `Buffer<T>` from a `BufferMut<T>`.
-    pub fn copy_from(values: impl AsRef<[T]>) -> Self {
+    pub fn copy_from(values: impl AsRef<[T]>) -> Self
+    where
+        T: Copy,
+    {
         BufferMut::copy_from(values).freeze()
     }
 
     /// Returns a new `Buffer<T>` copied with the provided allocator.
-    pub fn copy_from_in(values: impl AsRef<[T]>, allocator: BufferAllocatorRef) -> Self {
+    pub fn copy_from_in(values: impl AsRef<[T]>, allocator: BufferAllocatorRef) -> Self
+    where
+        T: Copy,
+    {
         BufferMut::copy_from_in(values, allocator).freeze()
     }
 
@@ -171,7 +188,10 @@ impl<T> Buffer<T> {
     /// `alignment`. Use [`copy_from_preferred_aligned`] to control the over-alignment.
     ///
     /// [`copy_from_preferred_aligned`]: Self::copy_from_preferred_aligned
-    pub fn copy_from_aligned(values: impl AsRef<[T]>, alignment: Alignment) -> Self {
+    pub fn copy_from_aligned(values: impl AsRef<[T]>, alignment: Alignment) -> Self
+    where
+        T: Copy,
+    {
         Self::copy_from_preferred_aligned(values, alignment, Some(Alignment::DEFAULT_ALIGNMENT))
     }
 
@@ -183,7 +203,10 @@ impl<T> Buffer<T> {
         values: impl AsRef<[T]>,
         alignment: Alignment,
         preferred_alignment: Option<Alignment>,
-    ) -> Self {
+    ) -> Self
+    where
+        T: Copy,
+    {
         BufferMut::copy_from_preferred_aligned(values, alignment, preferred_alignment).freeze()
     }
 
@@ -228,12 +251,9 @@ impl<T> Buffer<T> {
     ///
     /// This does not allocate. Empty buffers use an aligned dangling pointer.
     pub fn empty_aligned(alignment: Alignment) -> Self {
+        const { assert!(size_of::<T>() != 0, "ZSTs are not supported") };
         if !alignment.is_aligned_to(Alignment::of::<T>()) {
-            vortex_panic!(
-                "Alignment {} must align to the scalar type's alignment {}",
-                alignment,
-                Alignment::of::<T>(),
-            );
+            misaligned_scalar_type(alignment, Alignment::of::<T>());
         }
         Self {
             ptr: empty_ptr(),
@@ -277,22 +297,15 @@ impl<T> Buffer<T> {
     /// Panics if the buffer is not aligned to the given alignment, if the length is not a multiple
     /// of the size of `T`, or if the given alignment is not aligned to that of `T`.
     pub fn from_byte_buffer_aligned(buffer: ByteBuffer, alignment: Alignment) -> Self {
+        const { assert!(size_of::<T>() != 0, "ZSTs are not supported") };
         if !alignment.is_aligned_to(Alignment::of::<T>()) {
-            vortex_panic!(
-                "Alignment {} must be compatible with the scalar type's alignment {}",
-                alignment,
-                Alignment::of::<T>(),
-            );
+            incompatible_scalar_alignment(alignment, Alignment::of::<T>());
         }
         if !alignment.is_ptr_aligned(buffer.as_ptr()) {
-            vortex_panic!("Buffer must align to the requested alignment {}", alignment);
+            buffer_not_aligned(alignment);
         }
         if !buffer.len().is_multiple_of(size_of::<T>()) {
-            vortex_panic!(
-                "Buffer length {} must be a multiple of the scalar type's size {}",
-                buffer.len(),
-                size_of::<T>()
-            );
+            buffer_len_not_multiple(buffer.len(), size_of::<T>());
         }
         Self {
             ptr: buffer.ptr.cast(),
@@ -309,25 +322,15 @@ impl<T> Buffer<T> {
     /// Panics if the buffer is not aligned to the size of `T`, or the length is not a multiple of
     /// the size of `T`.
     pub fn from_bytes_aligned(bytes: Bytes, alignment: Alignment) -> Self {
+        const { assert!(size_of::<T>() != 0, "ZSTs are not supported") };
         if !alignment.is_aligned_to(Alignment::of::<T>()) {
-            vortex_panic!(
-                "Alignment {} must be compatible with the scalar type's alignment {}",
-                alignment,
-                Alignment::of::<T>(),
-            );
+            incompatible_scalar_alignment(alignment, Alignment::of::<T>());
         }
         if !alignment.is_ptr_aligned(bytes.as_ptr()) {
-            vortex_panic!(
-                "Bytes alignment must align to the requested alignment {}",
-                alignment,
-            );
+            bytes_not_aligned(alignment);
         }
         if !bytes.len().is_multiple_of(size_of::<T>()) {
-            vortex_panic!(
-                "Bytes length {} must be a multiple of the scalar type's size {}",
-                bytes.len(),
-                size_of::<T>()
-            );
+            bytes_len_not_multiple(bytes.len(), size_of::<T>());
         }
         Self::from_bytes(bytes, alignment)
     }
@@ -390,10 +393,7 @@ impl<T> Buffer<T> {
         self.alignment
     }
 
-    /// Returns the allocator to use for derived buffers.
-    ///
-    /// External buffers use the static allocator.
-    pub fn allocator(&self) -> &BufferAllocatorRef {
+    pub(crate) fn allocator(&self) -> &BufferAllocatorRef {
         match self.backing.as_deref() {
             Some(backing) => backing.allocator(),
             None => BufferAllocatorRef::static_ref(),
@@ -481,14 +481,10 @@ impl<T> Buffer<T> {
         };
 
         if begin > end {
-            vortex_panic!(
-                "range start must not be greater than end: {:?} <= {:?}",
-                begin,
-                end
-            );
+            slice_range_inverted(begin, end);
         }
         if end > len {
-            vortex_panic!("range end out of bounds: {:?} > {:?}", end, len);
+            slice_range_out_of_bounds(end, len);
         }
 
         if end == begin {
@@ -499,10 +495,7 @@ impl<T> Buffer<T> {
 
         let begin_byte = begin * size_of::<T>();
         if !alignment.is_offset_aligned(begin_byte) {
-            vortex_panic!(
-                "range start must be aligned to {alignment:?}, byte {}",
-                begin_byte
-            );
+            slice_start_misaligned(alignment, begin_byte);
         }
         if !alignment.is_aligned_to(Alignment::of::<T>()) {
             vortex_panic!("Slice alignment must at least align to type T")
@@ -656,7 +649,10 @@ impl<T> Buffer<T> {
     }
 
     /// Convert self into `BufferMut<T>`, cloning the data if there are multiple strong references.
-    pub fn into_mut(self) -> BufferMut<T> {
+    pub fn into_mut(self) -> BufferMut<T>
+    where
+        T: Copy,
+    {
         self.try_into_mut().unwrap_or_else(|buffer| {
             let allocator = buffer.allocator().clone();
             BufferMut::<T>::copy_from_aligned_in(&buffer, buffer.alignment, allocator)
@@ -669,7 +665,10 @@ impl<T> Buffer<T> {
     }
 
     /// Return a `Buffer<T>` with the given alignment. Where possible, this will be zero-copy.
-    pub fn aligned(mut self, alignment: Alignment) -> Self {
+    pub fn aligned(mut self, alignment: Alignment) -> Self
+    where
+        T: Copy,
+    {
         if alignment.is_ptr_aligned(self.as_ptr()) {
             self.alignment = alignment;
             self
@@ -802,29 +801,25 @@ impl<T> FromIterator<T> for Buffer<T> {
     }
 }
 
-// Helper struct that preserves drop glue for non-native Vec elements.
-#[repr(transparent)]
-struct Wrapper<T>(Vec<T>);
-
-impl<T: Send + Sync + 'static> crate::BufferOwner for Wrapper<T> {
-    fn as_ptr(&self) -> *const u8 {
-        self.0.as_ptr().cast()
-    }
-
-    fn len(&self) -> usize {
-        self.0.len() * size_of::<T>()
-    }
-}
-
 impl<T> From<Vec<T>> for Buffer<T>
 where
     T: Send + Sync + 'static,
 {
     fn from(value: Vec<T>) -> Self {
+        const { assert!(size_of::<T>() != 0, "ZSTs are not supported") };
         let length = value.len();
         let alignment = Alignment::of::<T>();
         if std::mem::needs_drop::<T>() {
-            Self::from_owner(Wrapper(value), alignment)
+            // Keep the typed owner so its elements are dropped.
+            Self {
+                ptr: NonNull::new(value.as_ptr().cast_mut())
+                    .vortex_expect("a Vec always has a non-null pointer"),
+                length,
+                alignment,
+                backing: Some(Arc::new(BufferBacking::External {
+                    _owner: Box::new(value),
+                })),
+            }
         } else {
             Self::from_allocation(Allocation::from_vec(value), 0, length, alignment)
         }
@@ -945,6 +940,66 @@ impl<T> From<BufferMut<T>> for Buffer<T> {
     fn from(value: BufferMut<T>) -> Self {
         value.freeze()
     }
+}
+
+// If panic helpers are inlined, this makes callers of BufferMut's functions
+// not inline-eligible. This is more ugly than direct panics but helps with
+// performance
+
+#[cold]
+#[inline(never)]
+fn misaligned_scalar_type(alignment: Alignment, scalar_align: Alignment) -> ! {
+    vortex_panic!("Alignment {alignment} must align to the scalar type's alignment {scalar_align}")
+}
+
+#[cold]
+#[inline(never)]
+fn incompatible_scalar_alignment(alignment: Alignment, scalar_align: Alignment) -> ! {
+    vortex_panic!(
+        "Alignment {alignment} must be compatible with the scalar type's alignment {scalar_align}"
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn buffer_not_aligned(alignment: Alignment) -> ! {
+    vortex_panic!("Buffer must align to the requested alignment {alignment}")
+}
+
+#[cold]
+#[inline(never)]
+fn bytes_not_aligned(alignment: Alignment) -> ! {
+    vortex_panic!("Bytes alignment must align to the requested alignment {alignment}")
+}
+
+#[cold]
+#[inline(never)]
+fn buffer_len_not_multiple(len: usize, scalar_size: usize) -> ! {
+    vortex_panic!("Buffer length {len} must be a multiple of the scalar type's size {scalar_size}")
+}
+
+#[cold]
+#[inline(never)]
+fn bytes_len_not_multiple(len: usize, scalar_size: usize) -> ! {
+    vortex_panic!("Bytes length {len} must be a multiple of the scalar type's size {scalar_size}")
+}
+
+#[cold]
+#[inline(never)]
+fn slice_range_inverted(begin: usize, end: usize) -> ! {
+    vortex_panic!("range start must not be greater than end: {begin:?} <= {end:?}")
+}
+
+#[cold]
+#[inline(never)]
+fn slice_range_out_of_bounds(end: usize, len: usize) -> ! {
+    vortex_panic!("range end out of bounds: {end:?} > {len:?}")
+}
+
+#[cold]
+#[inline(never)]
+fn slice_start_misaligned(alignment: Alignment, begin_byte: usize) -> ! {
+    vortex_panic!("range start must be aligned to {alignment:?}, byte {begin_byte}")
 }
 
 #[cfg(test)]
@@ -1095,6 +1150,42 @@ mod test {
     }
 
     #[test]
+    fn byte_owner_preserves_slice_and_lifetime() {
+        struct Owner {
+            values: Vec<u8>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.values[1..4]
+            }
+        }
+
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let owner = Owner {
+            values: vec![0, 1, 2, 3, 4],
+            drops: Arc::clone(&drops),
+        };
+        let ptr = owner.as_ref().as_ptr();
+        let buffer = ByteBuffer::from(Bytes::from_owner(owner));
+        assert_eq!(buffer.as_ptr(), ptr);
+        assert_eq!(buffer.as_slice(), [1, 2, 3]);
+        let view = buffer.slice(1..);
+        drop(buffer);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(view.as_slice(), [2, 3]);
+        drop(view);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn bytes_round_trip_reuses_owner() {
         let bytes = Bytes::from_static(&[1, 2, 3, 4]);
         let ptr = bytes.as_ptr();
@@ -1151,9 +1242,15 @@ mod test {
         let Ok(mut sliced) = sliced.try_into_mut() else {
             panic!("uniquely owned slice should become mutable")
         };
+        let ptr = sliced.as_ptr();
         let capacity = sliced.capacity();
         sliced.push_n(0, capacity - sliced.len());
         assert_eq!(sliced.len(), capacity);
+        assert_eq!(sliced.as_ptr(), ptr);
+        sliced.push(42);
+        assert_eq!(&sliced[..32], (64u32..96).collect::<Vec<_>>());
+        assert_eq!(&sliced[32..capacity], vec![0; capacity - 32]);
+        assert_eq!(sliced[capacity], 42);
     }
 
     #[test]

@@ -212,11 +212,11 @@ fn probe(data: &ArrayAndStats) -> VortexResult<ProbeResult> {
             if index >= end {
                 continue;
             }
-            probed_rows += 1;
             if validity_bits
                 .as_ref()
                 .is_some_and(|validity| !validity.value(index))
             {
+                probed_rows += 1;
                 saw_null = true;
                 continue;
             }
@@ -227,6 +227,7 @@ fn probe(data: &ArrayAndStats) -> VortexResult<ProbeResult> {
             if next_probed_bytes > MAX_PROBE_BYTES {
                 break 'probe;
             }
+            probed_rows += 1;
             probed_bytes = next_probed_bytes;
             distinct_values.insert(value);
         }
@@ -390,6 +391,17 @@ mod tests {
             values[start..end].fill(Some("x".repeat(256)));
         }
         let data = string_data(&values);
+        assert_eq!(probe(&data)?, ProbeResult::Inconclusive);
+        Ok(())
+    }
+
+    #[test]
+    fn probe_is_inconclusive_when_last_value_exceeds_byte_budget() -> VortexResult<()> {
+        let data = string_data(&[
+            Some("a".to_owned()),
+            Some("x".repeat(super::MAX_PROBE_BYTES)),
+        ]);
+
         assert_eq!(probe(&data)?, ProbeResult::Inconclusive);
         Ok(())
     }

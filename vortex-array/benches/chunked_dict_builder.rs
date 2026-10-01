@@ -4,15 +4,19 @@
 use std::sync::LazyLock;
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use rand::distr::Distribution;
 use rand::distr::StandardUniform;
 use vortex_array::Canonical;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::dict_test::gen_dict_primitive_chunks;
-use vortex_array::builders::builder_with_capacity;
+use vortex_array::builders::builder_with_capacity_in;
 use vortex_array::dtype::NativePType;
 use vortex_error::VortexExpect;
 use vortex_session::VortexSession;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     LazyLock::force(&SESSION);
@@ -43,7 +47,8 @@ fn chunked_dict_primitive_canonical_into<T: NativePType>(
     bencher
         .with_inputs(|| (&chunk, SESSION.create_execution_ctx()))
         .bench_refs(|(chunk, ctx)| {
-            let mut builder = builder_with_capacity(chunk.dtype(), len * chunk_count);
+            let mut builder =
+                builder_with_capacity_in(chunk.dtype(), len * chunk_count, ctx.allocator());
             chunk
                 .append_to_builder(builder.as_mut(), ctx)
                 .vortex_expect("append failed");

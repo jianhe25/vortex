@@ -16,11 +16,11 @@ use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
+use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::scalar::Scalar;
-use vortex_array::scalar::ScalarValue;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::smallvec::smallvec;
 use vortex_array::vtable::VTable;
@@ -30,14 +30,14 @@ use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
-use vortex_session::registry::CachedId;
 
 use crate::FoRData;
-use crate::r#for::array::FoRArrayExt;
 use crate::r#for::array::FoRSlots;
 use crate::r#for::array::FoRSlotsView;
 use crate::r#for::array::for_decompress::decompress;
+use crate::r#for::array::num_chunks;
 use crate::r#for::vtable::rules::PARENT_RULES;
+use crate::for_v2_id;
 
 mod kernels;
 mod operations;
@@ -54,13 +54,13 @@ pub(crate) fn initialize(session: &VortexSession) {
 
 impl ArrayHash for FoRData {
     fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
-        self.reference.hash(state);
+        self.offset.hash(state);
     }
 }
 
 impl ArrayEq for FoRData {
     fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
-        self.reference == other.reference
+        self.offset == other.offset
     }
 }
 
@@ -71,8 +71,7 @@ impl VTable for FoR {
     type ValidityVTable = ValidityVTableFromChild;
 
     fn id(&self) -> ArrayId {
-        static ID: CachedId = CachedId::new("fastlanes.for");
-        *ID
+        for_v2_id()
     }
 
     fn validate(
@@ -82,8 +81,8 @@ impl VTable for FoR {
         len: usize,
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
-        let encoded = FoRSlotsView::from_slots(slots).encoded;
-        validate_parts(encoded.dtype(), encoded.len(), &data.reference, dtype, len)
+        let slots = FoRSlotsView::from_slots(slots);
+        validate_parts(slots.encoded, slots.references, data.offset, dtype, len)
     }
 
     fn nbuffers(_array: ArrayView<'_, Self>) -> usize {
@@ -111,43 +110,22 @@ impl VTable for FoR {
     }
 
     fn serialize(
-        array: ArrayView<'_, Self>,
+        _array: ArrayView<'_, Self>,
         _session: &VortexSession,
     ) -> VortexResult<Option<Vec<u8>>> {
-        // Note that we **only** serialize the optional scalar value (not including the dtype).
-        Ok(Some(ScalarValue::to_proto_bytes(
-            array.reference_scalar().value(),
-        )))
+        vortex_bail!("FoR serialization requires FoRPlugin")
     }
 
     fn deserialize(
         &self,
-        dtype: &DType,
-        len: usize,
-        metadata: &[u8],
-        buffers: &[BufferHandle],
-        children: &dyn ArrayChildren,
-        session: &VortexSession,
+        _dtype: &DType,
+        _len: usize,
+        _metadata: &[u8],
+        _buffers: &[BufferHandle],
+        _children: &dyn ArrayChildren,
+        _session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
-        vortex_ensure!(
-            buffers.is_empty(),
-            "FoRArray expects 0 buffers, got {}",
-            buffers.len()
-        );
-        if children.len() != 1 {
-            vortex_bail!(
-                "Expected 1 child for FoR encoding, found {}",
-                children.len()
-            )
-        }
-
-        let scalar_value = ScalarValue::from_proto_bytes(metadata, dtype, session)?;
-        let reference = Scalar::try_new(dtype.clone(), scalar_value)?;
-        let encoded = children.get(0, dtype, len)?;
-        let slots = smallvec![Some(encoded)];
-
-        let data = FoRData::try_new(reference)?;
-        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        vortex_bail!("FoR deserialization requires FoRPlugin")
     }
 
     fn reduce_parent(
@@ -173,10 +151,25 @@ impl FoR {
         let dtype = reference
             .dtype()
             .with_nullability(encoded.dtype().nullability());
-        let reference = reference.cast(&dtype)?;
+        let reference = reference.cast(&dtype.as_nonnullable())?;
+        let references = ConstantArray::new(reference, num_chunks(0, encoded.len())).into_array();
+        Self::try_new_chunked(encoded, references, 0)
+    }
+
+    /// Construct a FoR array with one reference per 1024-element chunk.
+    ///
+    /// `references` must be a non-nullable integer array of the encoded array's type, with one
+    /// entry for each chunk spanned by `offset + encoded.len()` elements. `offset` is the position
+    /// of the first element within the first chunk.
+    pub fn try_new_chunked(
+        encoded: ArrayRef,
+        references: ArrayRef,
+        offset: u16,
+    ) -> VortexResult<FoRArray> {
+        let dtype = encoded.dtype().clone();
         let len = encoded.len();
-        let data = FoRData::try_new(reference)?;
-        let slots = smallvec![Some(encoded)];
+        let data = FoRData::try_new(offset)?;
+        let slots = smallvec![Some(encoded), Some(references)];
         Array::try_from_parts(ArrayParts::new(FoR, dtype, len, data).with_slots(slots))
     }
 
@@ -184,30 +177,42 @@ impl FoR {
     pub fn encode(array: PrimitiveArray, ctx: &mut ExecutionCtx) -> VortexResult<FoRArray> {
         FoRData::encode(array, ctx)
     }
+
+    /// Encode a primitive array with one Frame of Reference per 1024-element chunk.
+    pub fn encode_chunked(array: PrimitiveArray, ctx: &mut ExecutionCtx) -> VortexResult<FoRArray> {
+        FoRData::encode_chunked(array, ctx)
+    }
 }
 
 fn validate_parts(
-    encoded_dtype: &DType,
-    encoded_len: usize,
-    reference: &Scalar,
+    encoded: &ArrayRef,
+    references: &ArrayRef,
+    offset: u16,
     dtype: &DType,
     len: usize,
 ) -> VortexResult<()> {
     vortex_ensure!(dtype.is_int(), "FoR requires an integer dtype, got {dtype}");
     vortex_ensure!(
-        reference.dtype() == dtype,
-        "FoR reference dtype mismatch: expected {dtype}, got {}",
-        reference.dtype()
-    );
-    vortex_ensure!(
-        encoded_dtype == dtype,
+        encoded.dtype() == dtype,
         "FoR encoded dtype mismatch: expected {dtype}, got {}",
-        encoded_dtype
+        encoded.dtype()
     );
     vortex_ensure!(
-        encoded_len == len,
+        encoded.len() == len,
         "FoR encoded length mismatch: expected {len}, got {}",
-        encoded_len
+        encoded.len()
+    );
+    let references_dtype = dtype.as_nonnullable();
+    vortex_ensure!(
+        references.dtype() == &references_dtype,
+        "FoR references dtype mismatch: expected {references_dtype}, got {}",
+        references.dtype()
+    );
+    let num_chunks = num_chunks(offset, len);
+    vortex_ensure!(
+        references.len() == num_chunks,
+        "FoR expects {num_chunks} references, got {}",
+        references.len()
     );
     Ok(())
 }

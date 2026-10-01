@@ -19,18 +19,20 @@ use super::batch::finalize_kernel_output;
 use super::row_fn::RowFn;
 use super::visitor::BatchPlanner;
 use super::visitor::ExecuteDenseWithRetry;
+use super::visitor::ExecuteFilteredRows;
 use super::visitor::ExecuteRows;
 use super::visitor::ExecuteValidRows;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::dtype::DType;
-use crate::expr::Expression;
-use crate::expr::union_child_validities;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::ExecutionArgs;
+use crate::scalar_fn::ReduceNode;
+use crate::scalar_fn::ReduceNodeValidity;
 use crate::scalar_fn::ScalarFnId;
 use crate::scalar_fn::ScalarFnVTable;
+use crate::scalar_fn::union_child_validities;
 use crate::scalar_fn::unstable::row::execute::DenseAttempt;
 
 impl<F: RowFn> ScalarFnVTable for F {
@@ -69,12 +71,12 @@ impl<F: RowFn> ScalarFnVTable for F {
         execute_rows(self, options, args, ctx)
     }
 
-    fn validity(
+    fn validity<T: ReduceNode>(
         &self,
         _options: &Self::Options,
-        expression: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        union_child_validities(expression)
+        node: &T,
+    ) -> VortexResult<ReduceNodeValidity<T>> {
+        Ok(ReduceNodeValidity::Reduced(union_child_validities(node)?))
     }
 
     // `RowFn` is stricter than `ScalarFnVTable::is_strict`: its kernel cannot produce null from
@@ -126,6 +128,7 @@ pub fn execute_rows<F: RowFn>(
         |args, ctx| execute_row_kernel(function, options, args, ctx),
         |args, ctx| execute_dense_attempt(function, options, args, ctx),
         |args, valid, ctx| try_execute_valid_rows(function, options, args, valid, ctx),
+        |args, valid, ctx| execute_filtered_rows(function, options, args, valid, ctx),
         ctx,
     )
 }
@@ -197,6 +200,21 @@ fn try_execute_valid_rows<F: RowFn>(
         options,
         args.dtypes(),
         ExecuteValidRows::<F>::new(&args, args.dtypes(), args.plan(), valid, ctx),
+    )
+}
+
+/// Execute valid rows over `args` filtered to the valid row domain of `valid`.
+fn execute_filtered_rows<F: RowFn>(
+    function: &F,
+    options: &F::Options,
+    args: BorrowedRowFnArgs<'_>,
+    valid: MaskValuesRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    function.dispatch(
+        options,
+        args.dtypes(),
+        ExecuteFilteredRows::<F>::new(&args, args.dtypes(), args.plan(), valid, ctx),
     )
 }
 

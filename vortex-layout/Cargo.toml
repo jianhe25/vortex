@@ -11,6 +11,7 @@ license = { workspace = true }
 readme = { workspace = true }
 repository = { workspace = true }
 rust-version = { workspace = true }
+
 version = { workspace = true }
 
 [package.metadata.docs.rs]
@@ -44,7 +45,6 @@ vortex-arrow = { workspace = true }
 vortex-btrblocks = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-error = { workspace = true }
-vortex-flatbuffers = { workspace = true, features = ["layout"] }
 vortex-io = { workspace = true }
 vortex-mask = { workspace = true }
 vortex-metrics = { workspace = true }
@@ -59,6 +59,7 @@ divan = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 goldenfile = { workspace = true }
 insta = { workspace = true }
+mimalloc = { workspace = true }
 rand = { workspace = true }
 rstest = { workspace = true }
 temp-env = { workspace = true }
@@ -84,6 +85,10 @@ uuid = { workspace = true, features = ["js"], optional = true }
 
 [[bench]]
 name = "bloom_filter"
+harness = false
+
+[[bench]]
+name = "aggregate_partial_merge"
 harness = false
 
 [lints]

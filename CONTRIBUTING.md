@@ -36,6 +36,31 @@ The contribution process is outlined below:
 
 ## Development Workflows
 
+### Build prerequisites
+
+Bindings for the `.proto` schemas are checked in under `<crate>/src/proto/generated/`. After
+changing a schema, regenerate them with:
+
+```bash
+cargo run -p xtask -- generate-proto
+```
+
+Generation parses schemas in pure Rust, so `protoc` is not required, and its output is pinned by
+`Cargo.lock`.
+
+Bindings for the `.fbs` schemas are checked in under `<crate>/src/flatbuffers/generated/`, so
+building needs no FlatBuffers tooling. After changing a schema, regenerate them with:
+
+```bash
+cargo run -p xtask -- generate-flatbuffers
+```
+
+This shells out to the [`flatc`](https://github.com/google/flatbuffers/releases) compiler on
+`PATH`, or at the location in the `FLATC` environment variable, and refuses any version other
+than the one pinned in `xtask/src/generate_flatbuffers.rs`, since generated code is not
+source-compatible across `flatc` releases. CI regenerates both sets of bindings and fails if the
+checked-in copies differ.
+
 The repository uses [`uv`](https://docs.astral.sh/uv/) to manage its Python workspace. From the
 repository root, create or update the development environment with:
 
@@ -116,6 +141,24 @@ make -C docs serve
 ```
 
 Use `make -C docs help` to list focused targets, and finish documentation changes with `check`.
+
+#### PR previews
+
+PRs with branches in `vortex-data/vortex` get a docs preview when they change `docs/` or a docs
+workflow. This includes draft PRs and PRs targeting another feature branch. Fork PRs do not get
+hosted previews. Resolve merge conflicts before building a preview.
+
+Add the `action/preview-docs` label to preview other changes, such as API documentation generated from
+source code. The label stays on the PR and enables previews for later pushes. Removing it stops
+updates only if the PR no longer changes docs or a docs workflow.
+
+The deployment status links to the latest preview for the PR. The workflow summary also records
+the built commit and an immutable deployment URL. Previews build the PR head commit. Eligibility
+uses the complete PR diff, so rebasing over upstream docs changes does not enable a preview for
+an unrelated PR.
+
+Closing a PR or removing its last reason for a preview stops new preview builds. The last hosted
+build and its deployment record remain available. Preview checks are not required for merging.
 
 ## Governance
 

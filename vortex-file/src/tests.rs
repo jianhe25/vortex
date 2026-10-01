@@ -38,6 +38,7 @@ use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::dtype::PType::I32;
 use vortex_array::dtype::StructFields;
+use vortex_array::dtype::i256;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
 use vortex_array::expr::and;
@@ -72,10 +73,14 @@ use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
 use vortex_buffer::ByteBufferMut;
 use vortex_buffer::buffer;
+use vortex_decimal_byte_parts::DecimalByteParts;
+use vortex_decimal_byte_parts::DecimalBytePartsArraySlotsExt;
+use vortex_edition::EDITION_DECLARATIONS;
 use vortex_edition::EditionSession;
+use vortex_edition::EditionSessionExt;
+use vortex_edition::declarations::core::CORE_2026_08_3;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
-use vortex_flatbuffers::footer as fb;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::DynLayout;
 use vortex_layout::LayoutStrategy;
@@ -87,6 +92,7 @@ use vortex_layout::layouts::table::TableStrategy;
 use vortex_layout::layouts::zoned::LegacyStats;
 use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::scan::scan_builder::ScanBuilder;
+use vortex_layout::scan::split_by::DEFAULT_MAX_SPLIT_ROWS;
 use vortex_layout::scan::split_by::SplitBy;
 use vortex_layout::session::LayoutSession;
 use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
@@ -99,6 +105,7 @@ use crate::V1_FOOTER_FBS_SIZE;
 use crate::VERSION;
 use crate::VortexFile;
 use crate::WriteOptionsSessionExt;
+use crate::flatbuffers::footer as fb;
 use crate::footer::SegmentSpec;
 static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = array_session()
@@ -116,8 +123,8 @@ fn strict_sorted(indices: Buffer<u64>) -> StrictSortedBuffer<u64> {
 }
 
 fn bind_scan_expr(file: &VortexFile, expr: Expression) -> BoundExpression {
-    expr.optimize_recursive(file.dtype())
-        .and_then(|expr| expr.bind(file.dtype()))
+    expr.bind(file.dtype())
+        .and_then(|expr| expr.optimize_recursive())
         .vortex_expect("scan expression should bind")
 }
 
@@ -170,6 +177,90 @@ async fn test_read_simple() {
     }
 
     assert_eq!(row_count, 8);
+}
+
+/// Wide decimals split into multi-part arrays only when the writer allows the v2 format. The
+/// default writer allows every registered encoding once editions are disabled; a strategy built
+/// from the session keeps the enabled editions' restrictions regardless.
+#[rstest]
+#[case::default_writer(false, false)]
+#[case::custom_layout(true, false)]
+#[case::explicit_compressor(true, true)]
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn decimal_writer_uses_default_or_session_restrictions(
+    #[values(false, true)] use_i256: bool,
+    #[case] custom_strategy: bool,
+    #[case] explicit_compressor: bool,
+) -> VortexResult<()> {
+    let session = array_session()
+        .with::<EditionSession>()
+        .with::<LayoutSession>()
+        .with::<RuntimeSession>();
+    crate::register_default_encodings(&session);
+    for declaration in EDITION_DECLARATIONS {
+        session.register_edition(declaration)?;
+    }
+    session.enable_edition(CORE_2026_08_3)?;
+
+    let array = if use_i256 {
+        DecimalArray::new(
+            (0..1024u128)
+                .map(|i| i256::from_parts(i * 17, 1i128 << 70))
+                .collect::<Buffer<i256>>(),
+            DecimalDType::new(76, 2),
+            Validity::NonNullable,
+        )
+    } else {
+        DecimalArray::new(
+            (0..1024i128)
+                .map(|i| (1i128 << 70) + i * 17)
+                .collect::<Buffer<i128>>(),
+            DecimalDType::new(38, 2),
+            Validity::NonNullable,
+        )
+    }
+    .into_array();
+    let strategy = crate::strategy::WriteStrategyBuilder::from_session(&session)
+        .with_row_block_size(256)
+        .with_data_block_target_bytes(None);
+    let strategy = if explicit_compressor {
+        strategy.with_btrblocks_builder(BtrBlocksCompressorBuilder::from_session(&session))
+    } else {
+        strategy
+    }
+    .build();
+
+    for disable_editions in [false, true] {
+        let mut options = session.write_options();
+        if custom_strategy {
+            options = options.with_strategy(Arc::clone(&strategy));
+        }
+        let options = if disable_editions {
+            options.disable_editions()
+        } else {
+            options
+        };
+        let mut buffer = ByteBufferMut::empty();
+        options
+            .write(&mut buffer, array.clone().to_array_stream())
+            .await?;
+        let actual = session
+            .open_options()
+            .open_buffer(buffer)?
+            .scan()?
+            .into_array_stream()?
+            .read_all()
+            .await?;
+        let uses_v2 = actual.depth_first_traversal().any(|array| {
+            array
+                .as_opt::<DecimalByteParts>()
+                .is_some_and(|parts| !parts.lower_parts().is_empty())
+        });
+        assert_eq!(uses_v2, disable_editions && !custom_strategy);
+        assert_arrays_eq!(array, actual, &mut session.create_execution_ctx());
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -1399,8 +1490,8 @@ async fn scan_empty_fields() -> VortexResult<()> {
             },
             [],
         )
-        .optimize_recursive(array.dtype())?
-        .bind(array.dtype())?;
+        .bind(array.dtype())?
+        .optimize_recursive()?;
 
     let result = round_trip(&array.clone().into_array(), |scan| {
         Ok(scan.with_projection(projection))
@@ -1873,7 +1964,7 @@ async fn write_read_roundtrip_with_layout(
     array: ArrayRef,
     use_list_layout: bool,
 ) -> VortexResult<ArrayRef> {
-    let strategy = crate::strategy::WriteStrategyBuilder::default()
+    let strategy = crate::strategy::WriteStrategyBuilder::from_session(&SESSION)
         .with_list_layout()
         .build();
     let mut buf = ByteBufferMut::empty();
@@ -1932,8 +2023,12 @@ fn map_array_from_rows(rows: &[MapRowFixture<'_>], keys_sorted: bool) -> VortexR
         keys_sorted,
     )?;
     let dtype = DType::Map(map_dtype.clone(), Nullability::Nullable);
-    let mut builder =
-        MapBuilder::<u64, u64>::with_capacity(map_dtype, Nullability::Nullable, rows.len());
+    let mut builder = MapBuilder::<u64, u64>::with_capacity_in(
+        map_dtype,
+        Nullability::Nullable,
+        rows.len(),
+        vortex_buffer::BufferAllocatorRef::static_ref(),
+    );
 
     for row in rows {
         let scalar = match row {
@@ -2228,9 +2323,7 @@ async fn timestamp_unit_mismatch() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let file = SESSION.open_options().open_buffer(buf)?;
-    let filter = filter_expr
-        .optimize_recursive(file.dtype())?
-        .bind(file.dtype())?;
+    let filter = filter_expr.bind(file.dtype())?.optimize_recursive()?;
     let mut stream = file.scan()?.with_filter(filter).into_array_stream()?;
     let result = stream.try_next().await;
 
@@ -2248,14 +2341,14 @@ async fn timestamp_unit_mismatch() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn timestamp_unit_mismatch_errors_with_constant_children()
 -> Result<(), Box<dyn std::error::Error>> {
-    let compressor = vortex_btrblocks::BtrBlocksCompressor::default();
+    let compressor = vortex_btrblocks::BtrBlocksCompressor::from_session(&SESSION);
 
     // Write file with MILLISECONDS timestamps using this compressor.
     let ts_array = PrimitiveArray::from_iter(vec![1704067200000i64, 1704153600000, 1704240000000])
         .into_array();
     let temporal = TemporalArray::new_timestamp(ts_array, TimeUnit::Milliseconds, None);
 
-    let strategy = crate::strategy::WriteStrategyBuilder::default()
+    let strategy = crate::strategy::WriteStrategyBuilder::from_session(&SESSION)
         .with_compressor(compressor)
         .build();
 
@@ -2279,9 +2372,7 @@ async fn timestamp_unit_mismatch_errors_with_constant_children()
     );
 
     let file = SESSION.open_options().open_buffer(buf)?;
-    let filter = filter_expr
-        .optimize_recursive(file.dtype())?
-        .bind(file.dtype())?;
+    let filter = filter_expr.bind(file.dtype())?.optimize_recursive()?;
     let stream = file.scan()?.with_filter(filter).into_array_stream()?;
     let results = stream.try_collect::<Vec<_>>().await;
 
@@ -2337,19 +2428,15 @@ fn layout_has_dict(layout: &dyn DynLayout) -> bool {
             .any(|child| layout_has_dict(child.as_ref()))
 }
 
-/// Mirrors the (private) `IDEAL_SPLIT_SIZE` that `SplitBy::Layout` uses to sub-divide wide
-/// chunk-boundary spans: layout splits are never wider than this many rows.
-const MAX_SPLIT_ROWS: u64 = 100_000;
+/// Rows in the [`large_flat_file`] fixture; spans the sub-split threshold.
+const FLAT_N_ROWS: u64 = 250_000;
 
-#[tokio::test]
-#[cfg_attr(miri, ignore)]
-async fn test_large_flat_chunk_scan_subdivides_splits() -> VortexResult<()> {
-    // A single flat (unchunked) 250k-row layout spans the 100k sub-split threshold, so the scan
-    // must decode it as multiple row-range splits.
-    let mut ctx = SESSION.create_execution_ctx();
-    const N_ROWS: u64 = 250_000;
+/// A single flat (unchunked) [`FLAT_N_ROWS`]-row layout with alternating-sign values, so filters
+/// select rows on both sides of any split boundary. Returns the opened file and original array.
+async fn large_flat_file() -> VortexResult<(VortexFile, ArrayRef)> {
     let values =
-        Buffer::from_iter((0..N_ROWS as i32).map(|i| if i % 2 == 0 { i } else { -i })).into_array();
+        Buffer::from_iter((0..FLAT_N_ROWS as i32).map(|i| if i % 2 == 0 { i } else { -i }))
+            .into_array();
 
     let mut buf = ByteBufferMut::empty();
     SESSION
@@ -2358,14 +2445,27 @@ async fn test_large_flat_chunk_scan_subdivides_splits() -> VortexResult<()> {
         .write(&mut buf, values.to_array_stream())
         .await?;
 
-    let file = SESSION.open_options().open_buffer(buf)?;
+    Ok((SESSION.open_options().open_buffer(buf)?, values))
+}
 
-    // Sub-division caps each split at MAX_SPLIT_ROWS while tiling the file exactly.
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_large_flat_chunk_scan_subdivides_splits() -> VortexResult<()> {
+    // A single flat (unchunked) 250k-row layout spans the 100k sub-split threshold, so the scan
+    // must decode it as multiple row-range splits.
+    let mut ctx = SESSION.create_execution_ctx();
+    let (file, values) = large_flat_file().await?;
+
+    // Sub-division caps each split at DEFAULT_MAX_SPLIT_ROWS while tiling the file exactly.
     let splits = file.splits()?;
     assert!(splits.len() > 1, "expected sub-divided splits: {splits:?}");
-    assert!(splits.iter().all(|r| r.end - r.start <= MAX_SPLIT_ROWS));
+    assert!(
+        splits
+            .iter()
+            .all(|r| r.end - r.start <= DEFAULT_MAX_SPLIT_ROWS)
+    );
     assert_eq!(splits.first().map(|r| r.start), Some(0));
-    assert_eq!(splits.last().map(|r| r.end), Some(N_ROWS));
+    assert_eq!(splits.last().map(|r| r.end), Some(FLAT_N_ROWS));
     assert!(splits.windows(2).all(|w| w[0].end == w[1].start));
 
     // A full scan across the sub-splits returns the original rows.
@@ -2380,8 +2480,47 @@ async fn test_large_flat_chunk_scan_subdivides_splits() -> VortexResult<()> {
         .read_all()
         .await?;
     let expected =
-        Buffer::from_iter((0..N_ROWS as i32).filter(|i| i % 2 == 0 && *i > 0)).into_array();
+        Buffer::from_iter((0..FLAT_N_ROWS as i32).filter(|i| i % 2 == 0 && *i > 0)).into_array();
     assert_arrays_eq!(result, expected, &mut ctx);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_layout_split_keeps_large_chunk_whole() -> VortexResult<()> {
+    // The same over-wide single chunk as above, scanned with `SplitBy::Layout`: the scan follows
+    // the layout's chunk boundaries exactly, so the file decodes as one batch.
+    let mut ctx = SESSION.create_execution_ctx();
+    let (file, values) = large_flat_file().await?;
+
+    let mut chunks: Vec<ArrayRef> = file
+        .scan()?
+        .with_split_by(SplitBy::Layout)
+        .into_array_stream()?
+        .try_collect()
+        .await?;
+    assert_eq!(chunks.len(), 1, "expected a single un-split chunk");
+    assert_arrays_eq!(chunks.remove(0), values, &mut ctx);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn test_sub_splitting_max_rows_caps_scan_batches() -> VortexResult<()> {
+    // A custom `max_rows` tiles the 250k-row chunk into five evenly sized batches.
+    const MAX_ROWS: u64 = 50_000;
+    let (file, _) = large_flat_file().await?;
+
+    let chunks: Vec<ArrayRef> = file
+        .scan()?
+        .with_split_by(SplitBy::LayoutSubSplitting { max_rows: MAX_ROWS })
+        .into_array_stream()?
+        .try_collect()
+        .await?;
+    assert_eq!(chunks.len(), (FLAT_N_ROWS / MAX_ROWS) as usize);
+    assert!(chunks.iter().all(|c| c.len() as u64 <= MAX_ROWS));
 
     Ok(())
 }
@@ -2398,18 +2537,7 @@ async fn test_flat_chunk_scan_with_row_count_splits(
     // results whether the split size straddles the chunk arbitrarily or exceeds the file's
     // row count (a single split).
     let mut ctx = SESSION.create_execution_ctx();
-    const N_ROWS: u64 = 250_000;
-    let values =
-        Buffer::from_iter((0..N_ROWS as i32).map(|i| if i % 2 == 0 { i } else { -i })).into_array();
-
-    let mut buf = ByteBufferMut::empty();
-    SESSION
-        .write_options()
-        .with_strategy(Arc::new(FlatLayoutStrategy::default()))
-        .write(&mut buf, values.to_array_stream())
-        .await?;
-
-    let file = SESSION.open_options().open_buffer(buf)?;
+    let (file, values) = large_flat_file().await?;
 
     let result = file
         .scan()?
@@ -2427,7 +2555,7 @@ async fn test_flat_chunk_scan_with_row_count_splits(
         .read_all()
         .await?;
     let expected =
-        Buffer::from_iter((0..N_ROWS as i32).filter(|i| i % 2 == 0 && *i > 0)).into_array();
+        Buffer::from_iter((0..FLAT_N_ROWS as i32).filter(|i| i % 2 == 0 && *i > 0)).into_array();
     assert_arrays_eq!(result, expected, &mut ctx);
 
     Ok(())
@@ -2438,7 +2566,7 @@ async fn test_flat_chunk_scan_with_row_count_splits(
 async fn test_string_chunks_stay_fine_grained_under_split_cap() -> VortexResult<()> {
     // Default writing targets ~1MiB uncompressed blocks, so ~120-byte strings chunk at a few
     // thousand rows (~8k with today's defaults). These natural boundaries sit far below the
-    // sub-split cap, and SplitBy::Layout must pass them through untouched.
+    // sub-split cap, and SplitBy::LayoutSubSplitting must pass them through untouched.
     let mut ctx = SESSION.create_execution_ctx();
     const N_ROWS: usize = 40_000;
     let strings = VarBinArray::from_iter(
@@ -2462,7 +2590,9 @@ async fn test_string_chunks_stay_fine_grained_under_split_cap() -> VortexResult<
         "expected multiple natural chunks: {splits:?}"
     );
     assert!(
-        splits.iter().all(|r| r.end - r.start < MAX_SPLIT_ROWS / 4),
+        splits
+            .iter()
+            .all(|r| r.end - r.start < DEFAULT_MAX_SPLIT_ROWS / 4),
         "string chunks should stay fine-grained, nowhere near the split cap: {splits:?}"
     );
     assert_eq!(splits.first().map(|r| r.start), Some(0));
@@ -2534,7 +2664,7 @@ async fn dict_probe_honours_configured_compressor() -> VortexResult<()> {
     let mut buf = ByteBufferMut::empty();
     let summary = SESSION
         .write_options()
-        .with_strategy(crate::strategy::WriteStrategyBuilder::default().build())
+        .with_strategy(crate::strategy::WriteStrategyBuilder::from_session(&SESSION).build())
         .write(&mut buf, strings.clone().to_array_stream())
         .await?;
     assert!(
@@ -2543,12 +2673,12 @@ async fn dict_probe_honours_configured_compressor() -> VortexResult<()> {
     );
 
     let no_string_dict =
-        BtrBlocksCompressorBuilder::default().exclude_schemes([StringDictScheme.id()]);
+        BtrBlocksCompressorBuilder::from_session(&SESSION).exclude_schemes([StringDictScheme.id()]);
     let mut buf = ByteBufferMut::empty();
     let summary = SESSION
         .write_options()
         .with_strategy(
-            crate::strategy::WriteStrategyBuilder::default()
+            crate::strategy::WriteStrategyBuilder::from_session(&SESSION)
                 .with_btrblocks_builder(no_string_dict)
                 .build(),
         )
@@ -2570,7 +2700,7 @@ async fn probe_compressor_override_is_independent() -> VortexResult<()> {
     let values: Vec<&str> = (0..n).map(|i| ["alpha", "beta", "gamma"][i % 3]).collect();
     let strings = VarBinArray::from(values).into_array();
 
-    let probe_without_dict = BtrBlocksCompressorBuilder::default()
+    let probe_without_dict = BtrBlocksCompressorBuilder::from_session(&SESSION)
         .exclude_schemes([StringDictScheme.id()])
         .build();
 
@@ -2578,7 +2708,7 @@ async fn probe_compressor_override_is_independent() -> VortexResult<()> {
     let summary = SESSION
         .write_options()
         .with_strategy(
-            crate::strategy::WriteStrategyBuilder::default()
+            crate::strategy::WriteStrategyBuilder::from_session(&SESSION)
                 .with_probe_compressor(probe_without_dict)
                 .build(),
         )
@@ -2786,9 +2916,7 @@ async fn repro_8166_binary_gt_all_ff_max() -> VortexResult<()> {
     );
 
     let file = SESSION.open_options().open_buffer(buf)?;
-    let filter = filter
-        .optimize_recursive(file.dtype())?
-        .bind(file.dtype())?;
+    let filter = filter.bind(file.dtype())?.optimize_recursive()?;
     let result = file
         .scan()?
         .with_filter(filter)

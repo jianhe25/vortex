@@ -3,6 +3,7 @@
 
 use bytes::bytes_dict_builder;
 use primitive::primitive_dict_builder;
+use vortex_buffer::BufferAllocatorRef;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_panic;
@@ -46,15 +47,30 @@ pub trait DictEncoder: Send {
     fn codes_ptype(&self) -> PType;
 }
 
+/// Create a dictionary encoder using the default allocator.
+#[deprecated(note = "use `dict_encoder_in` with an explicit allocator")]
 pub fn dict_encoder(array: &ArrayRef, constraints: &DictConstraints) -> Box<dyn DictEncoder> {
+    dict_encoder_in(
+        array,
+        constraints,
+        BufferAllocatorRef::statically_allocated(),
+    )
+}
+
+/// Create a dictionary encoder using `allocator`.
+pub fn dict_encoder_in(
+    array: &ArrayRef,
+    constraints: &DictConstraints,
+    allocator: BufferAllocatorRef,
+) -> Box<dyn DictEncoder> {
     let dict_builder: Box<dyn DictEncoder> = if let Some(pa) = array.as_opt::<Primitive>() {
         match_each_native_ptype!(pa.ptype(), |P| {
-            primitive_dict_builder::<P>(pa.dtype().nullability(), constraints)
+            primitive_dict_builder::<P>(pa.dtype().nullability(), constraints, allocator)
         })
     } else if let Some(vbv) = array.as_opt::<VarBinView>() {
-        bytes_dict_builder(vbv.dtype().clone(), constraints)
+        bytes_dict_builder(vbv.dtype().clone(), constraints, allocator)
     } else if let Some(vb) = array.as_opt::<VarBin>() {
-        bytes_dict_builder(vb.dtype().clone(), constraints)
+        bytes_dict_builder(vb.dtype().clone(), constraints, allocator)
     } else {
         vortex_panic!("Can only encode primitive or varbin/view arrays")
     };
@@ -69,7 +85,7 @@ pub fn dict_encode_with_constraints(
     constraints: &DictConstraints,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<DictArray> {
-    let encoder = dict_encoder(array, constraints);
+    let encoder = dict_encoder_in(array, constraints, ctx.allocator().clone());
     dict_encode_with_encoder(array, encoder, ctx)
 }
 
@@ -92,12 +108,14 @@ pub fn dict_encode_with_input_byte_limit(
             varbinview.dtype().clone(),
             constraints,
             max_input_bytes,
+            ctx.allocator().clone(),
         )
     } else if let Some(varbin) = array.as_opt::<VarBin>() {
         bytes::bytes_dict_builder_with_input_byte_limit(
             varbin.dtype().clone(),
             constraints,
             max_input_bytes,
+            ctx.allocator().clone(),
         )
     } else {
         vortex_bail!("Input-byte limits require a variable-width array")

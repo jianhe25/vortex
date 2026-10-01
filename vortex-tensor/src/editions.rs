@@ -34,7 +34,7 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         EditionMember::array(&"vortex.tensor.cosine_similarity"),
         EditionMember::array(&"vortex.tensor.inner_product"),
         EditionMember::array(&"vortex.tensor.l2_norm"),
-        EditionMember::array(&"vortex.tensor.normalized"),
+        EditionMember::array(&"vortex.tensor.l2_normalize"),
         EditionMember::dtype(&"vortex.tensor.fixed_shape_tensor"),
         EditionMember::dtype(&"vortex.tensor.vector"),
     ],
@@ -42,14 +42,14 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
 
 #[cfg(test)]
 mod tests {
-    use vortex_edition::EditionError;
     use vortex_edition::EditionSessionExt;
     use vortex_edition::test_harness::validate_edition;
+    use vortex_error::VortexResult;
 
     use super::*;
 
     #[test]
-    fn tensor_edition_is_valid() -> Result<(), EditionError> {
+    fn tensor_edition_is_valid() -> VortexResult<()> {
         let session = vortex_array::array_session();
         crate::initialize(&session);
         validate_edition(&session.editions(), &TENSOR_2026_04)

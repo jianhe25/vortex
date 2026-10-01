@@ -4,6 +4,7 @@
 use std::sync::LazyLock;
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use rand::SeedableRng;
 use rand::prelude::StdRng;
 use vortex_array::Canonical;
@@ -15,6 +16,9 @@ use vortex_array::builders::PrimitiveBuilder;
 use vortex_error::VortexExpect;
 use vortex_fastlanes::bitpack_compress::test_harness::make_array;
 use vortex_session::VortexSession;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     divan::main();
@@ -95,11 +99,13 @@ fn canonical_into_non_nullable(
     bencher
         .with_inputs(|| {
             let chunked = ChunkedArray::from_iter(chunks.clone()).into_array();
-            let primitive_builder = PrimitiveBuilder::<i32>::with_capacity(
+            let ctx = SESSION.create_execution_ctx();
+            let primitive_builder = PrimitiveBuilder::<i32>::with_capacity_in(
                 chunked.dtype().nullability(),
                 chunk_len * chunk_count,
+                ctx.allocator(),
             );
-            (chunked, primitive_builder, SESSION.create_execution_ctx())
+            (chunked, primitive_builder, ctx)
         })
         .bench_refs(|(chunked, primitive_builder, ctx)| {
             chunked
@@ -174,11 +180,13 @@ fn canonical_into_nullable(
     bencher
         .with_inputs(|| {
             let chunked = ChunkedArray::from_iter(chunks.clone()).into_array();
-            let primitive_builder = PrimitiveBuilder::<i32>::with_capacity(
+            let ctx = SESSION.create_execution_ctx();
+            let primitive_builder = PrimitiveBuilder::<i32>::with_capacity_in(
                 chunked.dtype().nullability(),
                 chunk_len * chunk_count,
+                ctx.allocator(),
             );
-            (chunked, primitive_builder, SESSION.create_execution_ctx())
+            (chunked, primitive_builder, ctx)
         })
         .bench_refs(|(chunked, primitive_builder, ctx)| {
             chunked

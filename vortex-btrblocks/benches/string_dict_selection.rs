@@ -13,11 +13,13 @@ mod benchmarks {
     use vortex_array::arrays::VarBinViewArray;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
-    use vortex_btrblocks::BtrBlocksCompressor;
+    use vortex_btrblocks::BtrBlocksCompressorBuilder;
+    use vortex_btrblocks::CompressionSession;
     use vortex_error::VortexExpect;
     use vortex_session::VortexSession;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
+    static SESSION: LazyLock<VortexSession> =
+        LazyLock::new(|| vortex_array::array_session().with::<CompressionSession>());
 
     #[derive(Clone, Copy)]
     enum Distribution {
@@ -140,7 +142,9 @@ mod benchmarks {
     #[divan::bench(args = CASES)]
     fn compress(bencher: Bencher, case: Case) {
         let array = case.make_array();
-        let compressor = BtrBlocksCompressor::default();
+        let compressor = BtrBlocksCompressorBuilder::from_session(&SESSION)
+            .unrestricted()
+            .build();
         bencher
             .with_inputs(|| (&array, SESSION.create_execution_ctx()))
             .input_counter(|(array, _)| ItemsCount::new(array.len()))
@@ -149,7 +153,9 @@ mod benchmarks {
 
     #[divan::bench(args = CASES)]
     fn decompress(bencher: Bencher, case: Case) {
-        let compressor = BtrBlocksCompressor::default();
+        let compressor = BtrBlocksCompressorBuilder::from_session(&SESSION)
+            .unrestricted()
+            .build();
         let mut ctx = SESSION.create_execution_ctx();
         let compressed = compressor
             .compress(&case.make_array(), &mut ctx)
