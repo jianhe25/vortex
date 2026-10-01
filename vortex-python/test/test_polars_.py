@@ -7,6 +7,7 @@ import os
 import polars as pl
 import pyarrow as pa
 import pytest
+from polars.testing import assert_frame_equal
 
 import vortex as vx
 import vortex.expr as ve
@@ -86,5 +87,8 @@ def test_unsigned_predicate_pushdown(tmp_path, arrow_type, threshold):
     )
     path = tmp_path / "unsigned.vortex"
     vx.io.write(vx.array(table), str(path))
-    result = vx.open(str(path)).to_polars().filter(pl.col("value") >= threshold).collect()
+    expr = pl.col("value") >= threshold
+    expected = pl.from_arrow(table).lazy().filter(expr).collect()
+    result = vx.open(str(path)).to_polars().filter(expr).collect()
+    assert_frame_equal(result, expected)
     assert result["id"].to_list() == [1, 2]
