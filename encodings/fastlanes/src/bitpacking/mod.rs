@@ -16,7 +16,6 @@ pub(crate) mod compute;
 mod plugin;
 mod vtable;
 
-pub(crate) use array::uniform_bit_width;
 pub(crate) use plugin::BitPackedPatchedPlugin;
 pub use plugin::BitPackedPlugin;
 pub use vtable::BitPacked;

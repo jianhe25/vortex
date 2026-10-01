@@ -39,7 +39,6 @@ use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::BitPackedArrayExt;
-use crate::BitPackedArraySlotsExt;
 use crate::BitPackedData;
 use crate::BitPackedDataParts;
 use crate::FL_CHUNK_SIZE;
@@ -48,7 +47,6 @@ use crate::bitpack_decompress::unpack_into_primitive_builder;
 use crate::bitpacking::array::BitPackedSlots;
 use crate::bitpacking::array::BitPackedSlotsView;
 use crate::bitpacking::array::PATCH_SLOTS;
-use crate::bitpacking::array::uniform_bit_width;
 use crate::bitpacking::array::uniform_block_offsets;
 use crate::bitpacking::array::validate_block_offsets;
 use crate::bitpacking::vtable::rules::RULES;
@@ -266,7 +264,8 @@ impl BitPacked {
         let len = array.len();
         let patches = array.patches();
         let validity = array.validity().vortex_expect("BitPacked validity");
-        let bit_width = uniform_bit_width(array.block_offsets())
+        let bit_width = array
+            .constant_bit_width()
             .vortex_expect("into_parts requires a constant bit width");
         let data = array.into_data();
         BitPackedDataParts {

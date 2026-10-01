@@ -25,9 +25,7 @@ use vortex_error::VortexResult;
 use super::chunked_indices;
 use crate::BitPacked;
 use crate::BitPackedArrayExt;
-use crate::BitPackedArraySlotsExt;
 use crate::bitpack_decompress;
-use crate::bitpacking::array::uniform_bit_width;
 
 // TODO(connor): This is duplicated in `encodings/fastlanes/src/bitpacking/kernels/mod.rs`.
 /// assuming the buffer is already allocated (which will happen at most once) then unpacking
@@ -87,7 +85,7 @@ fn take_primitive<T: NativePType + BitPacking, I: IntegerPType>(
     }
 
     let offset = array.offset() as usize;
-    let bit_width = uniform_bit_width(array.block_offsets())? as usize;
+    let bit_width = array.uniform_bit_width()? as usize;
 
     let packed = array.packed_slice::<T>();
 

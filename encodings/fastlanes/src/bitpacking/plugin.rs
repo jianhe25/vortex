@@ -36,11 +36,9 @@ use vortex_session::VortexSession;
 use crate::BitPacked;
 use crate::BitPackedArray;
 use crate::BitPackedArrayExt;
-use crate::BitPackedArraySlotsExt;
 use crate::BitPackedData;
 use crate::FL_CHUNK_SIZE;
 use crate::bitpacking::array::BitPackedSlots;
-use crate::bitpacking::array::uniform_bit_width;
 use crate::bitpacking::array::uniform_block_offsets;
 
 #[derive(Clone, prost::Message)]
@@ -74,7 +72,7 @@ impl ArrayPlugin for BitPackedPlugin {
             vortex_err!("BitPacked plugin cannot serialize {}", array.encoding_id())
         })?;
         let metadata = BitPackedMetadata {
-            bit_width: u32::from(uniform_bit_width(view.block_offsets())?),
+            bit_width: u32::from(view.uniform_bit_width()?),
             offset: view.offset() as u32,
             patches: view
                 .patches()
@@ -234,7 +232,7 @@ impl ArrayPlugin for BitPackedPatchedPlugin {
         let packed = bitpacked.packed().clone();
         let ptype = bitpacked.dtype().as_ptype();
         let validity = bitpacked.validity()?;
-        let bw = uniform_bit_width(bitpacked.block_offsets())?;
+        let bw = bitpacked.uniform_bit_width()?;
         let len = bitpacked.len();
         let offset = bitpacked.offset();
 

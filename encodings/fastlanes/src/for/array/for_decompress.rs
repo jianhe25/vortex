@@ -31,10 +31,8 @@ use vortex_error::vortex_err;
 
 use crate::BitPacked;
 use crate::BitPackedArrayExt;
-use crate::BitPackedArraySlotsExt;
 use crate::FL_CHUNK_SIZE;
 use crate::FoRArray;
-use crate::bitpacking::uniform_bit_width;
 use crate::r#for::array::FoRArrayExt;
 use crate::r#for::array::FoRArraySlotsExt;
 use crate::unpack_iter::for_each_packed_chunk;
@@ -290,7 +288,7 @@ fn unpack_chunks<T: PhysicalPType<Physical = T> + UnsignedPType + FoR>(
     output: &mut [MaybeUninit<T>],
 ) -> VortexResult<()> {
     let offset = usize::from(bp.offset());
-    let bit_width = uniform_bit_width(bp.block_offsets())? as usize;
+    let bit_width = bp.uniform_bit_width()? as usize;
     let mut scratch = [const { MaybeUninit::<T>::uninit() }; FL_CHUNK_SIZE];
     for_each_packed_chunk::<T, _>(
         bp.packed_slice::<T>(),

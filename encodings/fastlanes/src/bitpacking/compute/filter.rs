@@ -25,9 +25,7 @@ use super::chunked_indices;
 use super::take::UNPACK_CHUNK_THRESHOLD;
 use crate::BitPacked;
 use crate::BitPackedArrayExt;
-use crate::BitPackedArraySlotsExt;
 use crate::BitPackedData;
-use crate::bitpacking::array::uniform_bit_width;
 
 /// The threshold over which it is faster to fully unpack the entire [`BitPackedArray`](crate::BitPackedArray) and then
 /// filter the result than to unpack only specific bitpacked values into the output buffer.
@@ -118,7 +116,7 @@ fn filter_primitive_without_patches<U: UnsignedPType + BitPacking>(
 ) -> VortexResult<(Buffer<U>, Validity)> {
     let values = filter_with_indices(
         array.data(),
-        uniform_bit_width(array.block_offsets())?,
+        array.uniform_bit_width()?,
         selection.indices(),
     );
     let validity = array

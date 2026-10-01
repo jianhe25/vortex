@@ -15,8 +15,6 @@ use vortex_error::VortexResult;
 
 use crate::BitPacked;
 use crate::bitpacking::array::BitPackedArrayExt;
-use crate::bitpacking::array::BitPackedArraySlotsExt;
-use crate::bitpacking::array::uniform_bit_width;
 
 impl SliceReduce for BitPacked {
     fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
@@ -64,7 +62,7 @@ fn slice_bitpacked(
     let block_start = max(0, offset_start - offset);
     let block_stop = offset_stop.div_ceil(1024) * 1024;
 
-    let bit_width = uniform_bit_width(array.block_offsets())?;
+    let bit_width = array.uniform_bit_width()?;
     let encoded_start = (block_start / 8) * bit_width as usize;
     let encoded_stop = (block_stop / 8) * bit_width as usize;
 

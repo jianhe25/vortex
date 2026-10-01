@@ -83,22 +83,6 @@ pub(crate) fn uniform_block_offsets(bit_width: u8, num_chunks: usize) -> ArrayRe
     .into_array()
 }
 
-/// The bit width shared by every block, or `None` if `offsets` is not a sequence.
-pub(crate) fn constant_bit_width(offsets: &ArrayRef) -> Option<u8> {
-    let step = offsets
-        .as_opt::<Sequence>()?
-        .multiplier()
-        .cast::<u64>()
-        .ok()?;
-    u8::try_from(step / 128).ok()
-}
-
-/// The bit width shared by every block, for code paths that do not support per-block widths yet.
-pub(crate) fn uniform_bit_width(offsets: &ArrayRef) -> VortexResult<u8> {
-    constant_bit_width(offsets)
-        .ok_or_else(|| vortex_err!("BitPacked blocks with different bit widths are not supported"))
-}
-
 /// Check that `offsets` holds `num_blocks + 1` boundaries spanning `packed_len` bytes, each block a
 /// whole number of 128-byte rows of at most 64 bits.
 ///
@@ -352,10 +336,26 @@ pub trait BitPackedArrayExt: BitPackedArraySlotsExt {
         BitPackedData::packed(self)
     }
 
-    /// The bit width shared by every block, or `None` if blocks are packed at different widths.
+    /// The bit width shared by every block, or `None` if block offsets are not a sequence.
     #[inline]
     fn constant_bit_width(&self) -> Option<u8> {
-        constant_bit_width(self.block_offsets())
+        let step = self
+            .block_offsets()
+            .as_opt::<Sequence>()?
+            .multiplier()
+            .cast::<u64>()
+            .ok()?;
+        u8::try_from(step / 128).ok()
+    }
+
+    /// The bit width shared by every block, for code paths that do not support per-block widths yet.
+    ///
+    /// Returns an error if [`Self::constant_bit_width`] is `None`.
+    #[inline]
+    fn uniform_bit_width(&self) -> VortexResult<u8> {
+        self.constant_bit_width().ok_or_else(|| {
+            vortex_err!("BitPacked blocks with different bit widths are not supported")
+        })
     }
 
     /// Calculate the maximum value that **can** be contained by this array, given its constant
@@ -401,7 +401,7 @@ pub trait BitPackedArrayExt: BitPackedArraySlotsExt {
         BitPackedData::unpacked_chunks::<T>(
             self,
             self.as_ref().dtype(),
-            uniform_bit_width(self.block_offsets())?,
+            self.uniform_bit_width()?,
             self.as_ref().len(),
             scratch,
         )
