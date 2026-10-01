@@ -4,9 +4,13 @@
 use rstest::rstest;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 
+use crate::ArrayRef;
+use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::VortexSessionExecute;
+use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnVTableExt;
 use crate::aggregate_fn::EmptyOptions;
 use crate::aggregate_fn::NumericalAggregateOpts;
@@ -14,6 +18,8 @@ use crate::aggregate_fn::fns::is_constant::IsConstant;
 use crate::aggregate_fn::fns::null_count::NullCount;
 use crate::aggregate_fn::fns::sum::Sum;
 use crate::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
+use crate::aggregate_fn::kernels::DynAggregateKernel;
+use crate::aggregate_fn::session::AggregateFnSessionExt;
 use crate::array_session;
 use crate::arrays::ConstantArray;
 use crate::arrays::PrimitiveArray;
@@ -80,6 +86,47 @@ fn errors_do_not_populate_the_cache() {
     assert!(cache.compute_result(&sum, &mut ctx).is_err());
     assert_eq!(cache.get_result(&sum), Precision::Absent);
     assert!(cache.snapshot_results().iter().next().is_none());
+}
+
+#[derive(Debug)]
+struct FailingAfterDependency;
+
+impl DynAggregateKernel for FailingAfterDependency {
+    fn aggregate(
+        &self,
+        _aggregate_fn: &AggregateFnRef,
+        batch: &ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<Scalar>> {
+        batch
+            .aggregations()
+            .compute_result(&NullCount.bind(EmptyOptions), ctx)?;
+        vortex_bail!("Target failed after computing its dependency")
+    }
+}
+
+#[test]
+fn failed_target_preserves_successful_dependency() -> VortexResult<()> {
+    let array = buffer![1i32, 2, 3].into_array();
+    let sum = Sum.bind(NumericalAggregateOpts::skip_nans());
+    let count = NullCount.bind(EmptyOptions);
+    assert_eq!(array.aggregations().get_result(&count), Precision::Absent);
+    let session = array_session();
+    session.aggregate_fns().register_aggregate_kernel(
+        array.encoding_id(),
+        Some(sum.id()),
+        &FailingAfterDependency,
+    );
+    let mut ctx = session.create_execution_ctx();
+
+    assert!(array.aggregations().compute_result(&sum, &mut ctx).is_err());
+    assert_eq!(array.aggregations().get_result(&sum), Precision::Absent);
+    assert_eq!(
+        array.aggregations().get_result(&count),
+        Precision::Exact(0u64.into())
+    );
+    assert_eq!(array.aggregations().snapshot_results().iter().count(), 1);
+    Ok(())
 }
 
 #[test]

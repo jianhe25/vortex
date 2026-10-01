@@ -795,6 +795,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use vortex_buffer::ByteBufferMut;
+    use vortex_buffer::buffer;
     use vortex_error::vortex_ensure;
     use vortex_session::registry::CachedId;
 
@@ -814,9 +815,13 @@ mod tests {
     use crate::array_session;
     use crate::arrays::Primitive;
     use crate::arrays::PrimitiveArray;
+    use crate::arrays::Struct;
+    use crate::arrays::StructArray;
     use crate::arrays::VarBinView;
     use crate::arrays::VarBinViewArray;
+    use crate::arrays::struct_::StructArrayExt;
     use crate::expr::stats::Precision;
+    use crate::validity::Validity;
 
     static SERIALIZER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -979,6 +984,50 @@ mod tests {
         assert!(
             sorted
                 .partial_from_result(decoded.dtype(), &expected_sorted)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recognized_child_node_hints_survive_round_trip() -> VortexResult<()> {
+        let session = array_session();
+        let mut execution = session.create_execution_ctx();
+        let child = buffer![1i32, 2, 3].into_array();
+        let min = Min.bind(NumericalAggregateOpts::skip_nans());
+        let sorted = IsSorted.bind(IsSortedOptions { strict: false });
+        let expected_min = child.aggregations().compute_result(&min, &mut execution)?;
+        let expected_sorted = child
+            .aggregations()
+            .compute_result(&sorted, &mut execution)?;
+        let array = StructArray::try_new(["values"].into(), [child], 3, Validity::NonNullable)?
+            .into_array();
+        let ctx = restricted_context(&[ArrayVTable::id(&Struct), old_primitive_id()]);
+        let serialized = SerializedArray::try_from(serialize_blob(&array, &ctx, &session)?)?;
+        let decoded = serialized.decode(
+            array.dtype(),
+            array.len(),
+            &ReadContext::new(ctx.to_ids()),
+            &session,
+        )?;
+        let decoded_struct = decoded.as_::<Struct>();
+        let decoded_child = decoded_struct.unmasked_field(0);
+
+        assert_eq!(decoded_child.encoding_id(), old_primitive_id());
+        assert_eq!(
+            decoded_child.aggregations().get_result(&min),
+            Precision::Exact(expected_min)
+        );
+        assert_eq!(
+            decoded_child.aggregations().get_result(&sorted),
+            Precision::Exact(expected_sorted)
+        );
+        assert!(
+            decoded
+                .aggregations()
+                .snapshot_results()
+                .iter()
+                .next()
                 .is_none()
         );
         Ok(())
