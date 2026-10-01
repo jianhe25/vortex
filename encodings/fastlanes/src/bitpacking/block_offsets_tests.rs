@@ -11,7 +11,11 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::assert_arrays_eq;
+use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
+use vortex_array::dtype::PType;
+use vortex_array::scalar_fn::fns::cast::CastKernel;
+use vortex_array::scalar_fn::fns::cast::CastReduce;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_sequence::Sequence;
@@ -74,6 +78,25 @@ fn materialized_block_offsets_have_no_constant_width(
             .execute::<PrimitiveArray>(&mut SESSION.create_execution_ctx())
             .is_err()
     );
+    Ok(())
+}
+
+#[rstest]
+#[case::equal_steps(buffer![0u64, 896, 1792, 2688])]
+#[case::different_widths(buffer![0u64, 384, 1408, 2688])]
+fn casts_with_materialized_block_offsets_decline(
+    #[case] offsets: vortex_buffer::Buffer<u64>,
+    #[values(
+        DType::Primitive(PType::U32, Nullability::Nullable),
+        DType::Primitive(PType::U64, Nullability::NonNullable)
+    )]
+    dtype: DType,
+) -> VortexResult<()> {
+    let array = BitPacked::with_block_offsets(uniform()?, offsets.into_array())?;
+    let mut ctx = SESSION.create_execution_ctx();
+
+    assert!(<BitPacked as CastReduce>::cast(array.as_view(), &dtype)?.is_none());
+    assert!(<BitPacked as CastKernel>::cast(array.as_view(), &dtype, &mut ctx)?.is_none());
     Ok(())
 }
 

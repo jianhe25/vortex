@@ -78,6 +78,10 @@ impl CastKernel for BitPacked {
         dtype: &DType,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
+        // Blocks packed at different widths fall back to decoding.
+        if array.constant_bit_width().is_none() {
+            return Ok(None);
+        }
         // Nullability-only change: keep the values bit-packed, just adjust validity.
         if array.dtype().eq_ignore_nullability(dtype) {
             let new_validity =
