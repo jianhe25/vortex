@@ -7,6 +7,7 @@ import os
 import polars as pl
 import pyarrow as pa
 import pytest
+from polars.testing import assert_frame_equal
 
 import vortex as vx
 import vortex.expr as ve
@@ -73,8 +74,18 @@ def test_to_polars_with_projection_and_filter(vxf: vx.VortexFile) -> None:
     assert len(df) == 100
 
 
-def test_polars_boolean_xor():
-    frame = pl.DataFrame({"x": [True, True, False, None], "y": [True, False, None, True]})
+def test_polars_boolean_xor(tmp_path):
+    frame = pl.DataFrame(
+        {
+            "id": list(range(9)),
+            "x": [False, False, True, True, None, None, None, True, False],
+            "y": [False, True, False, True, False, True, None, None, None],
+        }
+    )
     expr = pl.col("x") ^ pl.col("y")
-    actual = vx.array(frame.to_arrow()).apply(polars_to_vortex(expr)).to_arrow_array()
-    assert actual.equals(frame.select(expr).to_series().to_arrow())
+    path = tmp_path / "boolean_xor.vortex"
+    vx.io.write(vx.array(frame.to_arrow()), str(path))
+    expected_frame = frame.lazy().filter(expr).collect()
+    actual = vx.open(str(path)).to_polars().filter(expr).collect()
+    assert_frame_equal(actual, expected_frame)
+    assert actual["id"].to_list() == [1, 2]
