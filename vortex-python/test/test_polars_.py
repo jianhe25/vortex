@@ -71,3 +71,10 @@ def test_to_polars_with_projection_and_filter(vxf: vx.VortexFile) -> None:
     df = vxf.to_polars().select("index", "value").filter(pl.col("index") < 100).collect()
     assert df.columns == ["index", "value"]
     assert len(df) == 100
+
+
+def test_polars_struct_field():
+    frame = pl.DataFrame({"x": [{"a": 1}, None, {"a": 3}]})
+    expr = pl.col("x").struct.field("a")
+    actual = vx.array(frame.to_arrow()).apply(polars_to_vortex(expr)).to_arrow_array()
+    assert actual.equals(frame.select(expr).to_series().to_arrow())
