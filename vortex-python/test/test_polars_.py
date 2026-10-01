@@ -7,6 +7,7 @@ import os
 import polars as pl
 import pyarrow as pa
 import pytest
+from polars.testing import assert_frame_equal
 
 import vortex as vx
 import vortex.expr as ve
@@ -73,8 +74,12 @@ def test_to_polars_with_projection_and_filter(vxf: vx.VortexFile) -> None:
     assert len(df) == 100
 
 
-def test_polars_fill_null():
-    frame = pl.DataFrame({"x": [1, None, None], "y": [4, 5, None]})
-    expr = pl.col("x").fill_null(pl.col("y"))
-    actual = vx.array(frame.to_arrow()).apply(polars_to_vortex(expr)).to_arrow_array()
-    assert actual.equals(frame.select(expr).to_series().to_arrow())
+def test_polars_fill_null(tmp_path):
+    frame = pl.DataFrame({"id": [0, 1, 2, 3], "x": [1, None, None, 5], "y": [4, 5, None, 6]})
+    expr = pl.col("x").fill_null(pl.col("y")) == 5
+    path = tmp_path / "fill_null.vortex"
+    vx.io.write(vx.array(frame.to_arrow()), str(path))
+    expected_frame = frame.lazy().filter(expr).collect()
+    actual = vx.open(str(path)).to_polars().filter(expr).collect()
+    assert_frame_equal(actual, expected_frame)
+    assert actual["id"].to_list() == [1, 3]
