@@ -26,7 +26,6 @@ use crate::aggregate_fn::fns::min_max::MinMax;
 use crate::aggregate_fn::fns::min_max::MinMaxResult;
 use crate::aggregate_fn::fns::min_max::make_minmax_dtype;
 use crate::arrays::PrimitiveArray;
-use crate::builtins::ArrayBuiltins;
 use crate::dtype::Nullability;
 use crate::expr::stats::Precision;
 use crate::scalar::Scalar;
@@ -68,11 +67,13 @@ impl ArrayInput {
         let input = Self::new(PrimitiveArray::new(positions, Validity::NonNullable).into_array())
             .with_cache_mode(mode);
         input.record_bounds(bounds.as_ref(), true)?;
-        input
-            .inner
-            .verified_bounds
-            .set(VerifiedIntegerBounds::from_producer(bounds))
-            .ok();
+        if mode != AggregateCacheMode::Disabled {
+            input
+                .inner
+                .verified_bounds
+                .set(VerifiedIntegerBounds::from_producer(bounds))
+                .ok();
+        }
         input.record_sorted(true)?;
         Ok(input)
     }
@@ -111,8 +112,13 @@ impl ArrayInput {
     /// Validate canonical integer values once for checked casts that require value-range proof.
     ///
     /// This scans actual valid values without registered aggregate kernels. Unsupported encodings
-    /// and noninteger inputs return an error. Null slots do not participate in the proof.
+    /// and noninteger inputs return an error. Null slots do not participate in the proof. Enabled
+    /// modes retain the proof. Disabled mode validates on each call and retains no facts.
     pub fn validate_integer_bounds(&self, ctx: &mut ExecutionCtx) -> VortexResult<()> {
+        if self.cache_mode == AggregateCacheMode::Disabled {
+            VerifiedIntegerBounds::validate(self.array(), ctx)?;
+            return Ok(());
+        }
         if self.inner.verified_bounds.get().is_none() {
             let proof = VerifiedIntegerBounds::validate(self.array(), ctx)?;
             self.record_bounds(proof.values(), true)?;
@@ -169,7 +175,7 @@ impl ArrayInput {
                 let dtype = make_minmax_dtype(self.array().dtype());
                 let result = bounds.map_or_else(
                     || Scalar::null(dtype.clone()),
-                    |b| Scalar::struct_(dtype, vec![b.min.clone(), b.max.clone()]),
+                    |b| Scalar::struct_(dtype.clone(), vec![b.min.clone(), b.max.clone()]),
                 );
                 self.record_result(MinMax.bind(options), Precision::Exact(result))?;
             }
@@ -193,7 +199,7 @@ impl ArrayInput {
 
     fn subset(&self, array: ArrayRef) -> VortexResult<Self> {
         let output = Self::new(array).with_cache_mode(self.cache_mode);
-        if !self.array().dtype().is_int() {
+        if self.cache_mode == AggregateCacheMode::Disabled || !self.array().dtype().is_int() {
             return Ok(output);
         }
         if output.array().is_empty() {
@@ -227,18 +233,17 @@ impl ArrayInput {
                 output.record_result(aggregate.clone(), result.clone())?;
             } else if aggregate.is::<MinMax>()
                 && let Precision::Exact(value) = result
+                && let Some(bounds) = MinMaxResult::from_scalar(value.clone())?
             {
-                if let Some(bounds) = MinMaxResult::from_scalar(value.clone())? {
-                    let options = *aggregate.as_::<MinMax>();
-                    output.record_result(
-                        Min.bind(options),
-                        Precision::Inexact(bounds.min.into_nullable()),
-                    )?;
-                    output.record_result(
-                        Max.bind(options),
-                        Precision::Inexact(bounds.max.into_nullable()),
-                    )?;
-                }
+                let options = *aggregate.as_::<MinMax>();
+                output.record_result(
+                    Min.bind(options),
+                    Precision::Inexact(bounds.min.into_nullable()),
+                )?;
+                output.record_result(
+                    Max.bind(options),
+                    Precision::Inexact(bounds.max.into_nullable()),
+                )?;
             }
         }
         if let Some(proof) = self.verified_bounds() {

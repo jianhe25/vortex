@@ -103,15 +103,14 @@ impl ExecutionCtx {
                 if let Precision::Exact(result) = array.aggregations().get_result(aggregate) {
                     return Ok(result);
                 }
-                if let Some(input) = self.aggregate_input(array).cloned() {
-                    if let Some(result) =
+                if let Some(input) = self.aggregate_input(array).cloned()
+                    && let Some(result) =
                         input.aggregations().finalize_retained_result(aggregate)?
-                    {
-                        array
-                            .aggregations()
-                            .insert_result(aggregate.clone(), Precision::Exact(result.clone()))?;
-                        return Ok(result);
-                    }
+                {
+                    array
+                        .aggregations()
+                        .insert_result(aggregate.clone(), Precision::Exact(result.clone()))?;
+                    return Ok(result);
                 }
                 array.aggregations().compute_result(aggregate, self)
             }

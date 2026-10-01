@@ -416,7 +416,7 @@ fn tracked_rows<const KIND: u64>(
 ) -> AggregateFn<TrackedRows<KIND>> {
     AggregateFn::new(
         TrackedRows {
-            calls: calls.clone(),
+            calls: Arc::clone(calls),
             fail,
         },
         NumericalAggregateOpts::skip_nans(),

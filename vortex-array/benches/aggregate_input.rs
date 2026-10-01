@@ -37,6 +37,7 @@ use vortex_array::input::AggregateCacheMode;
 use vortex_array::input::ArrayInput;
 use vortex_array::validity::Validity;
 use vortex_buffer::Buffer;
+use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 
 #[global_allocator]
@@ -218,7 +219,7 @@ fn bench_cast(bencher: Bencher, args: BenchArgs, target: DType, preparation: Pre
             assert_arrays_eq!(result, expected, &mut ctx);
             assert_eq!(result.buffer::<i32>().as_ptr(), values.as_ptr());
         }
-        _ => panic!("Cast fixtures require primitive or decimal output"),
+        _ => vortex_panic!("Cast fixtures require primitive or decimal output"),
     }
 
     match preparation {

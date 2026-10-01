@@ -151,7 +151,6 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::arrays::dict::TakeExecute;
     use vortex_array::assert_arrays_eq;
     use vortex_error::VortexResult;
     use vortex_mask::Mask;

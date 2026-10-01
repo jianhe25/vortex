@@ -19,7 +19,9 @@ use crate::VortexSessionExecute;
 use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::AggregateFnVTableExt;
+use crate::aggregate_fn::EmptyOptions;
 use crate::aggregate_fn::NumericalAggregateOpts;
+use crate::aggregate_fn::fns::is_constant::IsConstant;
 use crate::aggregate_fn::fns::is_sorted::IsSorted;
 use crate::aggregate_fn::fns::is_sorted::IsSortedOptions;
 use crate::aggregate_fn::fns::max::Max;
@@ -335,5 +337,22 @@ fn nullable_cast_does_not_populate_validity_array_cache(
             .get_result(&Min.bind(NumericalAggregateOpts::skip_nans())),
         Precision::Absent
     );
+    Ok(())
+}
+
+#[rstest]
+#[case(AggregateCacheMode::Array)]
+#[case(AggregateCacheMode::Input)]
+#[case(AggregateCacheMode::Disabled)]
+fn an_empty_slice_does_not_inherit_constantness(
+    #[case] mode: AggregateCacheMode,
+) -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let input = ArrayInput::new(buffer![7i32, 7].into_array()).with_cache_mode(mode);
+    let constant = IsConstant.bind(EmptyOptions);
+    assert_eq!(input.compute_result(&constant, &mut ctx)?, true.into());
+    let empty = input.slice(0..0)?;
+    assert_eq!(empty.get_result(&constant), Precision::Absent);
+    assert_eq!(empty.compute_result(&constant, &mut ctx)?, false.into());
     Ok(())
 }

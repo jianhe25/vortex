@@ -32,6 +32,8 @@ use crate::expr::stats::Precision;
 use crate::scalar::Scalar;
 use crate::stats::AggregateResults;
 
+type CachedResults = Vec<(AggregateFnRef, Precision<Scalar>)>;
+
 /// Shared aggregate results and optional typed partial states for one immutable input.
 ///
 /// Keys include the function and all of its options. Cloning this handle shares its cache; only

@@ -85,7 +85,7 @@ impl AggregationsRef<'_> {
             .iter()
             .find_map(|entry| {
                 (&entry.aggregate == aggregate && entry.retained.matches_vtable(aggregate))
-                    .then(|| entry.retained.clone())
+                    .then(|| Arc::clone(&entry.retained))
             });
         retained.map(|partial| partial.finalize()).transpose()
     }
@@ -121,7 +121,7 @@ impl AggregationsRef<'_> {
             vtable: aggregate.vtable().clone(),
             options: aggregate.options().clone(),
             dtypes,
-            partial: partial.clone(),
+            partial: Arc::clone(&partial),
         });
 
         let mut entries = self.aggregations.entries.write();
@@ -166,5 +166,5 @@ where
                 && entry.aggregate.as_opt::<V>() == Some(aggregate.options())
         })
         .and_then(|entry| entry.retained.as_any().downcast_ref::<RetainedPartial<V>>())
-        .map(|retained| retained.partial.clone())
+        .map(|retained| Arc::clone(&retained.partial))
 }
