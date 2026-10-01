@@ -163,6 +163,37 @@ fn empty_and_zero_width_offsets() -> VortexResult<()> {
     Ok(())
 }
 
+#[rstest]
+#[case::sequence(sequence(128, 512, 3))]
+#[case::equal_steps(Ok(buffer![128u64, 640, 1152].into_array()))]
+#[case::different_widths(Ok(buffer![128u64, 512, 1152].into_array()))]
+fn into_parts_preserves_block_offsets(#[case] offsets: VortexResult<ArrayRef>) -> VortexResult<()> {
+    let offsets = offsets?;
+    let array = BitPacked::try_new_with_block_offsets(
+        BufferHandle::new_host(ByteBuffer::zeroed(1024)),
+        PType::U32,
+        Validity::NonNullable,
+        None,
+        offsets.clone(),
+        1500,
+        17,
+    )?;
+    let parts = BitPacked::into_parts(array);
+    let rebuilt = BitPacked::try_new_with_block_offsets(
+        parts.packed,
+        PType::U32,
+        parts.validity,
+        parts.patches,
+        parts.block_offsets,
+        parts.len,
+        parts.offset,
+    )?;
+    assert!(ArrayRef::ptr_eq(&offsets, rebuilt.block_offsets()));
+    assert_eq!(rebuilt.len(), 1500);
+    assert_eq!(rebuilt.offset(), 17);
+    Ok(())
+}
+
 #[cfg(target_pointer_width = "64")]
 #[test]
 fn block_offsets_from_constant_bit_width_reject_end_overflow() {

@@ -92,12 +92,12 @@ impl Scheme for BitPackingScheme {
         let array = if use_experimental_patches() {
             let patches = parts.patches.take();
             // Transpose patches into G-ALP style PatchedArray, wrapping an inner BitPackedArray.
-            let array = BitPacked::try_new(
+            let array = BitPacked::try_new_with_block_offsets(
                 parts.packed,
                 ptype,
                 parts.validity,
                 None,
-                parts.bit_width,
+                parts.block_offsets,
                 parts.len,
                 parts.offset,
             )?
@@ -117,12 +117,12 @@ impl Scheme for BitPackingScheme {
                 .map(|p| compress_patches(p, exec_ctx))
                 .transpose()?;
             parts.patches = patches;
-            BitPacked::try_new(
+            BitPacked::try_new_with_block_offsets(
                 parts.packed,
                 ptype,
                 parts.validity,
                 parts.patches,
-                parts.bit_width,
+                parts.block_offsets,
                 parts.len,
                 parts.offset,
             )?

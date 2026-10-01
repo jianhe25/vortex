@@ -84,12 +84,12 @@ impl_bench_int!(u8, u16, u32, u64, i8, i16, i32, i64);
 fn page_aligned(array: BitPackedArray) -> BitPackedArray {
     let ptype = array.dtype().as_ptype();
     let parts = BitPacked::into_parts(array);
-    BitPacked::try_new(
+    BitPacked::try_new_with_block_offsets(
         parts.packed.ensure_aligned(Alignment::new(4096)).unwrap(),
         ptype,
         parts.validity,
         parts.patches,
-        parts.bit_width,
+        parts.block_offsets,
         parts.len,
         parts.offset,
     )

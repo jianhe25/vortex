@@ -165,17 +165,16 @@ where
     A: BitPackedUnpack + NativePType + DeviceRepr + Send + Sync + 'static,
     A::Physical: DeviceRepr + Send + Sync + 'static,
 {
-    vortex_ensure!(
-        array.constant_bit_width_opt().is_some(),
-        "CUDA does not support BitPacked blocks with different bit widths"
-    );
+    let bit_width = array.constant_bit_width_opt().ok_or_else(|| {
+        vortex_err!("CUDA does not support BitPacked blocks with different bit widths")
+    })?;
     let BitPackedDataParts {
         offset,
-        bit_width,
         len,
         packed,
         patches,
         validity,
+        ..
     } = BitPacked::into_parts(array);
 
     vortex_ensure!(len > 0, "Non empty array");
