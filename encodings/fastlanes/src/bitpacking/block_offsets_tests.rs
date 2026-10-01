@@ -11,11 +11,14 @@ use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::assert_arrays_eq;
+use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
 use vortex_array::scalar_fn::fns::cast::CastKernel;
 use vortex_array::scalar_fn::fns::cast::CastReduce;
+use vortex_array::validity::Validity;
+use vortex_buffer::ByteBuffer;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_sequence::Sequence;
@@ -47,6 +50,18 @@ fn uniform() -> VortexResult<BitPackedArray> {
     encode(&(0..3000u32).map(|i| i % 128).collect::<Vec<_>>())
 }
 
+fn with_block_offsets(array: &BitPackedArray, offsets: ArrayRef) -> VortexResult<BitPackedArray> {
+    BitPacked::try_new_with_block_offsets(
+        array.packed().clone(),
+        array.dtype().as_ptype(),
+        array.validity()?,
+        array.patches(),
+        offsets,
+        array.len(),
+        array.offset(),
+    )
+}
+
 #[test]
 fn uniform_block_offsets_are_a_sequence() -> VortexResult<()> {
     let mut ctx = SESSION.create_execution_ctx();
@@ -59,7 +74,7 @@ fn uniform_block_offsets_are_a_sequence() -> VortexResult<()> {
         buffer![0u64, 896, 1792, 2688].into_array(),
         &mut ctx
     );
-    let rebased = BitPacked::with_block_offsets(uniform.clone(), sequence(128, 896, 4)?)?;
+    let rebased = with_block_offsets(&uniform, sequence(128, 896, 4)?)?;
     assert_eq!(rebased.constant_bit_width_opt(), Some(7));
     assert_arrays_eq!(uniform, rebased, &mut ctx);
     Ok(())
@@ -71,7 +86,7 @@ fn uniform_block_offsets_are_a_sequence() -> VortexResult<()> {
 fn materialized_block_offsets_have_no_constant_width(
     #[case] offsets: vortex_buffer::Buffer<u64>,
 ) -> VortexResult<()> {
-    let array = BitPacked::with_block_offsets(uniform()?, offsets.into_array())?;
+    let array = with_block_offsets(&uniform()?, offsets.into_array())?;
     assert_eq!(array.constant_bit_width_opt(), None);
     assert!(array.constant_bit_width().is_err());
     // Decoding per-block widths is not supported yet.
@@ -95,7 +110,7 @@ fn casts_with_materialized_block_offsets_decline(
     )]
     dtype: DType,
 ) -> VortexResult<()> {
-    let array = BitPacked::with_block_offsets(uniform()?, offsets.into_array())?;
+    let array = with_block_offsets(&uniform()?, offsets.into_array())?;
     let mut ctx = SESSION.create_execution_ctx();
 
     assert!(<BitPacked as CastReduce>::cast(array.as_view(), &dtype)?.is_none());
@@ -113,7 +128,23 @@ fn casts_with_materialized_block_offsets_decline(
 #[case::wrong_ptype(Ok(Sequence::try_new_typed(0u32, 896, Nullability::NonNullable, 4)?.into_array()))]
 #[case::nullable(Ok(Sequence::try_new_typed(0u64, 896, Nullability::Nullable, 4)?.into_array()))]
 fn invalid_block_offsets_are_rejected(#[case] offsets: VortexResult<ArrayRef>) -> VortexResult<()> {
-    assert!(BitPacked::with_block_offsets(uniform()?, offsets?).is_err());
+    assert!(with_block_offsets(&uniform()?, offsets?).is_err());
+    Ok(())
+}
+
+#[test]
+fn construct_blocks_without_a_uniform_width() -> VortexResult<()> {
+    // Two blocks at widths 3 and 4 occupy 896 bytes, which no constant width can represent.
+    let array = BitPacked::try_new_with_block_offsets(
+        BufferHandle::new_host(ByteBuffer::zeroed(896)),
+        PType::U32,
+        Validity::NonNullable,
+        None,
+        buffer![0u64, 384, 896].into_array(),
+        2048,
+        0,
+    )?;
+    assert_eq!(array.constant_bit_width_opt(), None);
     Ok(())
 }
 

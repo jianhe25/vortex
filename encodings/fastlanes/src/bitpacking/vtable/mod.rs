@@ -219,6 +219,7 @@ impl VTable for BitPacked {
 pub struct BitPacked;
 
 impl BitPacked {
+    /// Construct a bit-packed array whose blocks all use `bit_width`.
     pub fn try_new(
         packed: BufferHandle,
         ptype: PType,
@@ -228,31 +229,41 @@ impl BitPacked {
         len: usize,
         offset: u16,
     ) -> VortexResult<BitPackedArray> {
+        let num_chunks = (len + offset as usize).div_ceil(FL_CHUNK_SIZE);
+        Self::try_new_with_block_offsets(
+            packed,
+            ptype,
+            validity,
+            patches,
+            block_offsets_from_constant_bit_width(bit_width, num_chunks)?,
+            len,
+            offset,
+        )
+    }
+
+    /// Construct a bit-packed array from packed data and explicit block byte boundaries.
+    ///
+    /// `block_offsets` must be non-nullable `u64` with one boundary per block and a trailing end
+    /// boundary. Each block's bit width is derived from the distance between its boundaries.
+    pub fn try_new_with_block_offsets(
+        packed: BufferHandle,
+        ptype: PType,
+        validity: Validity,
+        patches: Option<Patches>,
+        block_offsets: ArrayRef,
+        len: usize,
+        offset: u16,
+    ) -> VortexResult<BitPackedArray> {
         let dtype = DType::Primitive(ptype, validity.nullability());
         let slots = {
             let mut s = ArraySlots::with_capacity(BitPackedSlots::COUNT);
             PatchesData::push_slots(&mut s, patches.as_ref());
             s.push(validity_to_child(&validity, len));
-            let num_chunks = (len + offset as usize).div_ceil(FL_CHUNK_SIZE);
-            s.push(Some(block_offsets_from_constant_bit_width(bit_width, num_chunks)?));
+            s.push(Some(block_offsets));
             s
         };
         let data = BitPackedData::try_new(packed, patches, offset)?;
         Array::try_from_parts(ArrayParts::new(BitPacked, dtype, len, data).with_slots(slots))
-    }
-
-    /// Replace the byte boundaries of the packed blocks.
-    pub fn with_block_offsets(
-        array: BitPackedArray,
-        table: ArrayRef,
-    ) -> VortexResult<BitPackedArray> {
-        let mut slots: ArraySlots = array.slots().iter().cloned().collect();
-        slots[BitPackedSlots::BLOCK_OFFSETS] = Some(table);
-        let dtype = array.dtype().clone();
-        let len = array.len();
-        Array::try_from_parts(
-            ArrayParts::new(BitPacked, dtype, len, array.into_data()).with_slots(slots),
-        )
     }
 
     /// Split the array into its parts.
