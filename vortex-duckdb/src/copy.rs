@@ -351,7 +351,7 @@ mod tests {
             let mut buf = ByteBufferMut::empty();
             let mut writer = SESSION
                 .write_options()
-                .with_file_aggregates(file_aggregates)
+                .with_file_statistics(file_aggregates)
                 .writer(&mut buf, array.dtype().clone());
             writer.push(array).await?;
             writer.finish().await

@@ -24,7 +24,7 @@ use crate::stats::Aggregations;
 
 #[test]
 fn known_results_remain_distinct_from_missing() -> VortexResult<()> {
-    let array = buffer![1i32, 2].into_array();
+    let array = buffer![i64::MAX, 1i64].into_array();
     let store = Aggregations::default();
     let cache = store.to_ref(&array);
     let count = NullCount.bind(EmptyOptions);
