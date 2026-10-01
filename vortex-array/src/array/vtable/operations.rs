@@ -25,23 +25,32 @@ pub trait OperationsVTable<V: VTable> {
     /// handles. Use `()` when no state is needed.
     type ProbeState: Default + 'static;
 
-    /// Read the non-null scalar at `index` of the array in `state`.
+    /// Read the scalar at `index` of the array in `state`, including its nullness.
     ///
-    /// Caller must check bounds and validity before calling this function and
-    /// ensure target row is non-NULL.
+    /// Bounds have been checked; the row may be null, and a null row must come back as
+    /// `Scalar::null` of the array's dtype. Resolving nullness is the encoding's job so that a
+    /// wrapper reading through a child walks the tree once: the child's scalar already carries
+    /// its nullness, and the wrapper passes it through. An encoding that holds its own validity
+    /// checks the row through [`ProbeState::is_valid`], which a repeated read resolves once and
+    /// keeps.
+    ///
     /// `state` carries the typed view of the array and, for a read through a
     /// [`RepeatedArrayProbe`](crate::RepeatedArrayProbe), the state that probe keeps. Read
     /// children through [`ProbeState::slot`], which follows the read's policy without the
-    /// encoding having to know it. Take encoding state from [`ProbeState::retained`]. The scalar must retain the source's
-    /// logical dtype, including nullability.
+    /// encoding having to know it. Take encoding state from [`ProbeState::retained`]. The scalar
+    /// must retain the source's logical dtype, including nullability.
     ///
-    /// The default preserves the existing scalar path without adding caching.
+    /// The default checks validity and then reads through [`Self::scalar_at`], so migrating an
+    /// encoding to `probe_scalar` also takes over the null check.
     fn probe_scalar(
         state: &mut ProbeState<'_, V>,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
         // FIXME: Remove this default once all encodings have migrated to probe_scalar.
+        if !state.is_valid(index, ctx)? {
+            return Ok(Scalar::null(state.array().dtype().clone()));
+        }
         Self::scalar_at(state.array(), index, ctx)
     }
 
@@ -50,8 +59,11 @@ pub trait OperationsVTable<V: VTable> {
     ///
     /// ## Preconditions
     ///
-    /// Bounds-checking has already been performed by the time this function is called,
-    /// and the index is guaranteed to be non-null. Implementations may assume `index < len`.
+    /// Bounds-checking has already been performed by the time this function is called, and the
+    /// default [`Self::probe_scalar`] calls this only for a valid row, so an encoding that keeps
+    /// the default may assume the row is non-null. An encoding that overrides `probe_scalar` and
+    /// delegates `scalar_at` to it resolves nullness there instead. Implementations may assume
+    /// `index < len`.
     ///
     /// ## Postconditions
     ///
@@ -65,6 +77,14 @@ pub trait OperationsVTable<V: VTable> {
 
 impl<V: VTable> OperationsVTable<V> for NotSupported {
     type ProbeState = ();
+
+    fn probe_scalar(
+        state: &mut ProbeState<'_, V>,
+        index: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        Self::scalar_at(state.array(), index, ctx)
+    }
 
     fn scalar_at(
         array: ArrayView<'_, V>,
