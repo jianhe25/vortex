@@ -32,6 +32,10 @@ from vortex.polars_ import polars_to_vortex
         #         & (ve.column("SearchPhrase") != "")
         #     ),
         # ),
+        (
+            pl.col("x").is_between(pl.col("l"), pl.col("u"), closed="none"),
+            (ve.column("x") > ve.column("l")) & (ve.column("x") < ve.column("u")),
+        ),
         (pl.col("c") > 10000, ve.column("c") > 10000),
         #        (pl.col("EventDate") >= date(2013, 7, 1), ve.column("EventDate") >= date(2013, 7, 1)),
     ],
