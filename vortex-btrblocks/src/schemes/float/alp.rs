@@ -115,13 +115,18 @@ impl Scheme for ALPScheme {
             ALP::new(compressed_alp_ints, exponents, patches).into_array()
         };
 
-        for (aggregate, result) in alp_stats.iter() {
-            if aggregate.is_representation_invariant() {
-                // SAFETY: recompressing ALP integers and patches preserves values and null positions.
-                unsafe {
-                    array
-                        .aggregations()
-                        .seed_result(aggregate.clone(), result.clone())?;
+        if alp_encoded.as_array().dtype() == array.dtype()
+            && alp_encoded.as_array().len() == array.len()
+        {
+            for (aggregate, result) in alp_stats.iter() {
+                if aggregate.is_representation_invariant() {
+                    // SAFETY: recompressing ALP integers and patches preserves values and null
+                    // positions at the same dtype and length.
+                    unsafe {
+                        array
+                            .aggregations()
+                            .seed_result(aggregate.clone(), result.clone())?;
+                    }
                 }
             }
         }

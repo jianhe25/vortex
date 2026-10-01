@@ -98,13 +98,16 @@ pub fn bitpack_encode(
         array.len(),
         0,
     )?;
-    for (aggregate, result) in array.aggregations().snapshot_results().iter() {
-        if aggregate.is_representation_invariant() {
-            // SAFETY: bitpacking preserves every logical value and the null positions.
-            unsafe {
-                bitpacked
-                    .aggregations()
-                    .seed_result(aggregate.clone(), result.clone())?;
+    if array.dtype() == bitpacked.dtype() && array.len() == bitpacked.len() {
+        for (aggregate, result) in array.aggregations().snapshot_results().iter() {
+            if aggregate.is_representation_invariant() {
+                // SAFETY: bitpacking preserves logical values and null positions
+                // at the same dtype and length.
+                unsafe {
+                    bitpacked
+                        .aggregations()
+                        .seed_result(aggregate.clone(), result.clone())?;
+                }
             }
         }
     }
@@ -137,13 +140,16 @@ pub unsafe fn bitpack_encode_unchecked(
         0,
     )
     .vortex_expect("bitpacked array construction should succeed");
-    for (aggregate, result) in arr_ref.aggregations().snapshot_results().iter() {
-        if aggregate.is_representation_invariant() {
-            // SAFETY: bitpacking preserves every logical value and the null positions.
-            unsafe {
-                bitpacked
-                    .aggregations()
-                    .seed_result(aggregate.clone(), result.clone())?;
+    if arr_ref.dtype() == bitpacked.dtype() && arr_ref.len() == bitpacked.len() {
+        for (aggregate, result) in arr_ref.aggregations().snapshot_results().iter() {
+            if aggregate.is_representation_invariant() {
+                // SAFETY: bitpacking preserves logical values and null positions
+                // at the same dtype and length.
+                unsafe {
+                    bitpacked
+                        .aggregations()
+                        .seed_result(aggregate.clone(), result.clone())?;
+                }
             }
         }
     }

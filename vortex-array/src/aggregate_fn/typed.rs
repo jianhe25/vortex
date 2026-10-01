@@ -116,10 +116,23 @@ impl<V: AggregateFnVTable> DynAggregateFn for AggregateFnInner<V> {
             dtypes.return_dtype,
             result.dtype()
         );
-        self.vtable
+        let Some(partial) = self
+            .vtable
             .partial_from_result(dtypes.args(&self.options), result.clone())?
-            .map(|partial| self.vtable.to_scalar(dtypes.args(&self.options), &partial))
-            .transpose()
+        else {
+            return Ok(None);
+        };
+        let state = self
+            .vtable
+            .to_scalar(dtypes.args(&self.options), &partial)?;
+        vortex_ensure!(
+            state.dtype() == &dtypes.partial_dtype,
+            "Aggregate {} requires partial dtype {}, got {}",
+            self.id(),
+            dtypes.partial_dtype,
+            state.dtype()
+        );
+        Ok(Some(state))
     }
 
     fn state_dtype(&self, input_dtype: &DType) -> Option<DType> {

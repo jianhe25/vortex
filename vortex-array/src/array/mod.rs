@@ -492,7 +492,9 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
                 );
             }
 
-            result.array().aggregations().inherit_results(&stats);
+            if result.array().dtype() == &dtype && result.array().len() == len {
+                result.array().aggregations().inherit_results(&stats);
+            }
         }
 
         Ok(result)

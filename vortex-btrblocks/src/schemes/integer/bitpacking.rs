@@ -86,7 +86,9 @@ impl Scheme for BitPackingScheme {
         let packed = bitpack_encode(&primitive_array, bw, Some(&histogram), exec_ctx)?;
 
         let packed_stats = packed.aggregations().snapshot_results();
-        let ptype = packed.dtype().as_ptype();
+        let packed_dtype = packed.dtype().clone();
+        let packed_len = packed.len();
+        let ptype = packed_dtype.as_ptype();
         let mut parts = BitPacked::into_parts(packed);
 
         let array = if use_experimental_patches() {
@@ -127,13 +129,16 @@ impl Scheme for BitPackingScheme {
             .into_array()
         };
 
-        for (aggregate, result) in packed_stats.iter() {
-            if aggregate.is_representation_invariant() {
-                // SAFETY: recompressing and relocating patches preserves values and null positions.
-                unsafe {
-                    array
-                        .aggregations()
-                        .seed_result(aggregate.clone(), result.clone())?;
+        if &packed_dtype == array.dtype() && packed_len == array.len() {
+            for (aggregate, result) in packed_stats.iter() {
+                if aggregate.is_representation_invariant() {
+                    // SAFETY: recompressing and relocating patches preserves values and null
+                    // positions at the same dtype and length.
+                    unsafe {
+                        array
+                            .aggregations()
+                            .seed_result(aggregate.clone(), result.clone())?;
+                    }
                 }
             }
         }

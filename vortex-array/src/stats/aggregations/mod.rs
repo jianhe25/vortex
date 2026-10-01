@@ -202,26 +202,12 @@ impl AggregationsRef<'_> {
         if !Arc::ptr_eq(&self.aggregations.entries, &source.aggregations.entries) {
             // Release the source lock before locking the destination. Opposite concurrent
             // inherit operations must not acquire both stores in opposite orders.
-            let mut results = source.snapshot_results();
-            if self.array.dtype() != source.array.dtype() {
-                results = AggregateResults::from_validated(
-                    results
-                        .iter()
-                        .filter(|(aggregate, result)| {
-                            aggregate
-                                .return_dtype(self.array.dtype())
-                                .is_some_and(|dtype| {
-                                    result
-                                        .as_ref()
-                                        .into_inner()
-                                        .is_none_or(|value| value.dtype() == &dtype)
-                                })
-                        })
-                        .map(|(aggregate, result)| (aggregate.clone(), result.clone()))
-                        .collect(),
-                );
+            // An aggregate may depend on input nullability even when its result dtype does not.
+            // A dtype-changing reduction can execute, but it cannot inherit generic results.
+            if self.array.dtype() == source.array.dtype() {
+                self.aggregations
+                    .inherit_results(&source.snapshot_results());
             }
-            self.aggregations.inherit_results(&results);
         }
         Ok(())
     }

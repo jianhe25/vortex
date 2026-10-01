@@ -615,7 +615,9 @@ fn finalize_done(
         );
     }
 
-    output.aggregations().inherit_results(&stats);
+    if output.dtype() == &expected_dtype && output.len() == expected_len {
+        output.aggregations().inherit_results(&stats);
+    }
     Ok((output, None))
 }
 

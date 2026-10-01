@@ -2,8 +2,10 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::slice;
+use std::sync::Arc;
 
 use rstest::rstest;
+use vortex_array::ArrayRef;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnRef;
@@ -18,11 +20,13 @@ use vortex_array::aggregate_fn::fns::min::Min;
 use vortex_array::aggregate_fn::fns::nan_count::NanCount;
 use vortex_array::aggregate_fn::fns::null_count::NullCount;
 use vortex_array::aggregate_fn::fns::sum::Sum;
+use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
 use vortex_array::array_session;
 use vortex_array::arrays::ListArray;
 use vortex_array::arrays::NullArray;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::TemporalArray;
+use vortex_array::arrays::VarBinViewArray;
 use vortex_array::builders::ArrayBuilder;
 use vortex_array::builders::VarBinViewBuilder;
 use vortex_array::dtype::DType;
@@ -74,11 +78,91 @@ fn combines_chunks() -> VortexResult<()> {
 }
 
 #[test]
-fn empty_input_has_no_summaries() -> VortexResult<()> {
-    let array = PrimitiveArray::empty::<i32>(Nullability::Nullable).into_array();
-    let mut acc = FieldAccumulator::new(array.dtype(), &default_file_aggregates(), 64)?;
-    acc.push_chunk(&array, &mut array_session().create_execution_ctx())?;
+fn no_chunks_have_no_summaries() -> VortexResult<()> {
+    let dtype = DType::Primitive(PType::I32, Nullability::Nullable);
+    let acc = FieldAccumulator::new(&dtype, &default_file_aggregates(), 64)?;
     assert_eq!(acc.results()?.iter().count(), 0);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::integer(
+    PrimitiveArray::empty::<i32>(Nullability::Nullable).into_array(),
+    Scalar::primitive(0i64, Nullability::Nullable),
+    Precision::Absent,
+)]
+#[case::float(
+    PrimitiveArray::empty::<f64>(Nullability::Nullable).into_array(),
+    Scalar::primitive(0f64, Nullability::Nullable),
+    Precision::Exact(0u64.into()),
+)]
+fn empty_chunk_preserves_zero_results(
+    #[case] array: ArrayRef,
+    #[case] expected_sum: Scalar,
+    #[case] expected_nan_count: Precision<Scalar>,
+) -> VortexResult<()> {
+    let mut aggregates = default_file_aggregates();
+    aggregates.extend([
+        UncompressedSizeInBytes.bind(EmptyOptions),
+        IsConstant.bind(EmptyOptions),
+        IsSorted.bind(IsSortedOptions { strict: false }),
+        IsSorted.bind(IsSortedOptions { strict: true }),
+    ]);
+    let mut acc = FieldAccumulator::new(array.dtype(), &aggregates, 64)?;
+    acc.push_chunk(&array, &mut array_session().create_execution_ctx())?;
+    let results = acc.results()?;
+    assert_eq!(
+        results.get_result(&Sum.bind(NumericalAggregateOpts::skip_nans())),
+        Precision::Exact(expected_sum)
+    );
+    assert_eq!(
+        results.get_result(&NanCount.bind(EmptyOptions)),
+        expected_nan_count
+    );
+    for aggregate in [
+        NullCount.bind(EmptyOptions),
+        UncompressedSizeInBytes.bind(EmptyOptions),
+    ] {
+        assert_eq!(
+            results.get_result(&aggregate),
+            Precision::Exact(0u64.into())
+        );
+    }
+    for aggregate in [
+        Min.bind(NumericalAggregateOpts::skip_nans()),
+        Max.bind(NumericalAggregateOpts::skip_nans()),
+        IsConstant.bind(EmptyOptions),
+        IsSorted.bind(IsSortedOptions { strict: false }),
+        IsSorted.bind(IsSortedOptions { strict: true }),
+    ] {
+        assert_eq!(results.get_result(&aggregate), Precision::Absent);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn empty_chunk_preserves_retained_buffer_size() -> VortexResult<()> {
+    let mut ctx = array_session().create_execution_ctx();
+    let backing = ByteBuffer::copy_from(b"retained backing bytes");
+    let expected_size = backing.len() as u64;
+    let array = VarBinViewArray::try_new(
+        buffer![],
+        Arc::from([backing]),
+        DType::Binary(Nullability::NonNullable),
+        Validity::NonNullable,
+        &mut ctx,
+    )?
+    .into_array();
+    let aggregate = UncompressedSizeInBytes.bind(EmptyOptions);
+    let mut acc = FieldAccumulator::new(array.dtype(), slice::from_ref(&aggregate), 64)?;
+    acc.push_chunk(&array, &mut ctx)?;
+    assert_eq!(
+        acc.results()?.get_result(&aggregate),
+        Precision::Exact(expected_size.into())
+    );
+
     Ok(())
 }
 

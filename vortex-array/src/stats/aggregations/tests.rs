@@ -16,6 +16,7 @@ use crate::aggregate_fn::fns::sum::Sum;
 use crate::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
 use crate::array_session;
 use crate::arrays::ConstantArray;
+use crate::arrays::PrimitiveArray;
 use crate::dtype::Nullability;
 use crate::expr::stats::Precision;
 use crate::scalar::Scalar;
@@ -159,5 +160,22 @@ fn physical_size_is_not_inherited_across_representations() -> VortexResult<()> {
         Precision::Absent
     );
     assert!(source.aggregations().get_result(&size).is_exact());
+    Ok(())
+}
+
+#[test]
+fn dtype_changing_reduction_drops_cached_results() -> VortexResult<()> {
+    let source = PrimitiveArray::from_option_iter([Some(7i32), Some(7)]).into_array();
+    let reduced = ConstantArray::new(7i32, 2).into_array();
+    let count = NullCount.bind(EmptyOptions);
+    let mut ctx = array_session().create_execution_ctx();
+    source.aggregations().compute_result(&count, &mut ctx)?;
+    reduced.aggregations().inherit_from(source.aggregations())?;
+
+    assert_eq!(reduced.aggregations().get_result(&count), Precision::Absent);
+    assert_eq!(
+        source.aggregations().get_result(&count),
+        Precision::Exact(0u64.into())
+    );
     Ok(())
 }

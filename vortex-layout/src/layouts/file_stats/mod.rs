@@ -120,8 +120,9 @@ impl FileStatsAccumulator {
 
     /// Finalized summaries with string and binary bounds truncated to the configured limit.
     ///
-    /// Call after consuming the stream to obtain complete file summaries. An empty stream produces
-    /// an empty result collection for each field.
+    /// Call after consuming the stream to obtain complete file summaries. A stream with no chunks
+    /// produces an empty collection for each field. Received empty chunks preserve supported count,
+    /// sum, and physical-size results while omitting extrema and flags.
     pub fn results(&self) -> VortexResult<Vec<AggregateResults>> {
         self.accumulators
             .lock()

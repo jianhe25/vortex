@@ -14,6 +14,8 @@ use vortex_array::aggregate_fn::AggregateFnRef;
 use vortex_array::aggregate_fn::AggregateFnVTableExt;
 use vortex_array::aggregate_fn::DynAccumulator;
 use vortex_array::aggregate_fn::NumericalAggregateOpts;
+use vortex_array::aggregate_fn::fns::is_constant::IsConstant;
+use vortex_array::aggregate_fn::fns::is_sorted::IsSorted;
 use vortex_array::aggregate_fn::fns::max::Max;
 use vortex_array::aggregate_fn::fns::min::Min;
 use vortex_array::aggregate_fn::fns::min_max::MinMax;
@@ -33,6 +35,7 @@ pub(super) struct FieldAccumulator {
     min_max: Option<Accumulator<MinMax>>,
     max_length: usize,
     seen_input: bool,
+    has_rows: bool,
 }
 
 impl FieldAccumulator {
@@ -76,6 +79,7 @@ impl FieldAccumulator {
             min_max,
             max_length,
             seen_input: false,
+            has_rows: false,
         })
     }
 
@@ -84,10 +88,6 @@ impl FieldAccumulator {
         array: &ArrayRef,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
-        if array.is_empty() {
-            return Ok(());
-        }
-
         if let Some(accumulator) = &mut self.min_max {
             accumulator.accumulate(array, ctx)?;
         }
@@ -96,6 +96,7 @@ impl FieldAccumulator {
         }
 
         self.seen_input = true;
+        self.has_rows |= !array.is_empty();
 
         Ok(())
     }
@@ -108,11 +109,23 @@ impl FieldAccumulator {
         let mut entries = Vec::new();
 
         for (aggregate, accumulator) in &self.accumulators {
+            // Historical file summaries omit extrema and flags for zero-row input.
+            if !self.has_rows
+                && (aggregate.is::<Min>()
+                    || aggregate.is::<Max>()
+                    || aggregate.is::<IsConstant>()
+                    || aggregate.is::<IsSorted>())
+            {
+                continue;
+            }
+
             let value = Precision::Exact(accumulator.final_scalar()?);
             entries.push((aggregate.clone(), value));
         }
 
-        if let Some(accumulator) = &self.min_max {
+        if self.has_rows
+            && let Some(accumulator) = &self.min_max
+        {
             let result = MinMaxResult::from_scalar(accumulator.final_scalar()?)?;
             let dtype = self.dtype.as_nullable();
             let (min, max) = match result {

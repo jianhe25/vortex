@@ -29,6 +29,56 @@ constructor checks unique keys and result dtypes. It does not establish that tho
 an array. Producers that avoid scanning must prove that their facts describe the exact immutable
 input before using the documented unsafe `seed_result` boundary.
 
+## Migrating Callers
+
+Array computations use an aggregate request instead of a fixed statistic:
+
+```rust
+// Before
+let sum = array.statistics().compute_stat(Stat::Sum, ctx)?;
+
+// After
+let aggregate = Sum.bind(NumericalAggregateOpts::skip_nans());
+let sum = array.aggregations().compute_result(&aggregate, ctx)?;
+```
+
+Safe arbitrary setters are removed. An encoding that already proves sortedness can seed that fact
+for its exact output array through the producer boundary:
+
+```rust
+// SAFETY: this producer establishes ascending order for every value in this exact array.
+unsafe {
+    array.aggregations().seed_result(
+        IsSorted.bind(IsSortedOptions { strict: false }),
+        Precision::Exact(true.into()),
+    )?;
+}
+```
+
+File selections and lookups use the same full request. Numerical requests must explicitly skip NaNs
+because the existing footer has no field for NaN-including options:
+
+```rust
+let minimum = Min.bind(NumericalAggregateOpts::skip_nans());
+let options = options.with_file_statistics(vec![minimum.clone(), NullCount.bind(EmptyOptions)]);
+let known = file.file_stats().unwrap().fields()[field_index].get_result(&minimum);
+```
+
+Callers that own a stream retain their accumulator rather than merging finalized snapshots. The
+accumulator can reuse a chunk's exact cached result when its aggregate supports `partial_from_result`:
+
+```rust
+let sum = Sum.bind(NumericalAggregateOpts::skip_nans());
+let mut accumulator = sum.accumulator(&input_dtype)?;
+for chunk in chunks {
+    accumulator.accumulate(&chunk, ctx)?;
+}
+let result = accumulator.finish()?;
+```
+
+A custom aggregate opts into this reuse only if its finalized result reconstructs a complete partial.
+An aggregate with a richer partial leaves the default conversion unchanged.
+
 ## Results and Partials
 
 An accumulator owns the state needed to merge chunks. A finalized scalar can replace a partial only
@@ -42,19 +92,23 @@ booleans omit boundary or representative values. Rich states such as `SumV2` als
 `StatFn` reads metadata and converts results through this explicit aggregate contract. It does not
 scan the input. Missing metadata stays unknown, and supported bounds retain their precision.
 Streaming file summaries accumulate typed partials and finalize them only after merging chunks.
+An unseen stream has no results, while a received empty batch preserves known count and sum identities.
+Nonempty all-null input now retains exact null extrema instead of omitting those fields.
 
 ## Array Rewrites
 
 A new representation receives a fresh store. An aggregate opts into transfer with
 `is_representation_invariant` when its result depends only on logical values, order, and dtype.
-Custom aggregates keep their results on the original representation by default.
+Custom aggregates keep their results on the original representation by default. A rewrite that
+changes the input dtype, including nullability, discards inherited results.
 
 `UncompressedSizeInBytes` does not opt in. Some implementations count retained backing buffers, so
 equal logical values can have different sizes in different representations. Slice and subset
 propagation use separate rules for facts that remain valid, such as known constantness or sortedness.
 
 Generic aggregate results do not prove unchecked constructor invariants. Decimal precision, list
-offsets, and list-view trimming validate physical values independently before unchecked construction.
+offsets, validity masks, and list-view trimming validate physical values independently before
+unchecked construction.
 
 ## Wire Compatibility
 

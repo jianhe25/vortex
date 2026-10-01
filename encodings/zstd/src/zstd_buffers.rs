@@ -97,13 +97,16 @@ impl ZstdBuffers {
             ArrayParts::new(ZstdBuffers, array.dtype().clone(), array.len(), data)
                 .with_slots(slots),
         )?;
-        for (aggregate, result) in array.aggregations().snapshot_results().iter() {
-            if aggregate.is_representation_invariant() {
-                // SAFETY: buffer compression reconstructs the same values and null positions.
-                unsafe {
-                    compressed
-                        .aggregations()
-                        .seed_result(aggregate.clone(), result.clone())?;
+        if array.dtype() == compressed.dtype() && array.len() == compressed.len() {
+            for (aggregate, result) in array.aggregations().snapshot_results().iter() {
+                if aggregate.is_representation_invariant() {
+                    // SAFETY: buffer compression reconstructs the same values and null positions
+                    // at the same dtype and length.
+                    unsafe {
+                        compressed
+                            .aggregations()
+                            .seed_result(aggregate.clone(), result.clone())?;
+                    }
                 }
             }
         }
