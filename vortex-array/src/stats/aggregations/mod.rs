@@ -100,7 +100,8 @@ impl AggregationsRef<'_> {
     /// Return the exact result, computing and caching it when needed.
     ///
     /// Computation runs without holding a cache lock. Concurrent requests may compute the same
-    /// result; failed computations leave the cache unchanged.
+    /// result. A failed target result is not retained, although successful nested computations can
+    /// retain their own results.
     pub fn compute_result(
         &self,
         aggregate: &AggregateFnRef,
