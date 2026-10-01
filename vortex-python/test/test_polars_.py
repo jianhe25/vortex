@@ -83,3 +83,17 @@ def test_polars_fill_null(tmp_path):
     actual = vx.open(str(path)).to_polars().filter(expr).collect()
     assert_frame_equal(actual, expected_frame)
     assert actual["id"].to_list() == [1, 3]
+
+
+@pytest.mark.parametrize("fill_value, expected_ids", [(5, [1, 2, 3]), (0, [1, 2]), (-1, [1, 2])])
+def test_polars_fill_null_literal(tmp_path, fill_value, expected_ids):
+    frame = pl.DataFrame({"id": [0, 1, 2, 3], "x": [1, None, None, 5]})
+    filled = pl.col("x").fill_null(fill_value)
+    assert polars_to_vortex(filled).serialize() == ve.fill_null(ve.column("x"), fill_value).serialize()
+    predicate = filled == fill_value
+    path = tmp_path / "fill_null_literal.vortex"
+    vx.io.write(vx.array(frame.to_arrow()), str(path))
+    expected_frame = frame.lazy().filter(predicate).collect()
+    actual = vx.open(str(path)).to_polars().filter(predicate).collect()
+    assert_frame_equal(actual, expected_frame)
+    assert actual["id"].to_list() == expected_ids
