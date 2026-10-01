@@ -134,6 +134,118 @@ fn producer_indices_handle_empty_all_and_sparse(
     Ok(())
 }
 
+#[rstest]
+#[case::empty(Mask::AllFalse(0), 0)]
+#[case::nonempty(Mask::from_indices(10, [1, 4, 6, 9]), 20)]
+fn full_slice_and_all_true_filter_share_owner(
+    #[case] mask: Mask,
+    #[case] expected_sum: u64,
+    #[values(
+        AggregateCacheMode::Array,
+        AggregateCacheMode::Input,
+        AggregateCacheMode::Disabled
+    )]
+    mode: AggregateCacheMode,
+) -> VortexResult<()> {
+    let input = ArrayInput::from_mask_indices_with_cache_mode(&mask, mode)?;
+    let sliced = input.slice(0..input.array().len())?;
+    let filtered = input.filter(Mask::AllTrue(input.array().len()))?;
+    let sum = Sum.bind(NumericalAggregateOpts::skip_nans());
+    let min = Min.bind(NumericalAggregateOpts::skip_nans());
+    let sorted = IsSorted.bind(IsSortedOptions { strict: true });
+    let mut ctx = array_session().create_execution_ctx();
+    assert_eq!(
+        u64::try_from(&sliced.compute_result(&sum, &mut ctx)?)?,
+        expected_sum
+    );
+    assert_eq!(
+        input.verified_bounds().is_some(),
+        mode != AggregateCacheMode::Disabled
+    );
+
+    for output in [&sliced, &filtered] {
+        assert!(Arc::ptr_eq(&input.inner, &output.inner));
+        assert!(ArrayRef::ptr_eq(input.array(), output.array()));
+        assert_eq!(output.cache_mode(), mode);
+        assert_eq!(
+            output.verified_bounds().map(std::ptr::from_ref),
+            input.verified_bounds().map(std::ptr::from_ref)
+        );
+        assert_eq!(output.get_result(&min), input.get_result(&min));
+        assert_eq!(output.get_result(&sum), input.get_result(&sum));
+        assert_eq!(output.get_result(&sorted), input.get_result(&sorted));
+    }
+
+    if mode == AggregateCacheMode::Disabled {
+        assert_eq!(input.get_result(&sum), Precision::Absent);
+        assert_eq!(input.get_result(&sorted), Precision::Absent);
+    } else {
+        assert_eq!(
+            input.get_result(&sum),
+            Precision::Exact(Scalar::primitive(expected_sum, Nullability::Nullable))
+        );
+        assert!(matches!(input.get_result(&min), Precision::Exact(_)));
+        assert_eq!(input.get_result(&sorted), Precision::Exact(true.into()));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn fresh_disabled_validation_retains_no_proof_or_results() -> VortexResult<()> {
+    let input = ArrayInput::new(buffer![3i32, 1, 2].into_array())
+        .with_cache_mode(AggregateCacheMode::Disabled);
+    let mut ctx = array_session().create_execution_ctx();
+    input.validate_integer_bounds(&mut ctx)?;
+    assert!(input.inner.verified_bounds.get().is_none());
+
+    for mode in [AggregateCacheMode::Array, AggregateCacheMode::Input] {
+        let enabled = input.clone().with_cache_mode(mode);
+        assert!(enabled.verified_bounds().is_none());
+        assert!(enabled.snapshot_results().iter().next().is_none());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn switching_modes_keeps_shared_results_and_private_proof() -> VortexResult<()> {
+    let input = ArrayInput::new(buffer![2i32, 3, 5].into_array());
+    let sum = Sum.bind(NumericalAggregateOpts::skip_nans());
+    let expected = Scalar::primitive(10i64, Nullability::Nullable);
+    let mut ctx = array_session().create_execution_ctx();
+    input.validate_integer_bounds(&mut ctx)?;
+    assert_eq!(input.compute_result(&sum, &mut ctx)?, expected);
+    let proof = std::ptr::from_ref(
+        input
+            .verified_bounds()
+            .vortex_expect("direct validation retained proof"),
+    );
+    let array = input.clone().with_cache_mode(AggregateCacheMode::Array);
+    assert_eq!(array.compute_result(&sum, &mut ctx)?, expected);
+    let disabled = array.clone().with_cache_mode(AggregateCacheMode::Disabled);
+    assert!(disabled.verified_bounds().is_none());
+    assert_eq!(disabled.get_result(&sum), Precision::Absent);
+    disabled.validate_integer_bounds(&mut ctx)?;
+
+    for mode in [AggregateCacheMode::Array, AggregateCacheMode::Input] {
+        let restored = disabled.clone().with_cache_mode(mode);
+        assert!(Arc::ptr_eq(&input.inner, &restored.inner));
+        assert_eq!(
+            restored.verified_bounds().map(std::ptr::from_ref),
+            Some(proof)
+        );
+        assert_eq!(
+            restored.get_result(&sum),
+            Precision::Exact(expected.clone())
+        );
+    }
+    assert_eq!(input.cache_mode(), AggregateCacheMode::Input);
+    assert_eq!(array.cache_mode(), AggregateCacheMode::Array);
+
+    Ok(())
+}
+
 #[test]
 fn stable_subsets_keep_bounds_and_positive_sortedness() -> VortexResult<()> {
     let input = ArrayInput::from_mask_indices(&Mask::from_indices(10, [1, 4, 6, 9]))?;
