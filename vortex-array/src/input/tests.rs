@@ -3,12 +3,16 @@
 
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use rstest::rstest;
 use vortex_buffer::buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
+use vortex_session::VortexSession;
 
 use super::AggregateCacheMode;
 use super::ArrayInput;
@@ -31,18 +35,25 @@ use crate::aggregate_fn::fns::min_max::make_minmax_dtype;
 use crate::aggregate_fn::fns::sum::Sum;
 use crate::aggregate_fn::kernels::DynAggregateKernel;
 use crate::aggregate_fn::session::AggregateFnSessionExt;
+use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::array_session;
 use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
+use crate::arrays::Dict;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::dict::DictArraySlotsExt;
+use crate::arrays::dict::TakeExecute;
 use crate::assert_arrays_eq;
 use crate::dtype::DType;
 use crate::dtype::DecimalDType;
 use crate::dtype::Nullability;
 use crate::dtype::PType;
 use crate::expr::stats::Precision;
+use crate::kernel::ExecuteParentKernel;
+use crate::optimizer::kernels::ArrayKernelsExt;
+use crate::optimizer::kernels::KernelSession;
 use crate::scalar::Scalar;
 use crate::validity::Validity;
 
@@ -264,23 +275,28 @@ fn safe_aggregate_results_cannot_bypass_decimal_precision() -> VortexResult<()> 
 }
 
 #[test]
-fn direct_proof_ignores_null_slots_and_checks_nullability() -> VortexResult<()> {
-    let array = PrimitiveArray::new(buffer![1000i16, 12], Validity::from_iter([false, true]));
+fn physical_proof_includes_null_payloads_and_cast_checks_nullability() -> VortexResult<()> {
+    let array = PrimitiveArray::new(buffer![1000i16, 1], Validity::from_iter([false, true]));
     let input = ArrayInput::new(array.into_array());
     let mut ctx = array_session().create_execution_ctx();
     input.validate_integer_bounds(&mut ctx)?;
-    let dtype = DType::Decimal(DecimalDType::new(3, 0), Nullability::Nullable);
+    let dtype = DType::Decimal(DecimalDType::new(2, 0), Nullability::Nullable);
     assert!(
-        input
+        !input
             .verified_bounds()
             .vortex_expect("direct validation retained proof")
             .fits(&dtype)
+    );
+    let max = Max.bind(NumericalAggregateOpts::skip_nans());
+    assert_eq!(
+        input.get_result(&max),
+        Precision::Exact(Scalar::primitive(1i16, Nullability::Nullable))
     );
     assert!(input.execute_cast(dtype, &mut ctx).is_ok());
     assert!(
         input
             .execute_cast(
-                DType::Decimal(DecimalDType::new(3, 0), Nullability::NonNullable),
+                DType::Decimal(DecimalDType::new(2, 0), Nullability::NonNullable),
                 &mut ctx
             )
             .is_err()
@@ -371,5 +387,105 @@ fn private_cast_proof_does_not_follow_nonempty_subsets() -> VortexResult<()> {
             .is_none()
     );
     assert!(input.slice(0..0)?.verified_bounds().is_some());
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ObserveTakeInputs {
+    source_result: Precision<Scalar>,
+    indices_result: Precision<Scalar>,
+    called: Arc<AtomicBool>,
+}
+
+impl ExecuteParentKernel<Primitive> for ObserveTakeInputs {
+    type Parent = Dict;
+
+    fn execute_parent(
+        &self,
+        array: ArrayView<'_, Primitive>,
+        parent: ArrayView<'_, Dict>,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        if child_idx != 1 {
+            return Ok(None);
+        }
+        let sum = Sum.bind(NumericalAggregateOpts::skip_nans());
+        assert_eq!(
+            ctx.aggregate_result(array.array(), &sum),
+            self.source_result
+        );
+        assert_eq!(
+            ctx.aggregate_result(parent.codes(), &sum),
+            self.indices_result
+        );
+        self.called.store(true, Ordering::Relaxed);
+        <Primitive as TakeExecute>::take(array, parent.codes(), ctx)
+    }
+}
+
+#[rstest]
+fn eager_take_keeps_both_owners_and_their_modes(
+    #[values(
+        AggregateCacheMode::Array,
+        AggregateCacheMode::Input,
+        AggregateCacheMode::Disabled
+    )]
+    source_mode: AggregateCacheMode,
+    #[values(
+        AggregateCacheMode::Array,
+        AggregateCacheMode::Input,
+        AggregateCacheMode::Disabled
+    )]
+    indices_mode: AggregateCacheMode,
+) -> VortexResult<()> {
+    let source = ArrayInput::new(buffer![11i32, 22, 33].into_array()).with_cache_mode(source_mode);
+    let indices = ArrayInput::new(buffer![2u64, 0].into_array()).with_cache_mode(indices_mode);
+    let sum = Sum.bind(NumericalAggregateOpts::skip_nans());
+    let mut preparation = array_session().create_execution_ctx();
+    source.compute_result(&sum, &mut preparation)?;
+    indices.compute_result(&sum, &mut preparation)?;
+
+    let session = VortexSession::empty().with_some(KernelSession::empty());
+    let called = Arc::new(AtomicBool::new(false));
+    session.kernels().register_execute_parent_kernel(
+        Dict.id(),
+        Primitive,
+        ObserveTakeInputs {
+            source_result: source.get_result(&sum),
+            indices_result: indices.get_result(&sum),
+            called: Arc::clone(&called),
+        },
+    );
+    let mut ctx = session.create_execution_ctx();
+    assert_arrays_eq!(
+        source.execute_take(&indices, &mut ctx)?.into_array(),
+        buffer![33i32, 11].into_array(),
+        &mut preparation
+    );
+    assert!(called.load(Ordering::Relaxed));
+    assert!(ctx.aggregate_inputs.is_none());
+    assert_eq!(ctx.aggregate_cache_mode(), AggregateCacheMode::Array);
+    Ok(())
+}
+
+#[test]
+fn nearest_owner_wins_for_the_same_array_handle() -> VortexResult<()> {
+    let input = ArrayInput::from_mask_indices(&Mask::AllTrue(3))?;
+    let array_owner =
+        ArrayInput::new(input.array().clone()).with_cache_mode(AggregateCacheMode::Array);
+    let sorted = IsSorted.bind(IsSortedOptions { strict: false });
+    let parent = array_session()
+        .create_execution_ctx()
+        .with_aggregate_input(&input);
+    let child = parent.with_aggregate_input(&array_owner);
+    assert_eq!(
+        child.aggregate_result(input.array(), &sorted),
+        Precision::Absent
+    );
+    assert_eq!(
+        parent.aggregate_result(input.array(), &sorted),
+        Precision::Exact(true.into())
+    );
     Ok(())
 }

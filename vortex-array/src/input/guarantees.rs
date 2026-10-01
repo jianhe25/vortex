@@ -82,9 +82,10 @@ impl ArrayInput {
     ///
     /// Exact integer extrema become bounds. Positive sortedness keeps its original strictness;
     /// negative sortedness and other aggregate results are omitted. Integer ordering places nulls
-    /// first, and strict ordering excludes duplicate values and repeated nulls. A complete slice shares its
-    /// owner's store. No values are read to propagate guarantees. Nonempty subsets drop the
-    /// private cast proof because external transformation kernels do not establish native bounds.
+    /// first, and strict ordering excludes duplicate values and repeated nulls. A complete slice
+    /// shares its owner's store. No values are read to propagate guarantees. Nonempty subsets
+    /// drop the private cast proof because external transformation kernels do not establish native
+    /// bounds.
     pub fn slice(&self, range: Range<usize>) -> VortexResult<Self> {
         let array = match self.cache_mode {
             AggregateCacheMode::Array => self.array().slice(range)?,
@@ -113,17 +114,18 @@ impl ArrayInput {
 
     /// Validate canonical integer values once for checked casts that require value-range proof.
     ///
-    /// This scans actual valid values without registered aggregate kernels. Unsupported encodings
-    /// and noninteger inputs return an error. Null slots do not participate in the proof. Enabled
-    /// modes retain the proof. Disabled mode validates on each call and retains no facts.
+    /// This scans native values without registered aggregate kernels. Unsupported encodings and
+    /// noninteger inputs return an error. The private proof includes null payloads so it remains
+    /// valid across execution contexts. Logical extrema use the current validity mask. Enabled
+    /// modes retain both. Disabled mode validates on each call and retains no facts.
     pub fn validate_integer_bounds(&self, ctx: &mut ExecutionCtx) -> VortexResult<()> {
         if self.cache_mode == AggregateCacheMode::Disabled {
             VerifiedIntegerBounds::validate(self.array(), ctx)?;
             return Ok(());
         }
         if self.inner.verified_bounds.get().is_none() {
-            let proof = VerifiedIntegerBounds::validate(self.array(), ctx)?;
-            self.record_bounds(proof.values(), true)?;
+            let (proof, logical_bounds) = VerifiedIntegerBounds::validate(self.array(), ctx)?;
+            self.record_bounds(logical_bounds.as_ref(), true)?;
             self.inner.verified_bounds.set(proof).ok();
         }
         Ok(())

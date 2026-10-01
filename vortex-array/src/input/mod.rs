@@ -54,6 +54,24 @@ struct ArrayInputInner {
 ///
 /// Construction accepts any encoding. Clones share one store. Independently wrapping the same
 /// array creates a new store, and cloning out an [`ArrayRef`] does not retain this owner.
+///
+/// ```
+/// use vortex_array::{ArrayInput, IntoArray, VortexSessionExecute};
+/// use vortex_array::aggregate_fn::{AggregateFnVTableExt, NumericalAggregateOpts};
+/// use vortex_array::aggregate_fn::fns::sum::Sum;
+/// use vortex_array::arrays::PrimitiveArray;
+/// use vortex_array::expr::stats::Precision;
+///
+/// let input = ArrayInput::new(PrimitiveArray::from_iter([1i32, 2, 3]).into_array());
+/// let sum = Sum.bind(NumericalAggregateOpts::skip_nans());
+/// assert_eq!(input.get_result(&sum), Precision::Absent);
+/// let mut ctx = vortex_array::array_session().create_execution_ctx();
+/// let result = input.compute_result(&sum, &mut ctx)?;
+/// assert_eq!(i64::try_from(&result)?, 6);
+/// assert_eq!(input.clone().get_result(&sum), Precision::Exact(result));
+/// assert_eq!(input.array().aggregations().get_result(&sum), Precision::Absent);
+/// # Ok::<(), vortex_error::VortexError>(())
+/// ```
 #[derive(Clone)]
 pub struct ArrayInput {
     inner: Arc<ArrayInputInner>,

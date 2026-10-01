@@ -122,10 +122,13 @@ impl ArrayInput {
     }
 
     /// Take from this input using an explicitly retained indices owner, and finish execution.
+    ///
+    /// Both owners remain available to kernels and retain their selected cache modes. If source
+    /// and indices share the exact array handle, the indices binding takes precedence.
     pub fn execute_take(&self, indices: &Self, ctx: &mut ExecutionCtx) -> VortexResult<Canonical> {
         self.array()
             .take(indices.array().clone())?
-            .execute(&mut ctx.with_aggregate_input(indices))
+            .execute(&mut ctx.with_aggregate_input(self).with_aggregate_input(indices))
     }
 
     pub(crate) fn aggregations(&self) -> AggregationsRef<'_> {

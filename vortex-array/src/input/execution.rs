@@ -25,8 +25,10 @@ impl ExecutionCtx {
     /// Create a child context that retains this input and resolves its aggregate lookups by identity.
     ///
     /// The parent context is unchanged, including when child execution errors or panics. Nested
-    /// scopes retain previous owners. Lazy arrays carry no scope: execute them with the returned
-    /// context, or use the input's eager execution methods before dropping it.
+    /// scopes retain previous owners. Each bound input keeps its own cache mode. The innermost
+    /// mode applies to unbound arrays, and the nearest matching handle wins. Lazy arrays carry no
+    /// scope: execute them with the returned context, or use the input's eager execution methods
+    /// before dropping it.
     pub fn with_aggregate_input(&self, input: &ArrayInput) -> Self {
         let mut child = self.clone();
         child.aggregate_cache_mode = input.cache_mode();
@@ -51,7 +53,7 @@ impl ExecutionCtx {
         array: &ArrayRef,
         aggregate: &AggregateFnRef,
     ) -> Precision<Scalar> {
-        match self.aggregate_cache_mode {
+        match self.mode_for(array) {
             AggregateCacheMode::Array => array.aggregations().get_result(aggregate),
             AggregateCacheMode::Input => self
                 .aggregate_input(array)
@@ -82,7 +84,7 @@ impl ExecutionCtx {
         aggregate: AggregateFnRef,
         result: Precision<Scalar>,
     ) -> VortexResult<()> {
-        match self.aggregate_cache_mode {
+        match self.mode_for(array) {
             AggregateCacheMode::Array => array.aggregations().insert_result(aggregate, result),
             AggregateCacheMode::Input => match self.aggregate_input(array) {
                 Some(input) => input.aggregations().insert_result(aggregate, result),
@@ -98,7 +100,7 @@ impl ExecutionCtx {
         array: &ArrayRef,
         aggregate: &AggregateFnRef,
     ) -> VortexResult<Scalar> {
-        match self.aggregate_cache_mode {
+        match self.mode_for(array) {
             AggregateCacheMode::Array => {
                 if let Precision::Exact(result) = array.aggregations().get_result(aggregate) {
                     return Ok(result);
@@ -129,12 +131,17 @@ impl ExecutionCtx {
         array: &ArrayRef,
         dtype: &DType,
     ) -> Option<bool> {
-        if self.aggregate_cache_mode == AggregateCacheMode::Disabled {
+        if self.mode_for(array) == AggregateCacheMode::Disabled {
             return None;
         }
         self.aggregate_input(array)?
             .verified_bounds()
             .map(|proof| proof.fits(dtype))
+    }
+
+    fn mode_for(&self, array: &ArrayRef) -> AggregateCacheMode {
+        self.aggregate_input(array)
+            .map_or(self.aggregate_cache_mode, ArrayInput::cache_mode)
     }
 
     fn aggregate_input(&self, array: &ArrayRef) -> Option<&ArrayInput> {
