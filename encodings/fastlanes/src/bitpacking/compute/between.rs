@@ -34,7 +34,7 @@ impl BetweenKernel for BitPacked {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         // Blocks packed at different widths fall back to decoding.
-        if array.constant_bit_width().is_none() {
+        if array.constant_bit_width_opt().is_none() {
             return Ok(None);
         }
         // Only accelerate constant-bounds between; vary-by-row bounds fall through to the

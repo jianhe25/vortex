@@ -78,7 +78,7 @@ where
     F: Fn(T, T) -> bool + Copy,
 {
     let len = array.len();
-    let bit_width = array.uniform_bit_width()? as usize;
+    let bit_width = array.constant_bit_width()? as usize;
     let offset = array.offset() as usize;
 
     // A degenerate width has no packed payload for the fused kernel to consume; defer to the scalar

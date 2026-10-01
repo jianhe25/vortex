@@ -61,7 +61,7 @@ pub(crate) fn bitpacked_slice_view(
     let block_start = offset_start - bitpacked_offset;
     let block_stop = offset_stop.div_ceil(PATCH_CHUNK_SIZE) * PATCH_CHUNK_SIZE;
 
-    let bit_width = bp.constant_bit_width().ok_or_else(|| {
+    let bit_width = bp.constant_bit_width_opt().ok_or_else(|| {
         vortex_err!("CUDA does not support BitPacked blocks with different bit widths")
     })?;
     let encoded_start = (block_start / 8) * bit_width as usize;
@@ -99,7 +99,7 @@ impl BitPackedExecutor {
             bp.ptype(bp.dtype()),
             child.validity()?.slice(patch_range.clone())?,
             bp.patches(),
-            bp.constant_bit_width().ok_or_else(|| {
+            bp.constant_bit_width_opt().ok_or_else(|| {
                 vortex_err!("CUDA does not support BitPacked blocks with different bit widths")
             })?,
             len,
@@ -166,7 +166,7 @@ where
     A::Physical: DeviceRepr + Send + Sync + 'static,
 {
     vortex_ensure!(
-        array.constant_bit_width().is_some(),
+        array.constant_bit_width_opt().is_some(),
         "CUDA does not support BitPacked blocks with different bit widths"
     );
     let BitPackedDataParts {

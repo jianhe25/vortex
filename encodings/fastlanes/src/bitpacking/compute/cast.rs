@@ -44,7 +44,7 @@ fn build_with_validity(
             .patches()
             .map(|patches| patches.map_values(|values| values.cast(dtype.clone())))
             .transpose()?,
-        array.uniform_bit_width()?,
+        array.constant_bit_width()?,
         array.len(),
         array.offset(),
     )?
@@ -54,7 +54,7 @@ fn build_with_validity(
 impl CastReduce for BitPacked {
     fn cast(array: ArrayView<'_, Self>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         // Blocks packed at different widths fall back to decoding.
-        if array.constant_bit_width().is_none() {
+        if array.constant_bit_width_opt().is_none() {
             return Ok(None);
         }
         if !array.dtype().eq_ignore_nullability(dtype) {
@@ -77,7 +77,7 @@ impl CastKernel for BitPacked {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         // Blocks packed at different widths fall back to decoding.
-        if array.constant_bit_width().is_none() {
+        if array.constant_bit_width_opt().is_none() {
             return Ok(None);
         }
         // Nullability-only change: keep the values bit-packed, just adjust validity.

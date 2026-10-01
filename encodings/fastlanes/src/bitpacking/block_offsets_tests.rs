@@ -51,7 +51,8 @@ fn uniform() -> VortexResult<BitPackedArray> {
 fn uniform_block_offsets_are_a_sequence() -> VortexResult<()> {
     let mut ctx = SESSION.create_execution_ctx();
     let uniform = uniform()?;
-    assert_eq!(uniform.constant_bit_width(), Some(7));
+    assert_eq!(uniform.constant_bit_width_opt(), Some(7));
+    assert_eq!(uniform.constant_bit_width()?, 7);
     assert!(uniform.block_offsets().is::<Sequence>());
     assert_arrays_eq!(
         uniform.block_offsets(),
@@ -59,7 +60,7 @@ fn uniform_block_offsets_are_a_sequence() -> VortexResult<()> {
         &mut ctx
     );
     let rebased = BitPacked::with_block_offsets(uniform.clone(), sequence(128, 896, 4)?)?;
-    assert_eq!(rebased.constant_bit_width(), Some(7));
+    assert_eq!(rebased.constant_bit_width_opt(), Some(7));
     assert_arrays_eq!(uniform, rebased, &mut ctx);
     Ok(())
 }
@@ -71,7 +72,8 @@ fn materialized_block_offsets_have_no_constant_width(
     #[case] offsets: vortex_buffer::Buffer<u64>,
 ) -> VortexResult<()> {
     let array = BitPacked::with_block_offsets(uniform()?, offsets.into_array())?;
-    assert_eq!(array.constant_bit_width(), None);
+    assert_eq!(array.constant_bit_width_opt(), None);
+    assert!(array.constant_bit_width().is_err());
     // Decoding per-block widths is not supported yet.
     assert!(
         array

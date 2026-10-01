@@ -72,7 +72,7 @@ impl ArrayPlugin for BitPackedPlugin {
             vortex_err!("BitPacked plugin cannot serialize {}", array.encoding_id())
         })?;
         let metadata = BitPackedMetadata {
-            bit_width: u32::from(view.uniform_bit_width()?),
+            bit_width: u32::from(view.constant_bit_width()?),
             offset: view.offset() as u32,
             patches: view
                 .patches()
@@ -232,7 +232,7 @@ impl ArrayPlugin for BitPackedPatchedPlugin {
         let packed = bitpacked.packed().clone();
         let ptype = bitpacked.dtype().as_ptype();
         let validity = bitpacked.validity()?;
-        let bw = bitpacked.uniform_bit_width()?;
+        let bw = bitpacked.constant_bit_width()?;
         let len = bitpacked.len();
         let offset = bitpacked.offset();
 

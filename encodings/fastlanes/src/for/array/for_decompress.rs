@@ -53,7 +53,7 @@ fn decompress_one_ref(
     // Try to do fused unpack.
     if array.ptype().is_unsigned_int()
         && let Some(bp) = array.encoded().as_opt::<BitPacked>()
-        && bp.constant_bit_width().is_some()
+        && bp.constant_bit_width_opt().is_some()
     {
         return fused_decompress(array, bp, ctx);
     }
@@ -135,7 +135,7 @@ fn decompress_many_refs(array: &FoRArray, ctx: &mut ExecutionCtx) -> VortexResul
     if array.ptype().is_unsigned_int()
         && let Some(bp) = array.encoded().as_opt::<BitPacked>()
         && bp.offset() == array.offset()
-        && bp.constant_bit_width().is_some()
+        && bp.constant_bit_width_opt().is_some()
     {
         return fused_decompress_many_refs(array, bp, ctx);
     }
@@ -288,7 +288,7 @@ fn unpack_chunks<T: PhysicalPType<Physical = T> + UnsignedPType + FoR>(
     output: &mut [MaybeUninit<T>],
 ) -> VortexResult<()> {
     let offset = usize::from(bp.offset());
-    let bit_width = bp.uniform_bit_width()? as usize;
+    let bit_width = bp.constant_bit_width()? as usize;
     let mut scratch = [const { MaybeUninit::<T>::uninit() }; FL_CHUNK_SIZE];
     for_each_packed_chunk::<T, _>(
         bp.packed_slice::<T>(),

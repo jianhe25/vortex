@@ -44,7 +44,7 @@ impl DynAggregateKernel for BitPackedIsConstantKernel {
             return Ok(None);
         };
         // Blocks packed at different widths fall back to decoding.
-        if array.constant_bit_width().is_none() {
+        if array.constant_bit_width_opt().is_none() {
             return Ok(None);
         }
 

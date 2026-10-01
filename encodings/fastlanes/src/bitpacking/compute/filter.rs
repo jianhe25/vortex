@@ -50,7 +50,7 @@ impl FilterKernel for BitPacked {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         // Blocks packed at different widths fall back to decoding.
-        if array.constant_bit_width().is_none() {
+        if array.constant_bit_width_opt().is_none() {
             return Ok(None);
         }
         let values = match mask {
@@ -116,7 +116,7 @@ fn filter_primitive_without_patches<U: UnsignedPType + BitPacking>(
 ) -> VortexResult<(Buffer<U>, Validity)> {
     let values = filter_with_indices(
         array.data(),
-        array.uniform_bit_width()?,
+        array.constant_bit_width()?,
         selection.indices(),
     );
     let validity = array

@@ -27,7 +27,7 @@ impl PyFastLanesBitPackedArray {
             .as_super()
             .inner()
             .as_::<BitPacked>()
-            .constant_bit_width()
+            .constant_bit_width_opt()
     }
 }
 

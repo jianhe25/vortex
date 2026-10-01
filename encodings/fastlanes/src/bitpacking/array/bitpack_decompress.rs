@@ -165,7 +165,7 @@ pub(crate) fn apply_patches_to_uninit_range<S: NativePType, T: NativePType, F: F
 }
 
 pub fn unpack_single(array: ArrayView<'_, BitPacked>, index: usize) -> VortexResult<Scalar> {
-    let bit_width = array.uniform_bit_width()? as usize;
+    let bit_width = array.constant_bit_width()? as usize;
     let ptype = array.dtype().as_ptype();
     // let packed = array.packed().into_primitive()?;
     let index_in_encoded = index + array.offset() as usize;

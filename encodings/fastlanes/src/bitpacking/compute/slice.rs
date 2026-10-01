@@ -19,7 +19,7 @@ use crate::bitpacking::array::BitPackedArrayExt;
 impl SliceReduce for BitPacked {
     fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
         // Blocks packed at different widths fall back to decoding.
-        if array.constant_bit_width().is_none() {
+        if array.constant_bit_width_opt().is_none() {
             return Ok(None);
         }
         // We cannot access buffers (to slice the patches).
@@ -38,7 +38,7 @@ impl SliceKernel for BitPacked {
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         // Blocks packed at different widths fall back to decoding.
-        if array.constant_bit_width().is_none() {
+        if array.constant_bit_width_opt().is_none() {
             return Ok(None);
         }
         let patches = array
@@ -62,7 +62,7 @@ fn slice_bitpacked(
     let block_start = max(0, offset_start - offset);
     let block_stop = offset_stop.div_ceil(1024) * 1024;
 
-    let bit_width = array.uniform_bit_width()?;
+    let bit_width = array.constant_bit_width()?;
     let encoded_start = (block_start / 8) * bit_width as usize;
     let encoded_stop = (block_stop / 8) * bit_width as usize;
 

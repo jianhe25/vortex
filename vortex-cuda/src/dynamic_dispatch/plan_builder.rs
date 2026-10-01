@@ -74,7 +74,7 @@ pub struct MaterializedPlan {
 }
 
 fn cuda_bit_width(bp: &impl BitPackedArrayExt) -> VortexResult<u8> {
-    bp.constant_bit_width().ok_or_else(|| {
+    bp.constant_bit_width_opt().ok_or_else(|| {
         vortex_err!("CUDA does not support BitPacked blocks with different bit widths")
     })
 }
@@ -95,7 +95,7 @@ fn is_dyn_dispatch_compatible(array: &ArrayRef) -> bool {
         return matches!(arr.dtype().as_ptype(), PType::F32 | PType::F64);
     }
     if id == BitPacked.id() {
-        return array.as_::<BitPacked>().constant_bit_width().is_some();
+        return array.as_::<BitPacked>().constant_bit_width_opt().is_some();
     }
     if id == Dict.id() {
         let arr = array.as_::<Dict>();

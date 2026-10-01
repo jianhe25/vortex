@@ -40,7 +40,7 @@ impl TakeExecute for BitPacked {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         // Blocks packed at different widths fall back to decoding.
-        if array.constant_bit_width().is_none() {
+        if array.constant_bit_width_opt().is_none() {
             return Ok(None);
         }
         // If the indices are large enough, it's faster to flatten and take the primitive array.
@@ -85,7 +85,7 @@ fn take_primitive<T: NativePType + BitPacking, I: IntegerPType>(
     }
 
     let offset = array.offset() as usize;
-    let bit_width = array.uniform_bit_width()? as usize;
+    let bit_width = array.constant_bit_width()? as usize;
 
     let packed = array.packed_slice::<T>();
 
