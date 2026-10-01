@@ -137,10 +137,18 @@ fn cast_to_decimal(
         );
     }
 
-    let source_validity = array.validity()?;
-    let validity = source_validity
-        .clone()
-        .cast_nullability(nullability, array.len(), ctx)?;
+    // Resolve lazy validity once so the precision proof and emitted array use the same mask.
+    let valid_values = array.validity()?.execute_mask(array.len(), ctx)?;
+    let validity = if nullability == Nullability::NonNullable {
+        if !valid_values.all_true() {
+            vortex_bail!(
+                InvalidArgument: "Cannot cast array with invalid values to non-nullable type."
+            );
+        }
+        Validity::NonNullable
+    } else {
+        Validity::from_mask(valid_values.clone(), nullability)
+    };
     let values_type = DecimalType::smallest_decimal_value_type(&decimal_dtype);
 
     if decimal_dtype.scale() == 0
@@ -151,13 +159,11 @@ fn cast_to_decimal(
                 array,
                 decimal_dtype,
                 validity,
-                &source_validity,
-                ctx,
+                &valid_values,
             )
         });
     }
 
-    let valid_values = source_validity.execute_mask(array.len(), ctx)?;
     match_each_integer_ptype!(array.ptype(), |S| {
         match_each_decimal_value_type!(values_type, |T| {
             cast_integer_values_to_decimal::<S, T>(array, decimal_dtype, validity, &valid_values)
@@ -169,15 +175,13 @@ fn cast_unscaled_same_width_signed_integer_to_decimal<S>(
     array: ArrayView<'_, Primitive>,
     decimal_dtype: DecimalDType,
     validity: Validity,
-    source_validity: &Validity,
-    ctx: &mut ExecutionCtx,
+    valid_values: &Mask,
 ) -> VortexResult<ArrayRef>
 where
     S: IntegerPType + NativeDecimalType + ToI256,
 {
     let values = array.as_slice::<S>();
-    let valid_values = source_validity.execute_mask(array.len(), ctx)?;
-    validate_unscaled_signed_integer_values_to_decimal(values, decimal_dtype, &valid_values)
+    validate_unscaled_signed_integer_values_to_decimal(values, decimal_dtype, valid_values)
         .map_err(|idx| primitive_to_decimal_cast_error(values[idx], decimal_dtype))?;
 
     // SAFETY: `S::DECIMAL_TYPE` has the same physical representation as the source ptype, and
@@ -644,6 +648,7 @@ fn cached_values_fit_in(array: ArrayView<'_, Primitive>, target_dtype: &DType) -
 mod test {
     use rstest::rstest;
     use vortex_buffer::BitBuffer;
+    use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexError;
     use vortex_error::VortexResult;
@@ -750,6 +755,26 @@ mod test {
             PrimitiveArray::from_iter([0.0f32, 10., 200.]),
             &mut ctx
         );
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    #[case(-1)]
+    fn cast_empty_all_invalid_integer_to_non_nullable_decimal(
+        #[case] scale: i8,
+    ) -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let source = PrimitiveArray::new(Buffer::<i32>::empty(), Validity::AllInvalid);
+        let casted = super::cast_to_decimal(
+            source.as_view(),
+            DecimalDType::new(9, scale),
+            Nullability::NonNullable,
+            &mut ctx,
+        )?;
+        assert!(casted.is_empty());
+        assert!(matches!(casted.validity()?, Validity::NonNullable));
+        Ok(())
     }
 
     #[test]

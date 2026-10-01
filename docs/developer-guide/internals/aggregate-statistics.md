@@ -109,7 +109,8 @@ propagation use separate rules for facts that remain valid, such as known consta
 Generic aggregate results do not prove unchecked constructor invariants. Decimal precision, list
 offsets, validity masks, and list-view trimming validate physical values independently before
 unchecked construction. Masked and patched array construction and row output validation also inspect
-actual validity rather than generic aggregate facts.
+actual validity rather than generic aggregate facts. Decimal casts resolve lazy validity once and
+use that same physical mask for precision validation and the emitted array.
 
 ## Wire Compatibility
 

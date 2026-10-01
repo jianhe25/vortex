@@ -144,9 +144,10 @@ impl AggregationsRef<'_> {
     ///
     /// # Safety
     /// The caller must prove that `result` describes this exact immutable input for `aggregate`,
-    /// including its options. An inexact value must obey the aggregate's bound direction. A false
-    /// fact can cause an incorrect result or violate a consumer's invariants, including invariants
-    /// established by an unchecked array constructor. Scalar dtype validation alone is insufficient.
+    /// including its options. An inexact value must obey the aggregate's bound direction. False
+    /// facts can cause incorrect results. Scalar dtype validation does not establish these facts.
+    /// Seeded results remain generic metadata and do not establish the independent proof required
+    /// by unchecked constructors.
     #[doc(hidden)]
     pub unsafe fn seed_result(
         &self,
