@@ -7,6 +7,7 @@ import os
 import polars as pl
 import pyarrow as pa
 import pytest
+from polars.testing import assert_frame_equal
 
 import vortex as vx
 import vortex.expr as ve
@@ -32,10 +33,6 @@ from vortex.polars_ import polars_to_vortex
         #         & (ve.column("SearchPhrase") != "")
         #     ),
         # ),
-        (
-            pl.col("x").is_between(pl.col("l"), pl.col("u"), closed="none"),
-            (ve.column("x") > ve.column("l")) & (ve.column("x") < ve.column("u")),
-        ),
         (pl.col("c") > 10000, ve.column("c") > 10000),
         #        (pl.col("EventDate") >= date(2013, 7, 1), ve.column("EventDate") >= date(2013, 7, 1)),
     ],
@@ -75,3 +72,20 @@ def test_to_polars_with_projection_and_filter(vxf: vx.VortexFile) -> None:
     df = vxf.to_polars().select("index", "value").filter(pl.col("index") < 100).collect()
     assert df.columns == ["index", "value"]
     assert len(df) == 100
+
+
+@pytest.mark.parametrize(
+    "closed, expected",
+    [("both", [0, 1, 2]), ("left", [0, 1]), ("right", [1, 2]), ("none", [1])],
+)
+def test_polars_is_between(tmp_path, closed, expected):
+    frame = pl.DataFrame(
+        {"id": list(range(6)), "x": [1, 2, 3, 4, None, 2], "l": [1, 1, 1, 1, 1, None], "u": [3] * 6}
+    )
+    expr = pl.col("x").is_between(pl.col("l"), pl.col("u"), closed=closed)
+    path = tmp_path / "between.vortex"
+    vx.io.write(vx.array(frame.to_arrow()), str(path))
+    expected_frame = frame.lazy().filter(expr).collect()
+    actual = vx.open(str(path)).to_polars().filter(expr).collect()
+    assert_frame_equal(actual, expected_frame)
+    assert actual["id"].to_list() == expected
