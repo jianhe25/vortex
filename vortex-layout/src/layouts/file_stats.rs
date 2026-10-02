@@ -11,6 +11,10 @@ use parking_lot::Mutex;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::VortexSessionExecute;
+use vortex_array::aggregate_fn::Accumulator;
+use vortex_array::aggregate_fn::DynAccumulator;
+use vortex_array::aggregate_fn::fns::is_sorted::IsSorted;
+use vortex_array::aggregate_fn::fns::is_sorted::IsSortedOptions;
 use vortex_array::aggregate_fn::fns::sum::sum;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -68,6 +72,9 @@ pub fn accumulate_stats(
 /// Accumulates write-time statistics for a single file column.
 struct StatsAccumulator {
     builders: Vec<Box<dyn StatsArrayBuilder>>,
+    /// Sortedness depends on chunk order, so it is accumulated across chunks in write order by
+    /// the `IsSorted` aggregate, whose partial checks the boundaries between chunks.
+    sortedness: Vec<(Stat, Box<dyn DynAccumulator>)>,
     length: usize,
 }
 
@@ -76,12 +83,29 @@ impl StatsAccumulator {
         if !supports_file_stats(dtype) {
             return Self {
                 builders: Vec::new(),
+                sortedness: Vec::new(),
                 length: 0,
             };
         }
 
+        let sortedness = stats
+            .iter()
+            .filter_map(|&stat| {
+                let options = IsSortedOptions {
+                    strict: match stat {
+                        Stat::IsSorted => false,
+                        Stat::IsStrictSorted => true,
+                        _ => return None,
+                    },
+                };
+                let accumulator = Accumulator::try_new(IsSorted, options, dtype.clone()).ok()?;
+                Some((stat, Box::new(accumulator) as Box<dyn DynAccumulator>))
+            })
+            .collect();
+
         let builders = stats
             .iter()
+            .filter(|stat| !matches!(stat, Stat::IsSorted | Stat::IsStrictSorted))
             .filter_map(|&stat| {
                 stat.dtype(dtype).map(|stat_dtype| {
                     stats_builder_with_capacity(
@@ -96,11 +120,17 @@ impl StatsAccumulator {
 
         Self {
             builders,
+            sortedness,
             length: 0,
         }
     }
 
     fn push_chunk(&mut self, array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<()> {
+        for (stat, accumulator) in &mut self.sortedness {
+            // Cache the chunk's own verdict, which the accumulator then reuses.
+            array.statistics().compute_stat(*stat, ctx)?;
+            accumulator.accumulate(array, ctx)?;
+        }
         for builder in &mut self.builders {
             if let Some(value) = array.statistics().compute_stat(builder.stat(), ctx)? {
                 builder.append_scalar(value.cast(&value.dtype().as_nullable())?)?;
@@ -143,6 +173,14 @@ impl StatsAccumulator {
     /// Returns an aggregated stats set for the table.
     fn as_stats_set(&mut self, stats: &[Stat], ctx: &mut ExecutionCtx) -> VortexResult<StatsSet> {
         let mut stats_set = StatsSet::default();
+        for (stat, accumulator) in &self.sortedness {
+            if self.length > 0
+                && let Some(value) = accumulator.final_scalar()?.into_value()
+            {
+                stats_set.set(*stat, Precision::exact(value));
+            }
+        }
+
         let Some(stats_table) = self.as_array(ctx)? else {
             return Ok(stats_set);
         };
@@ -178,6 +216,7 @@ impl StatsAccumulator {
                         stats_set.set(stat, Precision::exact(sum_value));
                     }
                 }
+                // Sortedness is accumulated separately, in chunk order.
                 Stat::IsConstant | Stat::IsSorted | Stat::IsStrictSorted => {}
             }
         }
