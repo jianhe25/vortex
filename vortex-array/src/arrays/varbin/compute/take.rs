@@ -216,11 +216,13 @@ fn take_views<O: UnsignedPType, I: IntegerPType + AsPrimitive<usize>>(
         }
     };
 
-    // A source smaller than the index list is gathered many times over (a dictionary's values,
-    // for one), so build each source view once and copy 16 bytes per output row, rather than
-    // re-deriving a view from the offsets and bytes for every output row.
+    // A source much smaller than the index list is gathered many times over (a dictionary's
+    // values, for one), so build each source view once and copy 16 bytes per output row, rather
+    // than re-deriving a view from the offsets and bytes for every output row. Below two indices
+    // per source row the up-front views stop paying for themselves, since a take that visits most
+    // source rows about once builds views it never uses.
     let source_len = offsets.len() - 1;
-    if source_len < indices.len() {
+    if source_len < indices.len() / 2 {
         let views: Buffer<BinaryView> = Buffer::from_trusted_len_iter((0..source_len).map(build));
         return gather_views(&views, indices, mask);
     }
