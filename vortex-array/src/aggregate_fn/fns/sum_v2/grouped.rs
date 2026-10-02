@@ -3,6 +3,8 @@
 
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
+use vortex_buffer::BufferMut;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
@@ -165,9 +167,21 @@ impl DynGroupedAggregateKernel for CastGroupedSumV2EncodingKernel {
             return Ok(None);
         }
 
-        let input = input.clone().execute::<PrimitiveArray>(ctx)?;
         let group_ranges = groups.group_ranges(ctx)?;
         let group_validity = groups.group_validity(ctx)?;
+        if !input.is::<Primitive>()
+            && let Some(sums) = chunked_grouped_sum(
+                input,
+                &group_ranges,
+                &group_validity,
+                SumMode::CastToF64,
+                ctx,
+            )?
+        {
+            return Ok(Some(sums));
+        }
+
+        let input = input.clone().execute::<PrimitiveArray>(ctx)?;
         let elem_mask = input
             .as_ref()
             .validity()?
@@ -208,6 +222,208 @@ impl DynGroupedAggregateKernel for CastGroupedSumV2EncodingKernel {
             .into_array(),
         ))
     }
+}
+
+/// Grouped [`SumV2`] kernel for encoded primitive elements whose groups are laid out in order.
+///
+/// Executing the whole element array first decodes it into one large buffer, which for lightly
+/// compressed data such as bit-packed lists costs more than summing it. This kernel decodes the
+/// elements in cache-sized slices and carries each group's running sum across slice boundaries.
+#[derive(Debug)]
+pub(crate) struct ChunkedGroupedSumV2Kernel;
+
+impl DynGroupedAggregateKernel for ChunkedGroupedSumV2Kernel {
+    fn grouped_aggregate(
+        &self,
+        aggregate_fn: &AggregateFnRef,
+        groups: &GroupedArray,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let Some(options) = aggregate_fn.as_opt::<SumV2>() else {
+            return Ok(None);
+        };
+        let elements = groups.elements();
+        if elements.is::<Primitive>() || !matches!(elements.dtype(), DType::Primitive(..)) {
+            return Ok(None);
+        }
+        let group_ranges = groups.group_ranges(ctx)?;
+        let group_validity = groups.group_validity(ctx)?;
+        chunked_grouped_sum(
+            elements,
+            &group_ranges,
+            &group_validity,
+            SumMode::Native {
+                skip_nans: options.skip_nans,
+            },
+            ctx,
+        )
+    }
+}
+
+/// How [`chunked_grouped_sum`] sums its input values.
+#[derive(Clone, Copy)]
+enum SumMode {
+    /// Sum the values in their own type, as [`grouped_sum`] does.
+    Native { skip_nans: bool },
+    /// Convert integers to `f64` and sum the floats, as [`CastGroupedSumV2EncodingKernel`] does.
+    CastToF64,
+}
+
+/// Number of elements decoded at a time, sized so a decoded slice of 64-bit values stays in cache.
+const SUM_CHUNK_LEN: usize = 8 * 1024;
+
+/// Sum groups whose ranges are ordered and disjoint by decoding `input` one slice at a time.
+///
+/// Returns `None` when the group ranges are not ordered, so the caller can decode the whole input.
+fn chunked_grouped_sum(
+    input: &ArrayRef,
+    group_ranges: &GroupRanges,
+    group_validity: &Mask,
+    mode: SumMode,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<ArrayRef>> {
+    let mut prev_end = 0;
+    for (offset, size) in group_ranges.iter() {
+        if offset < prev_end {
+            return Ok(None);
+        }
+        prev_end = offset + size;
+    }
+    let DType::Primitive(ptype, _) = input.dtype() else {
+        return Ok(None);
+    };
+    let ptype = *ptype;
+
+    let (sums, is_overflow, is_empty) = match mode {
+        SumMode::CastToF64 => {
+            if !ptype.is_int() {
+                return Ok(None);
+            }
+            match_each_integer_ptype!(ptype, |T| {
+                chunked_sums::<T, f64>(input, group_ranges, group_validity, ctx, |acc, slice| {
+                    sum_float_all(acc, slice, false);
+                    false
+                })?
+            })
+        }
+        SumMode::Native { skip_nans } => match_each_native_ptype!(ptype,
+            unsigned: |T| {
+                chunked_sums::<T, u64>(input, group_ranges, group_validity, ctx, sum_unsigned_all)?
+            },
+            signed: |T| {
+                chunked_sums::<T, i64>(input, group_ranges, group_validity, ctx, sum_signed_all)?
+            },
+            floating: |T| {
+                chunked_sums::<T, f64>(input, group_ranges, group_validity, ctx, |acc, slice| {
+                    sum_float_all(acc, slice, skip_nans);
+                    false
+                })?
+            }
+        ),
+    };
+
+    let partial_fields = sum_v2_partial_fields(sums.dtype().clone());
+
+    // SAFETY: all three children have one value per group and match `partial_fields`; the struct
+    // validity is derived from the same group count.
+    Ok(Some(
+        unsafe {
+            StructArray::new_unchecked(
+                vec![
+                    sums.into_array(),
+                    BoolArray::new(is_overflow, Validity::NonNullable).into_array(),
+                    BoolArray::new(is_empty, Validity::NonNullable).into_array(),
+                ],
+                partial_fields,
+                group_validity.len(),
+                Validity::from_mask(group_validity.clone(), Nullability::Nullable),
+            )
+        }
+        .into_array(),
+    ))
+}
+
+/// The running sum of one group.
+#[derive(Default)]
+struct GroupSum<A> {
+    acc: A,
+    overflow: bool,
+    any_valid: bool,
+}
+
+/// Sum ordered, disjoint groups of `input` while decoding it one slice at a time.
+fn chunked_sums<T: NativePType, A: NativePType + Default>(
+    input: &ArrayRef,
+    group_ranges: &GroupRanges,
+    group_validity: &Mask,
+    ctx: &mut ExecutionCtx,
+    sum_run: impl Fn(&mut A, &[T]) -> bool,
+) -> VortexResult<(PrimitiveArray, BitBuffer, BitBuffer)> {
+    let group_count = group_ranges.len();
+    let mut sums = BufferMut::<A>::with_capacity(group_count);
+    let mut is_overflow = BitBufferMut::new_unset(group_count);
+    let mut is_empty = BitBufferMut::new_unset(group_count);
+
+    // The decoded slice `[chunk_start, chunk_start + chunk.len())` of the input.
+    let mut chunk_start = 0;
+    let mut chunk: Option<(PrimitiveArray, Mask)> = None;
+
+    for (group, (offset, size)) in group_ranges.iter().enumerate() {
+        let mut state = GroupSum::<A>::default();
+        if group_validity.value(group) {
+            let end = offset + size;
+            let mut pos = offset;
+            while pos < end && !state.overflow {
+                let loaded = chunk.as_ref().is_some_and(|(values, _)| {
+                    pos >= chunk_start && pos < chunk_start + values.len()
+                });
+                if !loaded {
+                    // Start on a block boundary, since encodings such as bit-packing decode whole
+                    // blocks of 1024 values.
+                    chunk_start = pos - pos % 1024;
+                    let chunk_end = (chunk_start + SUM_CHUNK_LEN).min(input.len());
+                    let values = input
+                        .slice(chunk_start..chunk_end)?
+                        .execute::<PrimitiveArray>(ctx)?;
+                    let mask = values
+                        .as_ref()
+                        .validity()?
+                        .execute_mask(values.as_ref().len(), ctx)?;
+                    chunk = Some((values, mask));
+                }
+                let (values, mask) = chunk.as_ref().vortex_expect("chunk was just loaded");
+                let local_start = pos - chunk_start;
+                let local_end = (end - chunk_start).min(values.len());
+                let (overflow, any_valid) = sum_masked_group(
+                    &mut state.acc,
+                    values.as_slice::<T>(),
+                    local_start,
+                    local_end - local_start,
+                    mask,
+                    &sum_run,
+                );
+                state.overflow |= overflow;
+                state.any_valid |= any_valid;
+                pos = chunk_start + local_end;
+            }
+        }
+        if state.overflow {
+            // SAFETY: `group` comes from enumerating `group_ranges`, and the bitmap has one bit
+            // per group.
+            unsafe { is_overflow.set_unchecked(group) };
+        }
+        if !state.any_valid {
+            // SAFETY: as above.
+            unsafe { is_empty.set_unchecked(group) };
+        }
+        sums.push(state.acc);
+    }
+
+    Ok((
+        PrimitiveArray::new(sums.freeze(), Validity::NonNullable),
+        is_overflow.freeze(),
+        is_empty.freeze(),
+    ))
 }
 
 /// Grouped [`SumV2`] implementation for canonical primitive elements.
