@@ -37,6 +37,7 @@ rand = { workspace = true }
 rstest = { workspace = true }
 test-with = { workspace = true }
 vortex-array = { workspace = true, features = ["_test-harness"] }
+vortex-fastlanes = { workspace = true }
 
 [[bench]]
 name = "fsst_compress"
@@ -50,6 +51,11 @@ required-features = ["_test-harness"]
 
 [[bench]]
 name = "fsst_url_compare"
+harness = false
+required-features = ["_test-harness"]
+
+[[bench]]
+name = "fsst_code_predicates"
 harness = false
 required-features = ["_test-harness"]
 
