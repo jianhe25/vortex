@@ -152,11 +152,12 @@ impl Scheme for DeltaScheme {
             return CompressionEstimate::Verdict(EstimateVerdict::Skip);
         }
 
-        // Estimating Delta needs the real transposed-delta span, so defer to a callback that
-        // delta-encodes the array and measures the residual range.
+        // Estimating Delta needs the real residuals, so defer to a callback that delta-encodes
+        // the array and sizes the residuals with the same cascade `compress` uses.
         let min_ratio = self.min_ratio;
+        let scheme_id = self.id();
         CompressionEstimate::Deferred(DeferredEstimate::Callback(Box::new(
-            move |_compressor, data, best_so_far, _ctx, exec_ctx| {
+            move |compressor, data, best_so_far, compress_ctx, exec_ctx| {
                 let primitive = data.array().clone().execute::<PrimitiveArray>(exec_ctx)?;
                 let full_width = primitive.ptype().bit_width() as f64;
                 let len = primitive.len();
@@ -168,22 +169,31 @@ impl Scheme for DeltaScheme {
                     return Ok(EstimateVerdict::Skip);
                 }
 
-                // Measure the actual FastLanes transposed-delta span. This is the lane-stride
-                // difference that gets bit-packed, not the lag-1 difference (which the transpose
-                // makes optimistic), so it is what truly drives the compressed size.
-                let (_bases, deltas) = vortex_fastlanes::delta_compress(&primitive, exec_ctx)?;
-                let delta_stats =
-                    ArrayAndStats::new(deltas.into_array(), GenerateStatsOptions::default());
-                let span = delta_stats.integer_stats(exec_ctx).erased().max_minus_min();
+                let (bases, deltas) = vortex_fastlanes::delta_compress(&primitive, exec_ctx)?;
+                let deltas = deltas.into_array();
 
-                // Bits needed to FoR-pack the residuals. A zero span means constant deltas, which
-                // SequenceScheme already captures more cheaply, so defer to it.
-                let delta_bits = match span.checked_ilog2() {
-                    Some(l) => (l + 1) as f64,
-                    None => return Ok(EstimateVerdict::Skip),
-                };
+                // A zero span means constant deltas, which SequenceScheme captures more cheaply.
+                let delta_stats = ArrayAndStats::new(deltas.clone(), GenerateStatsOptions::default());
+                if delta_stats.integer_stats(exec_ctx).erased().max_minus_min() == 0 {
+                    return Ok(EstimateVerdict::Skip);
+                }
 
-                let ratio = penalized_ratio(len, full_width, delta_bits);
+                // Size the residuals by compressing them, rather than from their min-max span. A
+                // few outlying residuals, such as the jump where a timestamp column restarts at
+                // each new series, would inflate the span to the full width, while the cascade
+                // patches or run-length encodes them and packs the rest in a few bits.
+                let bases = compressor.compress_child(
+                    &bases.into_array(),
+                    &compress_ctx,
+                    scheme_id,
+                    0,
+                    exec_ctx,
+                )?;
+                let deltas =
+                    compressor.compress_child(&deltas, &compress_ctx, scheme_id, 1, exec_ctx)?;
+                let compressed_bytes = (bases.nbytes() + deltas.nbytes()).max(1) as f64;
+
+                let ratio = primitive.nbytes() as f64 / compressed_bytes * DELTA_PENALTY;
                 if ratio <= min_ratio {
                     return Ok(EstimateVerdict::Skip);
                 }
