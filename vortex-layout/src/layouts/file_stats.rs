@@ -121,6 +121,9 @@ impl StatsAccumulator {
                 array.dtype().clone(),
             )?;
             chunk_sum.accumulate(array, ctx)?;
+            if let Some(value) = chunk_sum.final_scalar()?.into_value() {
+                array.statistics().set(Stat::Sum, Precision::Exact(value));
+            }
             sum.merge_from(&mut chunk_sum)?;
         }
         for builder in &mut self.builders {
@@ -564,6 +567,7 @@ mod tests {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::bool::BoolArrayExt;
     use vortex_array::builders::VarBinViewBuilder;
+    use vortex_array::expr::stats::StatsProvider;
     use vortex_buffer::BitBuffer;
     use vortex_buffer::buffer;
 
@@ -689,6 +693,26 @@ mod tests {
         assert_eq!(
             stats.get(Stat::Sum),
             expected.map_or(Precision::Absent, Precision::exact)
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::non_null(vec![3, 4], Some(7))]
+    #[case::overflow(vec![i64::MAX, 1], None)]
+    fn sum_preserves_chunk_cache_publication(
+        #[case] values: Vec<i64>,
+        #[case] expected: Option<i64>,
+    ) -> VortexResult<()> {
+        let array = PrimitiveArray::from_iter(values).into_array();
+        let mut ctx = array_session().create_execution_ctx();
+        let mut acc = StatsAccumulator::new(array.dtype(), &[Stat::Sum], 64);
+        acc.push_chunk(&array, &mut ctx)?;
+        assert_eq!(
+            array.statistics().get(Stat::Sum),
+            expected.map_or(Precision::Absent, |value| {
+                Precision::Exact(Scalar::primitive(value, Nullability::Nullable))
+            })
         );
         Ok(())
     }
