@@ -57,12 +57,36 @@ impl ClickBenchSortedBenchmark {
     }
 }
 
+/// Time-series queries over the sorted ClickBench data, sharing its data directory.
+pub struct ClickBenchTimeSeriesBenchmark {
+    pub queries_file: Option<String>,
+    pub data_url: Url,
+}
+
+impl ClickBenchTimeSeriesBenchmark {
+    /// Create the ClickBench time-series benchmark, optionally using a remote data directory.
+    pub fn new(use_remote_data_dir: Option<String>) -> Result<Self> {
+        Ok(Self {
+            queries_file: None,
+            data_url: resolve_data_url(use_remote_data_dir.as_deref(), CLICKBENCH_SORTED_NAME)?,
+        })
+    }
+}
+
 fn read_clickbench_queries(queries_file: Option<&str>) -> Result<Vec<(usize, String)>> {
+    read_sql_queries(queries_file, "clickbench_queries.sql")
+}
+
+/// Read `;`-separated queries from `queries_file`, or from `default_file` under `sql/`.
+fn read_sql_queries(
+    queries_file: Option<&str>,
+    default_file: &str,
+) -> Result<Vec<(usize, String)>> {
     let queries_filepath = match queries_file {
         Some(file) => file.into(),
         None => Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("sql")
-            .join("clickbench_queries.sql"),
+            .join(default_file),
     };
 
     Ok(fs::read_to_string(queries_filepath)?
@@ -168,6 +192,64 @@ impl Benchmark for ClickBenchSortedBenchmark {
     }
 }
 
+#[async_trait::async_trait]
+impl Benchmark for ClickBenchTimeSeriesBenchmark {
+    fn doc_path(&self) -> &'static str {
+        "vortex-bench/sql/clickbench-timeseries.md"
+    }
+
+    fn queries(&self) -> Result<Vec<(usize, String)>> {
+        read_sql_queries(self.queries_file.as_deref(), "clickbench_timeseries.sql")
+    }
+
+    async fn generate_base_data(&self) -> Result<()> {
+        if self.data_url.scheme() != "file" {
+            return Ok(());
+        }
+
+        generate_sorted_clickbench(CLICKBENCH_SORTED_NAME.to_data_path()).await
+    }
+
+    fn dataset(&self) -> BenchmarkDataset {
+        BenchmarkDataset::ClickBenchTimeSeries
+    }
+
+    fn dataset_name(&self) -> &str {
+        CLICKBENCH_TIMESERIES_NAME
+    }
+
+    fn dataset_display(&self) -> String {
+        CLICKBENCH_TIMESERIES_NAME.to_string()
+    }
+
+    fn data_url(&self) -> &Url {
+        &self.data_url
+    }
+
+    fn table_specs(&self) -> Vec<TableSpec> {
+        vec![TableSpec::new("hits", Some(HITS_SCHEMA.clone()))]
+    }
+}
+
 fn clickbench_flavor(flavor: Flavor) -> String {
     format!("clickbench_{flavor}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeseries_queries_split_into_one_entry_per_query() -> Result<()> {
+        let queries = read_sql_queries(None, "clickbench_timeseries.sql")?;
+
+        assert_eq!(queries.len(), 16);
+        assert!(
+            queries
+                .iter()
+                .enumerate()
+                .all(|(expected_idx, (idx, sql))| *idx == expected_idx && sql.contains("FROM hits"))
+        );
+        Ok(())
+    }
 }

@@ -56,6 +56,7 @@ class Benchmark(Enum):
     TPCDS = "tpcds"
     CLICKBENCH = "clickbench"
     CLICKBENCH_SORTED = "clickbench-sorted"
+    CLICKBENCH_TIMESERIES = "clickbench-timeseries"
     FINEWEB = "fineweb"
     GHARCHIVE = "gh-archive"
     POLARSIGNALS = "polarsignals"

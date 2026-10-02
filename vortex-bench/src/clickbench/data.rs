@@ -36,6 +36,8 @@ use crate::utils::file::temp_download_filepath;
 
 /// Benchmark and local data directory name for ClickBench sorted by event time.
 pub const CLICKBENCH_SORTED_NAME: &str = "clickbench-sorted";
+/// Benchmark name for the time-series queries over the sorted ClickBench data.
+pub const CLICKBENCH_TIMESERIES_NAME: &str = "clickbench-timeseries";
 const CLICKBENCH_PARTITIONED_NAME: &str = "clickbench_partitioned";
 const SORTED_SHARD_COUNT: usize = 100;
 const SORTED_SHARD_COUNT_U64: u64 = 100;
