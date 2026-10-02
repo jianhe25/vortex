@@ -33,7 +33,8 @@ const FALLBACK_MIN_DENSITY: f64 = 0.15;
 
 /// Gathers the selected values one chunk at a time, decoding only the chunks that hold a selected
 /// value and never materializing the full decoded array. Masks that select a large share of
-/// values from nearly every chunk keep the decode-then-filter path.
+/// values from nearly every chunk keep the decode-then-filter path, and contiguous masks keep the
+/// slice path.
 impl FilterKernel for Delta {
     fn filter(
         array: ArrayView<'_, Self>,
@@ -44,6 +45,10 @@ impl FilterKernel for Delta {
             return Ok(None);
         };
         let bits = values.bit_buffer();
+        // A contiguous mask executes as a slice, which decodes only the selected range.
+        if is_contiguous(bits, values.true_count()) {
+            return Ok(None);
+        }
         let offset = array.offset();
         let total_chunks = (offset + array.len()).div_ceil(1024);
         let touched = touched_chunks(bits, offset);
@@ -61,6 +66,13 @@ impl FilterKernel for Delta {
             PrimitiveArray::new(buffer, validity)
         });
         Ok(Some(filtered.reinterpret_cast(ptype).into_array()))
+    }
+}
+
+fn is_contiguous(bits: &BitBuffer, true_count: usize) -> bool {
+    match (bits.set_indices().next(), bits.last_set_index()) {
+        (Some(first), Some(last)) => last - first + 1 == true_count,
+        _ => true,
     }
 }
 
@@ -198,7 +210,7 @@ mod tests {
 
     #[rstest]
     #[case::sparse_scattered(Mask::from_indices(3000, (0..3000).step_by(97)))]
-    #[case::one_run(Mask::from_slices(3000, vec![(1020, 1100)]))]
+    #[case::one_run_slices(Mask::from_slices(3000, vec![(1020, 1100)]))]
     #[case::last_chunk(Mask::from_indices(3000, [2047, 2048, 2999]))]
     #[case::full_words_across_chunks(Mask::from_slices(3000, vec![(960, 1150), (2000, 2100)]))]
     #[case::dense_falls_back(Mask::from_indices(3000, (0..3000).step_by(2)))]
