@@ -685,6 +685,18 @@ fn execute_parent_for_child(
     Ok(None)
 }
 
+impl ArrayRef {
+    /// Run the session's `execute_parent` kernels against this array's children once, as the
+    /// executor does before executing an encoding.
+    pub(crate) fn try_execute_parent_kernels(
+        &self,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let kernels = Arc::clone(&ctx.execute_parent_kernels);
+        try_execute_parent(self, &kernels, ctx)
+    }
+}
+
 /// Try execute_parent on each occupied slot of the array.
 fn try_execute_parent(
     array: &ArrayRef,

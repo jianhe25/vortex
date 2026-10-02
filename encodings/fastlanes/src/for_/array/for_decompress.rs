@@ -20,6 +20,7 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::builders::PrimitiveBuilder;
 use vortex_array::builders::UninitRange;
 use vortex_array::chunk_iter::ChunkMut;
+use vortex_array::chunk_iter::ChunkPatches;
 use vortex_array::chunk_iter::ChunkSink;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PhysicalPType;
@@ -38,7 +39,6 @@ use crate::BitPacked;
 use crate::BitPackedArrayExt;
 use crate::FL_CHUNK_SIZE;
 use crate::FoRArray;
-use crate::bitpacking::chunked_decompress;
 use crate::for_::array::FoRArrayExt;
 use crate::for_::array::FoRArraySlotsExt;
 use crate::unpack_iter::for_each_packed_chunk;
@@ -370,9 +370,10 @@ fn apply_patches<T: NativePType + WrappingAdd>(
 /// Whether [`decompress_chunks`] can stream: either the fused unpack applies to a [`BitPacked`]
 /// child, or the encoded child streams and each chunk gets its references added on the way up.
 pub(crate) fn supports_decompress_chunks(array: ArrayView<'_, crate::FoR>) -> bool {
-    let fused = array.encoded().as_opt::<BitPacked>().is_some_and(|bp| {
-        array.references().is::<Constant>() || bp.offset() == array.offset()
-    });
+    let fused = array
+        .encoded()
+        .as_opt::<BitPacked>()
+        .is_some_and(|bp| array.references().is::<Constant>() || bp.offset() == array.offset());
     fused || array.encoded().supports_decompress_chunks()
 }
 
@@ -457,15 +458,14 @@ fn fused_decompress_chunks<
     let offset = usize::from(bp.offset());
     let bit_width = bp.bit_width() as usize;
 
-    let patches = match bp.patches() {
-        None => Vec::new(),
-        Some(patches) => chunked_decompress::build_patch_list(&patches, ctx, |row, value: T| {
+    let mut patches = match bp.patches() {
+        None => ChunkPatches::new(Vec::new()),
+        Some(patches) => ChunkPatches::try_from_patches(&patches, ctx, |row, value: T| {
             value.wrapping_add(&chunk_reference((offset + row) / FL_CHUNK_SIZE))
         })?,
     };
 
     let mut scratch = [const { MaybeUninit::<T::Physical>::uninit() }; FL_CHUNK_SIZE];
-    let mut patch_cursor = 0;
     let mut result = Ok(());
     for_each_packed_chunk::<T, _>(
         bp.packed_slice::<T::Physical>(),
@@ -490,8 +490,7 @@ fn fused_decompress_chunks<
                     rows.len(),
                 )
             };
-            patch_cursor =
-                chunked_decompress::patch_chunk(values, rows.start, &patches, patch_cursor);
+            patches.apply(values, rows.start);
             result = sink.accept(ChunkMut::new(values), rows);
         },
     )?;
@@ -519,7 +518,8 @@ where
         let mut start = 0;
         while start < values.len() {
             let for_chunk = (self.offset + rows.start + start) / FL_CHUNK_SIZE;
-            let end = ((for_chunk + 1) * FL_CHUNK_SIZE - self.offset - rows.start).min(values.len());
+            let end =
+                ((for_chunk + 1) * FL_CHUNK_SIZE - self.offset - rows.start).min(values.len());
             let reference = (self.chunk_reference)(for_chunk);
             for value in &mut values[start..end] {
                 *value = value.wrapping_add(&reference);
@@ -611,7 +611,11 @@ mod tests {
     fn chunked_values() -> PrimitiveArray {
         PrimitiveArray::from_iter((0..5000i64).map(|i| {
             let base = (i / 1024) * 1_000_000 - 3_000_000;
-            if i % 701 == 0 { base + 5_000 } else { base + i % 50 }
+            if i % 701 == 0 {
+                base + 5_000
+            } else {
+                base + i % 50
+            }
         }))
     }
 
@@ -644,15 +648,21 @@ mod tests {
         let sliced = sliced.as_::<FoR>();
         // Slicing a patched BitPacked array stays lazy until executed, which applies its slice
         // kernel.
-        let encoded = sliced.encoded().clone().execute_until::<BitPacked>(&mut ctx)?;
+        let encoded = sliced
+            .encoded()
+            .clone()
+            .execute_until::<BitPacked>(&mut ctx)?;
         if bitpack {
             assert_eq!(encoded.as_::<BitPacked>().offset(), sliced.offset());
         }
-        let array =
-            FoR::try_new_chunked(encoded, sliced.references().clone(), sliced.offset())?.into_array();
+        let array = FoR::try_new_chunked(encoded, sliced.references().clone(), sliced.offset())?
+            .into_array();
         assert!(array.supports_decompress_chunks());
 
-        let expected = values.into_array().slice(range)?.execute::<PrimitiveArray>(&mut ctx)?;
+        let expected = values
+            .into_array()
+            .slice(range)?
+            .execute::<PrimitiveArray>(&mut ctx)?;
         assert_eq!(stream::<i64>(&array, &mut ctx)?, expected.as_slice::<i64>());
         Ok(())
     }
@@ -672,7 +682,10 @@ mod tests {
         let bp = array.encoded().as_::<BitPacked>();
         assert_ne!(bp.offset(), array.offset());
 
-        let expected = values.into_array().slice(300..5000)?.execute::<PrimitiveArray>(&mut ctx)?;
+        let expected = values
+            .into_array()
+            .slice(300..5000)?
+            .execute::<PrimitiveArray>(&mut ctx)?;
         assert_eq!(
             stream::<i64>(&array.into_array(), &mut ctx)?,
             expected.as_slice::<i64>()

@@ -10,16 +10,12 @@
 
 use std::mem::MaybeUninit;
 
-use num_traits::AsPrimitive;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
-use vortex_array::arrays::PrimitiveArray;
 use vortex_array::chunk_iter::ChunkMut;
+use vortex_array::chunk_iter::ChunkPatches;
 use vortex_array::chunk_iter::ChunkSink;
-use vortex_array::dtype::NativePType;
 use vortex_array::match_each_integer_ptype;
-use vortex_array::match_each_unsigned_integer_ptype;
-use vortex_array::patches::Patches;
 use vortex_error::VortexResult;
 
 use crate::BitPacked;
@@ -46,67 +42,22 @@ fn decompress_chunks_typed<T: BitPackedUnpack>(
         return Ok(());
     }
 
-    let patches = match array.patches() {
-        None => Vec::new(),
-        Some(patches) => build_patch_list(&patches, ctx, |_, value: T| value)?,
+    let mut patches = match array.patches() {
+        None => ChunkPatches::new(Vec::new()),
+        Some(patches) => ChunkPatches::try_from_patches(&patches, ctx, |_, value: T| value)?,
     };
 
     let mut scratch = [const { MaybeUninit::<T>::uninit() }; FL_CHUNK_SIZE];
     let mut chunks = array.unpacked_chunks::<T>(&mut scratch)?;
-    let mut patch_cursor = 0;
     let mut result = Ok(());
     chunks.for_each_unpacked_chunk(|chunk, rows| {
         if result.is_err() {
             return;
         }
-        patch_cursor = patch_chunk(chunk, rows.start, &patches, patch_cursor);
+        patches.apply(chunk, rows.start);
         result = sink.accept(ChunkMut::new(chunk), rows);
     });
     result
-}
-
-/// Materialize sparse patches once as sorted `(row, value)` pairs, mapping each value through
-/// `map(row, value)`, so the per-chunk loop only advances a cursor. This is the only heap state the
-/// streaming path allocates, and it is proportional to the patch count, not the array length.
-pub(crate) fn build_patch_list<T: NativePType>(
-    patches: &Patches,
-    ctx: &mut ExecutionCtx,
-    map: impl Fn(usize, T) -> T,
-) -> VortexResult<Vec<(usize, T)>> {
-    let indices = patches.indices().clone().execute::<PrimitiveArray>(ctx)?;
-    let values = patches.values().clone().execute::<PrimitiveArray>(ctx)?;
-    let values = values.as_slice::<T>();
-    let offset = patches.offset();
-    Ok(match_each_unsigned_integer_ptype!(indices.ptype(), |P| {
-        indices
-            .as_slice::<P>()
-            .iter()
-            .zip(values)
-            .map(|(&index, &value)| {
-                let row = <P as AsPrimitive<usize>>::as_(index) - offset;
-                (row, map(row, value))
-            })
-            .collect()
-    }))
-}
-
-/// Overwrite the rows of `chunk`, which starts at row `start`, that `patches` covers, beginning
-/// at `cursor`, and return the advanced cursor.
-#[inline]
-pub(crate) fn patch_chunk<T: Copy>(
-    chunk: &mut [T],
-    start: usize,
-    patches: &[(usize, T)],
-    mut cursor: usize,
-) -> usize {
-    let end = start + chunk.len();
-    while let Some(&(row, value)) = patches.get(cursor)
-        && row < end
-    {
-        chunk[row - start] = value;
-        cursor += 1;
-    }
-    cursor
 }
 
 #[cfg(test)]

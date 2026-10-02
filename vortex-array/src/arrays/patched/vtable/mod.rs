@@ -11,6 +11,7 @@ mod slice;
 
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::ops::Range;
 
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
@@ -46,6 +47,7 @@ use crate::buffer::BufferHandle;
 use crate::builders::ArrayBuilder;
 use crate::builders::PrimitiveBuilder;
 use crate::chunk_iter::ChunkMut;
+use crate::chunk_iter::ChunkPatches;
 use crate::chunk_iter::ChunkSink;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
@@ -347,15 +349,14 @@ impl VTable for Patched {
 
         match_each_native_ptype!(values.ptype(), |V| {
             let mut adapter = PatchChunkSink {
-                patch_list: build_row_sorted_patches::<V>(
+                patches: ChunkPatches::new(build_row_sorted_patches::<V>(
                     lane_offsets.as_slice::<u32>(),
                     indices.as_slice::<u16>(),
                     values.as_slice::<V>(),
                     offset,
                     len,
                     n_lanes,
-                ),
-                cursor: 0,
+                )),
                 inner: sink,
             };
             array.inner().decompress_chunks(ctx, &mut adapter)
@@ -395,26 +396,15 @@ fn build_row_sorted_patches<V: NativePType>(
 
 /// Sink adapter that overwrites patched rows in each streamed chunk before forwarding it.
 struct PatchChunkSink<'a, V> {
-    patch_list: Vec<(usize, V)>,
-    cursor: usize,
+    patches: ChunkPatches<V>,
     inner: &'a mut dyn ChunkSink,
 }
 
 impl<V: NativePType> ChunkSink for PatchChunkSink<'_, V> {
     #[inline]
-    fn accept(
-        &mut self,
-        mut chunk: ChunkMut<'_>,
-        row_range: std::ops::Range<usize>,
-    ) -> VortexResult<()> {
-        let out = chunk.as_slice_mut::<V>();
-        while let Some(&(row, value)) = self.patch_list.get(self.cursor)
-            && row < row_range.end
-        {
-            out[row - row_range.start] = value;
-            self.cursor += 1;
-        }
-        self.inner.accept(chunk, row_range)
+    fn accept(&mut self, mut chunk: ChunkMut<'_>, rows: Range<usize>) -> VortexResult<()> {
+        self.patches.apply(chunk.as_slice_mut::<V>(), rows.start);
+        self.inner.accept(chunk, rows)
     }
 }
 

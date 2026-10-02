@@ -32,7 +32,9 @@
 //! # Contract
 //!
 //! - Chunks arrive in order, are contiguous, and cover `0..array.len()` exactly (debug-checked).
-//! - Chunks may be shorter than [`DECOMPRESS_CHUNK_LEN`] (sliced blocks, filtered blocks).
+//! - Chunks hold at most [`DECOMPRESS_CHUNK_LEN`] rows (debug-checked), and may hold fewer
+//!   (sliced blocks, filtered blocks), so adapters that change the value type can convert into a
+//!   fixed stack scratch chunk.
 //! - Chunks are producer-owned scratch: a sink may mutate one freely — wrappers rely on this to
 //!   transform values in place — and its contents are invalid once `accept` returns.
 //! - Validity is *not* streamed. Positions that are logically null hold unspecified but
@@ -59,6 +61,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use num_traits::AsPrimitive;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
@@ -69,6 +72,8 @@ use crate::builders::PrimitiveBuilder;
 use crate::dtype::NativePType;
 use crate::dtype::PType;
 use crate::match_each_native_ptype;
+use crate::match_each_unsigned_integer_ptype;
+use crate::patches::Patches;
 
 /// The target number of elements per streamed chunk.
 ///
@@ -134,6 +139,59 @@ impl<'a> ChunkMut<'a> {
         assert_eq!(T::PTYPE, self.ptype, "ChunkMut ptype mismatch");
         // SAFETY: constructed from a valid, exclusively borrowed `&mut [T]` with matching ptype.
         unsafe { std::slice::from_raw_parts_mut(self.data.cast(), self.len) }
+    }
+
+    /// Re-tag the chunk as values of `U`, a type of the same width, after transforming its values
+    /// in place (e.g. decoding ALP integers into floats).
+    ///
+    /// The bytes are not converted, which is sound because every primitive type is valid for
+    /// any bit pattern.
+    ///
+    /// # Panics
+    /// Panics if `U` is not the same width as the chunk's ptype.
+    #[inline]
+    pub fn retype<U: NativePType>(self) -> ChunkMut<'a> {
+        self.retype_to(U::PTYPE)
+    }
+
+    /// Re-tag the chunk as values of `ptype`, as [`Self::retype`] does for a type chosen at
+    /// runtime, e.g. to decode a signed type through its unsigned counterpart.
+    ///
+    /// # Panics
+    /// Panics if `ptype` is not the same width as the chunk's ptype.
+    #[inline]
+    pub fn retype_to(self, ptype: PType) -> ChunkMut<'a> {
+        assert_eq!(
+            ptype.byte_width(),
+            self.ptype.byte_width(),
+            "ChunkMut can only be re-tagged to a type of the same width"
+        );
+        ChunkMut {
+            ptype,
+            data: self.data,
+            len: self.len,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Narrow the chunk to the values in `range`, e.g. to forward only the rows a slice covers.
+    ///
+    /// # Panics
+    /// Panics if `range` is not within the chunk.
+    #[inline]
+    pub fn narrow(self, range: Range<usize>) -> ChunkMut<'a> {
+        assert!(
+            range.start <= range.end && range.end <= self.len,
+            "range {range:?} out of bounds for a chunk of {}",
+            self.len
+        );
+        ChunkMut {
+            ptype: self.ptype,
+            // SAFETY: `range.start` is within the chunk, so the offset stays in its allocation.
+            data: unsafe { self.data.add(range.start * self.ptype.byte_width()) },
+            len: range.len(),
+            _marker: PhantomData,
+        }
     }
 
     /// Reborrow this chunk with a shorter lifetime, e.g. to forward it to a downstream sink.
@@ -298,6 +356,18 @@ fn streaming_chain_len(array: &ArrayRef) -> usize {
         .unwrap_or(0)
 }
 
+/// Whether the chain of same-length, non-canonical children below `array` reaches `depth`
+/// nodes, counting `array` itself.
+///
+/// This walk makes no encoding calls, so the executor turns away the common shallow trees before
+/// asking any encoding whether it streams.
+fn spine_reaches(array: &ArrayRef, depth: usize) -> bool {
+    depth <= 1
+        || array.children_iter().any(|child| {
+            child.len() == array.len() && !child.is_canonical() && spine_reaches(child, depth - 1)
+        })
+}
+
 /// Returns whether the executor should canonicalize this array by streaming chunks rather than
 /// materializing an intermediate per encoding level.
 ///
@@ -305,6 +375,7 @@ fn streaming_chain_len(array: &ArrayRef) -> usize {
 /// [`MIN_STREAMING_CHAIN`] nodes — the depth at which streaming is measured to win.
 pub(crate) fn should_execute_via_chunks(array: &ArrayRef) -> bool {
     CHUNKED_EXECUTE_ENABLED.load(Ordering::Relaxed)
+        && spine_reaches(array, MIN_STREAMING_CHAIN)
         && streaming_chain_len(array) >= MIN_STREAMING_CHAIN
 }
 
@@ -352,11 +423,212 @@ struct BuilderSink<'a, T> {
 impl<T: NativePType> ChunkSink for BuilderSink<'_, T> {
     #[inline]
     fn accept(&mut self, chunk: ChunkMut<'_>, row_range: Range<usize>) -> VortexResult<()> {
-        // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout.
-        let src: &[MaybeUninit<T>] = unsafe { std::mem::transmute(chunk.as_slice::<T>()) };
-        self.dst[row_range].copy_from_slice(src);
+        self.dst[row_range].write_copy_of_slice(chunk.as_slice::<T>());
         Ok(())
     }
+}
+
+/// Stream `len` rows through `sink` from one stack scratch chunk that `fill` writes before each
+/// emission. This is the shape of every leaf producer that generates its values (constants,
+/// sequences, runs) or copies them out of a buffer.
+pub fn stream_from_fn<T: NativePType>(
+    len: usize,
+    sink: &mut dyn ChunkSink,
+    mut fill: impl FnMut(&mut [T], Range<usize>) -> VortexResult<()>,
+) -> VortexResult<()> {
+    let mut scratch = [T::default(); DECOMPRESS_CHUNK_LEN];
+    let mut start = 0;
+    while start < len {
+        let end = (start + DECOMPRESS_CHUNK_LEN).min(len);
+        let chunk = &mut scratch[..end - start];
+        fill(chunk, start..end)?;
+        sink.accept(ChunkMut::new(chunk), start..end)?;
+        start = end;
+    }
+    Ok(())
+}
+
+/// Sparse patches resolved once into row-sorted `(row, value)` pairs, applied to streamed chunks
+/// with a forward cursor.
+///
+/// This is the only heap state streaming producers allocate, and it is proportional to the patch
+/// count, not the array length.
+pub struct ChunkPatches<T> {
+    patches: Vec<(usize, T)>,
+    cursor: usize,
+}
+
+impl<T: NativePType> ChunkPatches<T> {
+    /// Wrap `(row, value)` pairs that are already sorted by row.
+    pub fn new(patches: Vec<(usize, T)>) -> Self {
+        debug_assert!(patches.is_sorted_by_key(|&(row, _)| row));
+        Self { patches, cursor: 0 }
+    }
+
+    /// Resolve `patches`, mapping each value through `map(row, value)`.
+    pub fn try_from_patches(
+        patches: &Patches,
+        ctx: &mut ExecutionCtx,
+        map: impl Fn(usize, T) -> T,
+    ) -> VortexResult<Self> {
+        let indices = patches.indices().clone().execute::<PrimitiveArray>(ctx)?;
+        let values = patches.values().clone().execute::<PrimitiveArray>(ctx)?;
+        let values = values.as_slice::<T>();
+        let offset = patches.offset();
+        let patches = match_each_unsigned_integer_ptype!(indices.ptype(), |P| {
+            indices
+                .as_slice::<P>()
+                .iter()
+                .zip(values)
+                .map(|(&index, &value)| {
+                    let row = <P as AsPrimitive<usize>>::as_(index) - offset;
+                    (row, map(row, value))
+                })
+                .collect()
+        });
+        Ok(Self::new(patches))
+    }
+
+    /// Overwrite the patched rows of `chunk`, which starts at row `start`.
+    ///
+    /// Chunks must be applied in row order, as they are streamed.
+    #[inline]
+    pub fn apply(&mut self, chunk: &mut [T], start: usize) {
+        let end = start + chunk.len();
+        while let Some(&(row, value)) = self.patches.get(self.cursor)
+            && row < end
+        {
+            chunk[row - start] = value;
+            self.cursor += 1;
+        }
+    }
+}
+
+/// Adapts a decoder of whole [`DECOMPRESS_CHUNK_LEN`]-row blocks, such as FastLanes RLE or delta,
+/// into a sink over its child's stream.
+///
+/// The child's chunks are regrouped into whole blocks aligned to the start of the stream: chunks
+/// that already are whole aligned blocks pass straight through, others are buffered. Each block is
+/// decoded by `decode(block_index, input, output)` into a scratch block, and the rows of it that
+/// fall in the array's `offset..offset + len` window of the stream are forwarded, renumbered from
+/// the window's start. Blocks past the window are never decoded.
+///
+/// Input chunks are read as `I` and output chunks are tagged `output_ptype`, each of which may
+/// differ from the stream's type in signedness only, so signed types decode through their
+/// unsigned counterparts.
+pub struct BlockDecodeSink<'a, I, O, D> {
+    offset: usize,
+    len: usize,
+    output_ptype: PType,
+    decode: D,
+    pending: [I; DECOMPRESS_CHUNK_LEN],
+    pending_len: usize,
+    output: [O; DECOMPRESS_CHUNK_LEN],
+    inner: &'a mut dyn ChunkSink,
+}
+
+impl<'a, I, O, D> BlockDecodeSink<'a, I, O, D>
+where
+    I: NativePType,
+    O: NativePType,
+    D: FnMut(usize, &[I; DECOMPRESS_CHUNK_LEN], &mut [O; DECOMPRESS_CHUNK_LEN]) -> VortexResult<()>,
+{
+    /// Forward rows `offset..offset + len` of the decoded stream, tagged `output_ptype`, to
+    /// `inner`.
+    pub fn new(
+        offset: usize,
+        len: usize,
+        output_ptype: PType,
+        decode: D,
+        inner: &'a mut dyn ChunkSink,
+    ) -> Self {
+        Self {
+            offset,
+            len,
+            output_ptype,
+            decode,
+            pending: [I::default(); DECOMPRESS_CHUNK_LEN],
+            pending_len: 0,
+            output: [O::default(); DECOMPRESS_CHUNK_LEN],
+            inner,
+        }
+    }
+}
+
+impl<I, O, D> ChunkSink for BlockDecodeSink<'_, I, O, D>
+where
+    I: NativePType,
+    O: NativePType,
+    D: FnMut(usize, &[I; DECOMPRESS_CHUNK_LEN], &mut [O; DECOMPRESS_CHUNK_LEN]) -> VortexResult<()>,
+{
+    fn accept(&mut self, chunk: ChunkMut<'_>, rows: Range<usize>) -> VortexResult<()> {
+        let chunk = chunk.retype_to(I::PTYPE);
+        let mut input = chunk.as_slice::<I>();
+        if self.pending_len == 0
+            && rows.start.is_multiple_of(DECOMPRESS_CHUNK_LEN)
+            && let Ok(block) = <&[I; DECOMPRESS_CHUNK_LEN]>::try_from(input)
+        {
+            return decode_block(
+                rows.start / DECOMPRESS_CHUNK_LEN,
+                block,
+                &mut self.decode,
+                &mut self.output,
+                self.offset..self.offset + self.len,
+                self.output_ptype,
+                &mut *self.inner,
+            );
+        }
+
+        let mut row = rows.start;
+        while !input.is_empty() {
+            let take = (DECOMPRESS_CHUNK_LEN - self.pending_len).min(input.len());
+            self.pending[self.pending_len..][..take].copy_from_slice(&input[..take]);
+            self.pending_len += take;
+            row += take;
+            input = &input[take..];
+            if self.pending_len == DECOMPRESS_CHUNK_LEN {
+                self.pending_len = 0;
+                decode_block(
+                    row / DECOMPRESS_CHUNK_LEN - 1,
+                    &self.pending,
+                    &mut self.decode,
+                    &mut self.output,
+                    self.offset..self.offset + self.len,
+                    self.output_ptype,
+                    &mut *self.inner,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Decode block `index` of the stream and forward the rows of it within `window`.
+fn decode_block<I, O, D>(
+    index: usize,
+    input: &[I; DECOMPRESS_CHUNK_LEN],
+    decode: &mut D,
+    output: &mut [O; DECOMPRESS_CHUNK_LEN],
+    window: Range<usize>,
+    output_ptype: PType,
+    inner: &mut dyn ChunkSink,
+) -> VortexResult<()>
+where
+    O: NativePType,
+    D: FnMut(usize, &[I; DECOMPRESS_CHUNK_LEN], &mut [O; DECOMPRESS_CHUNK_LEN]) -> VortexResult<()>,
+{
+    let block_start = index * DECOMPRESS_CHUNK_LEN;
+    let start = block_start.max(window.start);
+    let end = (block_start + DECOMPRESS_CHUNK_LEN).min(window.end);
+    if start >= end {
+        return Ok(());
+    }
+    decode(index, input, output)?;
+    let chunk = ChunkMut::new(&mut output[start - block_start..end - block_start]);
+    inner.accept(
+        chunk.retype_to(output_ptype),
+        start - window.start..end - window.start,
+    )
 }
 
 #[cfg(debug_assertions)]
@@ -376,6 +648,10 @@ impl ChunkSink for CoverageCheckSink<'_> {
             "chunk/row_range length mismatch"
         );
         debug_assert_eq!(chunk.ptype(), self.ptype, "chunk ptype mismatch");
+        debug_assert!(
+            chunk.len() <= DECOMPRESS_CHUNK_LEN,
+            "chunk exceeds the chunk length"
+        );
         self.next_row = row_range.end;
         self.inner.accept(chunk, row_range)
     }
@@ -384,8 +660,7 @@ impl ChunkSink for CoverageCheckSink<'_> {
 /// Fallback chunked decompression: execute the array to a canonical [`PrimitiveArray`], then
 /// stream copies of its values in [`DECOMPRESS_CHUNK_LEN`]-sized chunks.
 ///
-/// This is the two-pass baseline. It copies each chunk into a single reusable scratch buffer
-/// (allocated once) because sinks receive exclusive, mutable chunks.
+/// This is the two-pass baseline.
 pub fn decompress_chunks_via_canonical(
     array: &ArrayRef,
     ctx: &mut ExecutionCtx,
@@ -397,15 +672,16 @@ pub fn decompress_chunks_via_canonical(
     })
 }
 
-fn stream_slice_chunks<T: NativePType>(values: &[T], sink: &mut dyn ChunkSink) -> VortexResult<()> {
-    let mut scratch = vec![T::default(); values.len().min(DECOMPRESS_CHUNK_LEN)];
-    for (chunk_idx, chunk) in values.chunks(DECOMPRESS_CHUNK_LEN).enumerate() {
-        let start = chunk_idx * DECOMPRESS_CHUNK_LEN;
-        let scratch = &mut scratch[..chunk.len()];
-        scratch.copy_from_slice(chunk);
-        sink.accept(ChunkMut::new(scratch), start..start + chunk.len())?;
-    }
-    Ok(())
+/// Stream copies of `values` through `sink`, one stack scratch chunk at a time, since sinks receive
+/// exclusive, mutable chunks.
+pub fn stream_slice_chunks<T: NativePType>(
+    values: &[T],
+    sink: &mut dyn ChunkSink,
+) -> VortexResult<()> {
+    stream_from_fn(values.len(), sink, |chunk, rows| {
+        chunk.copy_from_slice(&values[rows]);
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -418,10 +694,12 @@ mod tests {
     use crate::array_session;
     use crate::arrays::ConstantArray;
     use crate::arrays::Patched;
+    use crate::builtins::ArrayBuiltins;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::patches::Patches;
     use crate::scalar::Scalar;
+    use crate::scalar_fn::fns::operators::Operator;
 
     fn collect_chunks<T: NativePType>(array: &ArrayRef) -> VortexResult<Vec<T>> {
         let mut ctx = array_session().create_execution_ctx();
@@ -481,12 +759,10 @@ mod tests {
     #[test]
     fn unsupported_encoding_errors_without_emitting() -> VortexResult<()> {
         let mut ctx = array_session().create_execution_ctx();
-        // A primitive-typed encoding tree with no streaming support: Dict over primitives.
-        let array = crate::arrays::DictArray::try_new(
-            buffer![0u32, 1, 0, 1].into_array(),
-            buffer![10i32, 20].into_array(),
-        )?
-        .into_array();
+        // A primitive-typed encoding tree with no streaming support: a lazy expression.
+        let array = buffer![1i32, 2, 1, 2]
+            .into_array()
+            .binary(buffer![9i32, 18, 9, 18].into_array(), Operator::Add)?;
         assert!(!array.supports_decompress_chunks());
 
         let mut emitted = 0usize;
