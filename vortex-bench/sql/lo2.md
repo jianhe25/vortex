@@ -53,7 +53,8 @@ The harness lives in [`src/lo2`](../src/lo2).
 
 ## CI variant
 
-This suite is not in the CI matrix.
+CI runs this suite only under the `action/bench-sql-extended` label, on DataFusion and DuckDB
+over Parquet and Vortex. It does not run on `develop` or under the other benchmark labels.
 
 ## Running locally
 
