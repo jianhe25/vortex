@@ -112,12 +112,6 @@ pub(crate) type ExecuteParentKernelRef = Arc<dyn DynExecuteParentKernel>;
 
 pub(crate) type ParentExecutionKernels = HashMap<ExecuteParentFnId, Arc<[ExecuteParentKernelRef]>>;
 
-/// The set of parent encoding ids that have at least one execute-parent kernel registered.
-///
-/// The executor consults this before looking up `(parent, child)` pairs, so a parent whose
-/// encoding has no kernels (every pure compression encoding) skips the per-child lookups.
-pub(crate) type ParentExecutionParents = HashMap<Id, ()>;
-
 #[derive(Debug)]
 struct ExecuteParentFnKernel(ExecuteParentFn);
 
@@ -191,7 +185,6 @@ type ExecuteParentRegistry = ArcSwapMap<ExecuteParentFnId, Arc<[ExecuteParentKer
 pub struct ArrayKernels {
     reduce_parent: ReduceParentRegistry,
     execute_parent: ExecuteParentRegistry,
-    execute_parent_parents: ArcSwapMap<Id, ()>,
 }
 
 impl Default for ArrayKernels {
@@ -208,7 +201,6 @@ impl ArrayKernels {
         Self {
             reduce_parent: ReduceParentRegistry::default(),
             execute_parent: ExecuteParentRegistry::default(),
-            execute_parent_parents: ArcSwapMap::default(),
         }
     }
 
@@ -258,7 +250,7 @@ impl ArrayKernels {
             .collect();
         self.execute_parent
             .extend(hash_fn_id(parent, child).into(), kernels.as_slice());
-        self.execute_parent_parents.insert_if_absent(parent, ());
+        self.mark_execute_parent(parent);
     }
 
     /// Register a typed [`ExecuteParentKernel`] for `(parent, child.id())`.
@@ -282,7 +274,17 @@ impl ArrayKernels {
                 kernel,
             }) as ExecuteParentKernelRef,
         );
-        self.execute_parent_parents.insert_if_absent(parent, ());
+        self.mark_execute_parent(parent);
+    }
+
+    /// Record that `parent` owns at least one execute-parent kernel.
+    ///
+    /// The marker lives in the same map as the kernels, under a key no `(parent, child)` pair
+    /// hashes to, so the executor's snapshot answers "does this parent have any kernel?" with
+    /// one probe and no extra state. The marker's kernel list is empty.
+    fn mark_execute_parent(&self, parent: Id) {
+        self.execute_parent
+            .insert_if_absent(execute_parent_marker_key(parent).into(), Arc::from([]));
     }
 
     /// Returns true when one or more execute-parent kernels are registered for `(parent, child)`.
@@ -296,11 +298,6 @@ impl ArrayKernels {
     pub(crate) fn execute_parent_snapshot(&self) -> Arc<ParentExecutionKernels> {
         self.execute_parent.snapshot()
     }
-
-    /// Return the currently published set of parent ids with execute-parent kernels.
-    pub(crate) fn execute_parent_parents_snapshot(&self) -> Arc<ParentExecutionParents> {
-        self.execute_parent_parents.snapshot()
-    }
 }
 
 fn hash_fn_id(parent: Id, child: Id) -> u64 {
@@ -310,6 +307,15 @@ fn hash_fn_id(parent: Id, child: Id) -> u64 {
 /// Return the registry key for execute-parent kernels registered for `(parent, child)`.
 pub(crate) fn execute_parent_key(parent: Id, child: Id) -> u64 {
     hash_fn_id(parent, child)
+}
+
+/// Return the registry key under which `parent` is marked as owning execute-parent kernels.
+///
+/// Hashed from a different tuple type than the `(Id, Id)` pair keys, so it cannot equal a pair
+/// key by construction, only by a 64-bit collision; either way a hit is harmless, as the marker's
+/// kernel list is empty and the prefilter only decides whether to probe the pairs.
+pub(crate) fn execute_parent_marker_key(parent: Id) -> u64 {
+    FN_HASHER.hash_one(("execute_parent", parent))
 }
 
 /// Session-scoped holder for the optimizer kernel registry.
