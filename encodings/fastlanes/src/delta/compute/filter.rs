@@ -46,16 +46,18 @@ impl FilterKernel for Delta {
         let validity = array.validity()?.filter(mask)?;
         let filtered = match_each_unsigned_integer_ptype!(ptype.to_unsigned(), |U| {
             const LANES: usize = U::LANES;
-            let buffer = gather::<U, LANES>(array, values.indices(), ctx)?;
+            let buffer = gather::<U, LANES>(array, values.slices(), values.true_count(), ctx)?;
             PrimitiveArray::new(buffer, validity)
         });
         Ok(Some(filtered.reinterpret_cast(ptype).into_array()))
     }
 }
 
+/// Copy each selected run out of the chunks it spans, decoding every touched chunk once.
 fn gather<U, const LANES: usize>(
     array: ArrayView<'_, Delta>,
-    indices: &[usize],
+    slices: &[(usize, usize)],
+    true_count: usize,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Buffer<U>>
 where
@@ -74,19 +76,23 @@ where
     let (bases, deltas) = (bases.as_slice::<U>(), deltas.as_slice::<U>());
 
     let offset = array.offset();
-    let mut output = BufferMut::<U>::with_capacity(indices.len());
+    let mut output = BufferMut::<U>::with_capacity(true_count);
     let mut transposed = [U::default(); 1024];
     let mut values = [U::default(); 1024];
     let mut decoded_chunk = None;
-    // Indices are sorted, so each chunk is decoded at most once.
-    for &index in indices {
-        let position = offset + index;
-        let chunk = position / 1024;
-        if decoded_chunk != Some(chunk) {
-            decode_chunk::<U, LANES>(bases, deltas, chunk, &mut transposed, &mut values);
-            decoded_chunk = Some(chunk);
+    // Slices are sorted and disjoint, so each chunk is decoded at most once.
+    for &(start, end) in slices {
+        let (mut position, end) = (offset + start, offset + end);
+        while position < end {
+            let chunk = position / 1024;
+            if decoded_chunk != Some(chunk) {
+                decode_chunk::<U, LANES>(bases, deltas, chunk, &mut transposed, &mut values);
+                decoded_chunk = Some(chunk);
+            }
+            let chunk_end = end.min((chunk + 1) * 1024);
+            output.extend_from_slice(&values[position % 1024..chunk_end - chunk * 1024]);
+            position = chunk_end;
         }
-        output.push(values[position % 1024]);
     }
     Ok(output.freeze())
 }
