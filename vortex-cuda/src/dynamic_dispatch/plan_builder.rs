@@ -73,12 +73,6 @@ pub struct MaterializedPlan {
     pub validity: Validity,
 }
 
-fn cuda_bit_width(bp: &impl BitPackedArrayExt) -> VortexResult<u8> {
-    bp.constant_bit_width_opt().ok_or_else(|| {
-        vortex_err!("CUDA requires BitPacked block offsets to be a constant-width sequence")
-    })
-}
-
 /// Checks whether the encoding of an array can be fused into a dynamic-dispatch plan.
 fn is_dyn_dispatch_compatible(array: &ArrayRef) -> bool {
     // F16 has no reinterpret path in the kernel.
@@ -587,7 +581,7 @@ impl FusedPlan {
             let buf_index = self.source_buffers.len();
             self.source_buffers.push(Some(packed));
             return Ok(Stage::new(
-                SourceOp::bitunpack(cuda_bit_width(&bp)?, bitpacked_offset),
+                SourceOp::bitunpack(bp.constant_bit_width()?, bitpacked_offset),
                 Some(buf_index),
                 source_ptype,
             )
@@ -642,7 +636,7 @@ impl FusedPlan {
         let buf_index = self.source_buffers.len();
         self.source_buffers.push(Some(bp.packed().clone()));
         Ok(Stage::new(
-            SourceOp::bitunpack(cuda_bit_width(&bp)?, bp.offset()),
+            SourceOp::bitunpack(bp.constant_bit_width()?, bp.offset()),
             Some(buf_index),
             source_ptype,
         )

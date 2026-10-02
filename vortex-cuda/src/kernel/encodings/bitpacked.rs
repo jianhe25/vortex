@@ -61,9 +61,7 @@ pub(crate) fn bitpacked_slice_view(
     let block_start = offset_start - bitpacked_offset;
     let block_stop = offset_stop.div_ceil(PATCH_CHUNK_SIZE) * PATCH_CHUNK_SIZE;
 
-    let bit_width = bp.constant_bit_width_opt().ok_or_else(|| {
-        vortex_err!("CUDA requires BitPacked block offsets to be a constant-width sequence")
-    })?;
+    let bit_width = bp.constant_bit_width()?;
     let encoded_start = (block_start / 8) * bit_width as usize;
     let encoded_stop = (block_stop / 8) * bit_width as usize;
 
@@ -99,9 +97,7 @@ impl BitPackedExecutor {
             bp.ptype(bp.dtype()),
             child.validity()?.slice(patch_range.clone())?,
             bp.patches(),
-            bp.constant_bit_width_opt().ok_or_else(|| {
-                vortex_err!("CUDA requires BitPacked block offsets to be a constant-width sequence")
-            })?,
+            bp.constant_bit_width()?,
             len,
             bitpacked_offset,
         )?;
@@ -165,9 +161,7 @@ where
     A: BitPackedUnpack + NativePType + DeviceRepr + Send + Sync + 'static,
     A::Physical: DeviceRepr + Send + Sync + 'static,
 {
-    let bit_width = array.constant_bit_width_opt().ok_or_else(|| {
-        vortex_err!("CUDA requires BitPacked block offsets to be a constant-width sequence")
-    })?;
+    let bit_width = array.constant_bit_width()?;
     let BitPackedParts {
         offset,
         len,
