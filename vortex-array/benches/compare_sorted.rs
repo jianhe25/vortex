@@ -29,6 +29,7 @@ use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarValue;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_buffer::Buffer;
+use vortex_mask::Mask;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -64,7 +65,36 @@ fn mark(array: ArrayRef, sortedness: Sortedness) -> ArrayRef {
     array
 }
 
+/// How the comparison result is consumed.
+#[derive(Debug, Clone, Copy)]
+enum Consumer {
+    /// One execution step: runs the comparison kernel and returns its output as-is.
+    Step,
+    /// Fully canonicalize into a `BoolArray`.
+    Canonical,
+    /// Execute into a filter `Mask`.
+    Mask,
+}
+
+impl std::fmt::Display for Consumer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+
+const CONSUMERS: &[Consumer] = &[Consumer::Step, Consumer::Canonical, Consumer::Mask];
+
 fn bench_compare(bencher: Bencher, lhs: ArrayRef, constant: Scalar, op: Operator) {
+    bench_consume(bencher, lhs, constant, op, Consumer::Canonical);
+}
+
+fn bench_consume(
+    bencher: Bencher,
+    lhs: ArrayRef,
+    constant: Scalar,
+    op: Operator,
+    consumer: Consumer,
+) {
     let session = vortex_array::array_session();
     let len = lhs.len();
     let rhs = ConstantArray::new(constant, len).into_array();
@@ -72,12 +102,13 @@ fn bench_compare(bencher: Bencher, lhs: ArrayRef, constant: Scalar, op: Operator
         .counter(ItemsCount::new(len))
         .with_inputs(|| (&lhs, &rhs, session.create_execution_ctx()))
         .bench_refs(|input| {
-            input
-                .0
-                .clone()
-                .binary(input.1.clone(), op)
-                .unwrap()
-                .execute::<Canonical>(&mut input.2)
+            let result = input.0.clone().binary(input.1.clone(), op).unwrap();
+            let ctx = &mut input.2;
+            match consumer {
+                Consumer::Step => drop(result.execute::<ArrayRef>(ctx).unwrap()),
+                Consumer::Canonical => drop(result.execute::<Canonical>(ctx).unwrap()),
+                Consumer::Mask => drop(result.execute::<Mask>(ctx).unwrap()),
+            }
         });
 }
 
@@ -123,4 +154,23 @@ fn utf8_lt<const N: usize>(bencher: Bencher, mode: Sortedness) {
     );
     let constant = Scalar::from(format!("value-{:012}x", N / 2).as_str());
     bench_compare(bencher, array, constant, Operator::Lt);
+}
+
+/// Sorted path only, consumed three ways, to separate kernel cost from materialization cost.
+#[divan::bench(args = CONSUMERS, consts = [8_192, 1_048_576])]
+fn i64_lt_sorted_consume<const N: usize>(bencher: Bencher, consumer: Consumer) {
+    let array = mark(ints(N).into_array(), Sortedness::Sorted);
+    bench_consume(bencher, array, Scalar::from(needle(N)), Operator::Lt, consumer);
+}
+
+#[divan::bench(args = CONSUMERS, consts = [8_192, 1_048_576])]
+fn i64_eq_sorted_consume<const N: usize>(bencher: Bencher, consumer: Consumer) {
+    let array = mark(ints(N).into_array(), Sortedness::Sorted);
+    bench_consume(bencher, array, Scalar::from(needle(N) - 1), Operator::Eq, consumer);
+}
+
+#[divan::bench(args = CONSUMERS, consts = [8_192, 1_048_576])]
+fn i64_lt_unsorted_consume<const N: usize>(bencher: Bencher, consumer: Consumer) {
+    let array = mark(ints(N).into_array(), Sortedness::Unknown);
+    bench_consume(bencher, array, Scalar::from(needle(N)), Operator::Lt, consumer);
 }
