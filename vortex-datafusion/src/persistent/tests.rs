@@ -448,7 +448,7 @@ async fn test_aggregate_argument_pushdown() -> anyhow::Result<()> {
     let with_rule = TestSessionContext::with_expression_pushdown();
     create_list_table(&with_rule).await?;
     let actual = with_rule.session.sql(query).await?.collect().await?;
-    assert_snapshot!(vortex_scan_projection(&with_rule.session, query).await?, @"pack(id: $.id, xs: $.xs, __vortex_aggregate_arg_2: cast(vortex.list.sum(cast($.xs as list(f64?)?), opts=skip_nans=false) as f64?))");
+    assert_snapshot!(vortex_scan_projection(&with_rule.session, query).await?, @"pack(id: $.id, __vortex_aggregate_arg_0: cast(vortex.list.sum(cast($.xs as list(f64?)?), opts=skip_nans=false) as f64?))");
 
     assert_eq!(
         pretty_format_batches(&expected)?.to_string(),

@@ -3,6 +3,7 @@
 
 //! A physical optimizer rule that moves more expressions into Vortex scans.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion_common::Result as DFResult;
@@ -15,10 +16,13 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::projection::ProjectionExpr;
+use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::aggregates::AggregateMode;
+use datafusion_physical_plan::aggregates::PhysicalGroupBy;
 use datafusion_physical_plan::expressions::Column;
 use datafusion_physical_plan::projection::ProjectionExec;
 
@@ -119,21 +123,11 @@ fn push_aggregate_arguments(aggregate: &AggregateExec) -> DFResult<Option<Arc<dy
         return Ok(None);
     }
     let input = aggregate.input();
-
-    // Pass every input column through unchanged, so the group by and filter expressions keep their
-    // column indices, and append one column per computed argument.
     let input_schema = input.schema();
-    let mut projection: Vec<ProjectionExpr> = input_schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(idx, field)| ProjectionExpr {
-            expr: Arc::new(Column::new(field.name(), idx)) as Arc<dyn PhysicalExpr>,
-            alias: field.name().clone(),
-        })
-        .collect();
 
-    let mut aggr_exprs = Vec::with_capacity(aggregate.aggr_expr().len());
+    // Replace every computed argument with a column of a new projection.
+    let mut computed: Vec<ProjectionExpr> = vec![];
+    let mut aggr_args = Vec::with_capacity(aggregate.aggr_expr().len());
     for aggr_expr in aggregate.aggr_expr() {
         let args = aggr_expr
             .expressions()
@@ -142,44 +136,106 @@ fn push_aggregate_arguments(aggregate: &AggregateExec) -> DFResult<Option<Arc<dy
                 if arg.downcast_ref::<Column>().is_some() || arg.children().is_empty() {
                     return arg;
                 }
-                if let Some(existing) = projection.iter().position(|p| p.expr.eq(&arg)) {
-                    return Arc::new(Column::new(&projection[existing].alias, existing))
-                        as Arc<dyn PhysicalExpr>;
-                }
-                let alias = format!("__vortex_aggregate_arg_{}", projection.len());
-                let column =
-                    Arc::new(Column::new(&alias, projection.len())) as Arc<dyn PhysicalExpr>;
-                projection.push(ProjectionExpr { expr: arg, alias });
-                column
+                let alias = match computed.iter().find(|p| p.expr.eq(&arg)) {
+                    Some(existing) => existing.alias.clone(),
+                    None => {
+                        let alias = format!("__vortex_aggregate_arg_{}", computed.len());
+                        computed.push(ProjectionExpr {
+                            expr: arg,
+                            alias: alias.clone(),
+                        });
+                        alias
+                    }
+                };
+                Arc::new(Column::new(&alias, 0)) as Arc<dyn PhysicalExpr>
             })
             .collect::<Vec<_>>();
-        let order_bys = aggr_expr
-            .order_bys()
-            .iter()
-            .map(|sort| Arc::clone(&sort.expr))
-            .collect();
-        let Some(rewritten) = aggr_expr.with_new_expressions(args, order_bys) else {
-            return Ok(None);
-        };
-        aggr_exprs.push(Arc::new(rewritten));
+        aggr_args.push(args);
     }
-
-    if projection.len() == input_schema.fields().len() {
+    if computed.is_empty() {
         return Ok(None);
     }
+
+    // The projection keeps only the input columns the aggregate still reads.
+    let group_by = aggregate.group_expr();
+    let order_bys = aggregate
+        .aggr_expr()
+        .iter()
+        .map(|aggr_expr| {
+            aggr_expr
+                .order_bys()
+                .iter()
+                .map(|sort| Arc::clone(&sort.expr))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let computed_names = computed.iter().map(|p| p.alias.clone()).collect::<Vec<_>>();
+    let referenced = group_by
+        .expr()
+        .iter()
+        .chain(group_by.null_expr())
+        .map(|(expr, _)| expr)
+        .chain(aggregate.filter_expr().iter().flatten())
+        .chain(aggr_args.iter().flatten())
+        .chain(order_bys.iter().flatten())
+        .flat_map(collect_columns)
+        .filter(|column| !computed_names.iter().any(|name| name == column.name()))
+        .map(|column| column.index())
+        .collect::<BTreeSet<_>>();
+    let projection = referenced
+        .into_iter()
+        .map(|idx| {
+            let name = input_schema.field(idx).name();
+            ProjectionExpr {
+                expr: Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>,
+                alias: name.clone(),
+            }
+        })
+        .chain(computed)
+        .collect::<Vec<_>>();
 
     let projection = ProjectionExec::try_new(projection, Arc::clone(input))?;
     let Some(new_input) = push_projection_into_scan(input, &projection)? else {
         return Ok(None);
     };
+    let new_schema = new_input.schema();
+    let remap = |expr: &Arc<dyn PhysicalExpr>| reassign_expr_columns(Arc::clone(expr), &new_schema);
+
+    let remap_group = |exprs: &[(Arc<dyn PhysicalExpr>, String)]| {
+        exprs
+            .iter()
+            .map(|(expr, name)| Ok((remap(expr)?, name.clone())))
+            .collect::<DFResult<Vec<_>>>()
+    };
+    let new_group_by = PhysicalGroupBy::new(
+        remap_group(group_by.expr())?,
+        remap_group(group_by.null_expr())?,
+        group_by.groups().to_vec(),
+        group_by.has_grouping_set(),
+    );
+    let new_filters = aggregate
+        .filter_expr()
+        .iter()
+        .map(|filter| filter.as_ref().map(remap).transpose())
+        .collect::<DFResult<Vec<_>>>()?;
+    let mut new_aggr_exprs = Vec::with_capacity(aggr_args.len());
+    for ((aggr_expr, args), order_bys) in aggregate.aggr_expr().iter().zip(aggr_args).zip(order_bys)
+    {
+        let args = args.iter().map(remap).collect::<DFResult<Vec<_>>>()?;
+        let order_bys = order_bys.iter().map(remap).collect::<DFResult<Vec<_>>>()?;
+        let Some(rewritten) = aggr_expr.with_new_expressions(args, order_bys) else {
+            return Ok(None);
+        };
+        new_aggr_exprs.push(Arc::new(rewritten));
+    }
 
     let new_aggregate = AggregateExec::try_new(
         *aggregate.mode(),
-        aggregate.group_expr().clone(),
-        aggr_exprs,
-        aggregate.filter_expr().to_vec(),
+        new_group_by,
+        new_aggr_exprs,
+        new_filters,
         Arc::clone(&new_input),
-        new_input.schema(),
+        new_schema,
     )?
     .with_limit_options(aggregate.limit_options());
 

@@ -723,6 +723,15 @@ fn can_be_pushed_down_impl(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> boo
         return false;
     }
 
+    // Lambda predicates are left to DataFusion. Evaluating them as a scan predicate made statpopgen
+    // query 10 twice as slow as filtering the scan's projected output.
+    if expr
+        .exists(|node| Ok(node.downcast_ref::<HigherOrderFunctionExpr>().is_some()))
+        .unwrap_or(true)
+    {
+        return false;
+    }
+
     if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>() {
         can_binary_be_pushed_down(binary, schema)
     } else if let Some(col) = expr.downcast_ref::<df_expr::Column>() {
@@ -751,8 +760,6 @@ fn can_be_pushed_down_impl(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> boo
         can_scalar_fn_be_pushed_down(scalar_fn, schema)
     } else if let Some(case_expr) = expr.downcast_ref::<df_expr::CaseExpr>() {
         can_case_be_pushed_down(case_expr, schema)
-    } else if expr.downcast_ref::<HigherOrderFunctionExpr>().is_some() {
-        is_convertible_expr(expr)
     } else {
         tracing::debug!(%expr, "DataFusion expression can't be pushed down");
         false
