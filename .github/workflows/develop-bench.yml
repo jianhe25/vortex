@@ -85,7 +85,6 @@ jobs:
       ${{ github.repository == 'vortex-data/vortex'
           && format('runs-on={0}/runner=bench-dedicated/family=c8gd.metal-24xl/image=ubuntu24-full-arm64-pre-v2/extras=s3-cache/tag={1}{2}', github.run_id, matrix.benchmark.id, matrix.benchmark.variant_id)
           || 'ubuntu-latest' }}
-    name: bench (${{ matrix.benchmark.id }}${{ matrix.benchmark.variant_id }})
     strategy:
       fail-fast: false
       matrix:

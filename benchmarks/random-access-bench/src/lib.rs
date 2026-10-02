@@ -254,7 +254,14 @@ fn v3_random_access_dataset_name(dataset: &str, pattern: Option<AccessPattern>) 
 }
 
 fn push_v3_random_access_record(records: &mut Vec<v3::V3Record>, run: &RandomAccessRun) {
-    let dataset = v3_random_access_dataset_name(&run.dataset, run.pattern);
+    // v3 records have no storage field, so S3 runs get their own dataset name. Otherwise they
+    // would share a measurement ID with, and overwrite, the local-disk rows.
+    let dataset = if run.timing.storage == STORAGE_S3 {
+        format!("{}-s3", run.dataset)
+    } else {
+        run.dataset.clone()
+    };
+    let dataset = v3_random_access_dataset_name(&dataset, run.pattern);
     let open_mode = if run.reopen { "reopen" } else { "cached" };
     records.push(v3::random_access_record(&run.timing, &dataset, open_mode));
 }
@@ -566,6 +573,20 @@ mod tests {
                 assert_eq!(record.dataset, "taxi/correlated");
                 assert_eq!(record.open_mode, "reopen");
             }
+            other => panic!("expected random-access record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v3_random_access_records_keep_s3_runs_apart() {
+        let mut run = fake_run("taxi", Some(AccessPattern::Uniform), false);
+        run.timing.storage = STORAGE_S3.to_string();
+        let mut records = Vec::new();
+
+        push_v3_random_access_record(&mut records, &run);
+
+        match &records[0] {
+            v3::V3Record::RandomAccessTime(record) => assert_eq!(record.dataset, "taxi-s3/uniform"),
             other => panic!("expected random-access record, got {other:?}"),
         }
     }
