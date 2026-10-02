@@ -23,11 +23,19 @@ use crate::arrays::Bool;
 use crate::arrays::BoolArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::ScalarFn;
 use crate::arrays::StructArray;
 use crate::arrays::bool::BoolArrayExt;
+use crate::arrays::scalar_fn::ExactScalarFn;
+use crate::arrays::scalar_fn::ScalarFnArrayExt;
+use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
+use crate::dtype::PType;
+use crate::match_each_integer_ptype;
 use crate::match_each_native_ptype;
+use crate::matcher::Matcher;
+use crate::scalar_fn::fns::cast::Cast;
 use crate::validity::Validity;
 
 /// Encoding-specific grouped [`SumV2`] kernel for primitive element arrays.
@@ -117,6 +125,83 @@ impl DynGroupedAggregateKernel for BoolGroupedSumV2EncodingKernel {
                     ],
                     partial_fields,
                     group_count,
+                    Validity::from_mask(group_validity, Nullability::Nullable),
+                )
+            }
+            .into_array(),
+        ))
+    }
+}
+
+/// Encoding-specific grouped [`SumV2`] kernel for integers cast to `f64`.
+///
+/// Summing `cast(ints as f64)` converts every element and then sums the floats in order, which is
+/// how engines such as DataFusion sum integer lists. This kernel performs the same per-element
+/// conversion inside the summation loop instead of first materializing the cast elements.
+#[derive(Debug)]
+pub(crate) struct CastGroupedSumV2EncodingKernel;
+
+impl DynGroupedAggregateKernel for CastGroupedSumV2EncodingKernel {
+    fn grouped_aggregate(
+        &self,
+        aggregate_fn: &AggregateFnRef,
+        groups: &GroupedArray,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        if aggregate_fn.as_opt::<SumV2>().is_none() {
+            return Ok(None);
+        }
+        let Some(cast) = ExactScalarFn::<Cast>::try_match(groups.elements()) else {
+            return Ok(None);
+        };
+        if !matches!(cast.options, DType::Primitive(PType::F64, _)) {
+            return Ok(None);
+        }
+        let Some(scalar_fn) = groups.elements().as_opt::<ScalarFn>() else {
+            return Ok(None);
+        };
+        let input = scalar_fn.child_at(0);
+        if !matches!(input.dtype(), DType::Primitive(ptype, _) if ptype.is_int()) {
+            return Ok(None);
+        }
+
+        let input = input.clone().execute::<PrimitiveArray>(ctx)?;
+        let group_ranges = groups.group_ranges(ctx)?;
+        let group_validity = groups.group_validity(ctx)?;
+        let elem_mask = input
+            .as_ref()
+            .validity()?
+            .execute_mask(input.as_ref().len(), ctx)?;
+        let all_valid = elem_mask.all_true();
+
+        // An integer always converts to `f64`, so the sum never overflows.
+        let (sums, is_overflow, is_empty) = match_each_integer_ptype!(input.ptype(), |T| {
+            collect_sums::<T, f64>(
+                input.as_slice::<T>(),
+                &group_ranges,
+                &group_validity,
+                &elem_mask,
+                all_valid,
+                |acc, slice| {
+                    sum_float_all(acc, slice, false);
+                    false
+                },
+            )
+        });
+        let partial_fields = sum_v2_partial_fields(sums.dtype().clone());
+
+        // SAFETY: all three children have one value per group and match `partial_fields`; the
+        // struct validity is derived from the same group count.
+        Ok(Some(
+            unsafe {
+                StructArray::new_unchecked(
+                    vec![
+                        sums.into_array(),
+                        BoolArray::new(is_overflow, Validity::NonNullable).into_array(),
+                        BoolArray::new(is_empty, Validity::NonNullable).into_array(),
+                    ],
+                    partial_fields,
+                    group_validity.len(),
                     Validity::from_mask(group_validity, Nullability::Nullable),
                 )
             }

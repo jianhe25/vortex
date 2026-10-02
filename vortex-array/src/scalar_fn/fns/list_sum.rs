@@ -160,6 +160,7 @@ mod tests {
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::expr::Expression;
+    use crate::expr::cast;
     use crate::expr::list_sum;
     use crate::expr::list_sum_opts;
     use crate::expr::proto::ExprSerializeProtoExt;
@@ -306,6 +307,27 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
         let expected =
             PrimitiveArray::from_option_iter::<u64, _>([Some(2), None, None, Some(1), None]);
+        assert_arrays_eq!(result, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sum_of_integers_cast_to_float() -> VortexResult<()> {
+        let elements = PrimitiveArray::from_option_iter([Some(1u64), Some(2), None, Some(3)]);
+        let list = ListArray::try_new(
+            elements.into_array(),
+            buffer![0u32, 2, 4, 4].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let float_list = DType::List(
+            Arc::new(DType::Primitive(PType::F64, Nullability::Nullable)),
+            Nullability::NonNullable,
+        );
+        let result = list.apply(&list_sum(cast(root(), float_list)))?;
+
+        let mut ctx = array_session().create_execution_ctx();
+        let expected = PrimitiveArray::from_option_iter::<f64, _>([Some(3.0), Some(3.0), None]);
         assert_arrays_eq!(result, expected, &mut ctx);
         Ok(())
     }
