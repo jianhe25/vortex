@@ -48,6 +48,7 @@ pub use view::*;
 
 use crate::hash::ArrayEq;
 use crate::hash::ArrayHash;
+use crate::stats::Aggregations;
 
 /// The slots of an array: a collection of optional child arrays.
 ///
@@ -391,8 +392,7 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
     }
 
     fn with_slots(&self, this: &ArrayRef, slots: ArraySlots) -> VortexResult<ArrayRef> {
-        let stats = this.statistics().to_owned();
-        Ok(Array::<V>::try_from_parts(
+        let array = Array::<V>::try_from_parts(
             ArrayParts::new(
                 self.vtable.clone(),
                 this.dtype().clone(),
@@ -401,18 +401,17 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
             )
             .with_slots(slots),
         )?
-        .with_stats_set(stats)
-        .into_array())
+        .into_array();
+        array.aggregations().inherit_from(this.aggregations());
+        Ok(array)
     }
 
     fn with_buffers(&self, this: &ArrayRef, buffers: Vec<BufferHandle>) -> VortexResult<ArrayRef> {
         let view = unsafe { ArrayView::new_unchecked(this, &self.data) };
-        let stats = this.statistics().to_owned();
-        Ok(
-            Array::<V>::try_from_parts(V::with_buffers(&self.vtable, view, &buffers)?)?
-                .with_stats_set(stats)
-                .into_array(),
-        )
+        let array = Array::<V>::try_from_parts(V::with_buffers(&self.vtable, view, &buffers)?)?
+            .into_array();
+        array.aggregations().inherit_from(this.aggregations());
+        Ok(array)
     }
 
     unsafe fn with_slots_unchecked(&self, this: &ArrayRef, slots: ArraySlots) -> ArrayRef {
@@ -425,10 +424,12 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
                 this.dtype().clone(),
                 self.data.clone(),
                 slots,
-                this.statistics().to_array_stats(),
+                Aggregations::default(),
             )
         };
-        ArrayRef::from_inner(Arc::new(store))
+        let array = ArrayRef::from_inner(Arc::new(store));
+        array.aggregations().inherit_from(this.aggregations());
+        array
     }
 
     fn reduce(&self, this: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
@@ -486,7 +487,7 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
     fn execute(&self, this: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         let len = this.len();
         let dtype = this.dtype().clone();
-        let stats = this.statistics().to_array_stats();
+        let source = this.clone();
         let result = unsafe { self.execute_unchecked(this, ctx)? };
 
         if matches!(result.step(), ExecutionStep::Done) {
@@ -505,8 +506,8 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
 
             result
                 .array()
-                .statistics()
-                .set_iter(crate::stats::StatsSet::from(stats).into_iter());
+                .aggregations()
+                .inherit_from(source.aggregations());
         }
 
         Ok(result)
