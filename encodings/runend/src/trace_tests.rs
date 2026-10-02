@@ -80,13 +80,21 @@ fn trace_compare_on_runend() -> VortexResult<()> {
       return output=vortex.bool(bool, len=9)
     ");
 
-    // The run-end kernel executes its values child in a nested `execute_until`; in the
-    // derivation that run is the premise of the step, instead of interleaving with it.
+    // The run-end kernel executes its values child in a nested `execute_until`; that run is
+    // named by its path in the outer tree instead of interleaving with the outer steps.
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
-    vortex.runend(bool, len=9) ->* vortex.bool(bool, len=9)  [execute_until AnyCanonical]
-    └─ vortex.runend(bool, len=9) -> vortex.bool(bool, len=9)  [execute vortex.runend]
-       └─ vortex.binary(bool, len=3) ->* vortex.bool(bool, len=3)  [execute_until AnyCanonical]
-          └─ vortex.binary(bool, len=3) -> vortex.bool(bool, len=3)  [execute vortex.binary]
+    [execute_until AnyCanonical]
+    vortex.runend(bool, len=9)
+    ├─(0) vortex.primitive(u8, len=3)
+    └─(1) vortex.binary(bool, len=3)
+       ├─(0) vortex.primitive(i32, len=3)
+       └─(1) vortex.constant(i32, len=3)
+
+    1. execute vortex.runend @root: vortex.runend(bool, len=9) -> vortex.bool(bool, len=9)
+       │ [execute_until AnyCanonical @1]
+       │ 1. execute vortex.binary @root: vortex.binary(bool, len=3) -> vortex.bool(bool, len=3)
+       │    = vortex.bool(bool, len=3)
+       = vortex.bool(bool, len=9)
     ");
 
     Ok(())

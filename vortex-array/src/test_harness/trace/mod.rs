@@ -33,9 +33,9 @@
 //! - A chunked array should drive the builder path rather than the stack path.
 //!
 //! [`TraceDisplay`] renders the event log as written. [`TraceDisplay::derivation`] renders the
-//! same events as a derivation of the reduction semantics: one `-> rhs  [rule]` line per step,
-//! with the child steps, nested passes, and declined attempts that justify a step indented
-//! beneath it. See [`derivation`] for the format.
+//! same events as a walk through the reduction semantics: the array tree with slot-labelled
+//! children, then one numbered step per rewrite naming the node it changed by path, with
+//! nested passes and declined attempts in the step's gutter. See [`derivation`] for the format.
 //!
 //! Two resolutions are available:
 //!

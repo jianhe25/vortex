@@ -1,99 +1,210 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Renders a [`TraceDisplay`] as a derivation of the small-step reduction semantics that the
+//! Renders a [`TraceDisplay`] as a walk through the small-step reduction semantics that the
 //! optimizer and executor implement.
 //!
-//! Every rule, kernel, and encoding execution is a single step `a -> a'`. `ExecuteSlot` focuses
-//! a child slot as an evaluation context: steps on the child are the premises of one congruence
-//! step `P -> P[i <- c']` on the parent. Nested `execute_until` and `optimize` passes are
-//! likewise premises of the step that invoked them.
-//!
-//! Every line is a complete judgement, `lhs -> rhs  [rule]` for a step or `lhs ->* rhs  [pass]`
-//! for a whole pass, and the tree connectors attach each step's premises beneath it:
+//! Every rule, kernel, and encoding execution is a single step `a -> a'` on one node of the
+//! array tree. The rendering prints the whole tree once, with each child labelled by its slot
+//! index, and then one numbered line per step naming the node it rewrote by path (`@root`,
+//! `@0`, `@0.1`):
 //!
 //! ```text
-//! vortex.filter(i32, len=2) ->* vortex.primitive(i32, len=2)  [execute_until AnyCanonical]
-//! ├─ vortex.filter(i32, len=2) -> vortex.slice(i32, len=2)  [execute vortex.filter]
-//! ├─ vortex.slice(i32, len=2) -> vortex.slice(i32, len=2)[0 <- vortex.primitive(i32, len=4)]  [slot 0]
-//! │  └─ vortex.filter(i32, len=4) -> vortex.primitive(i32, len=4)  [execute vortex.filter]
-//! └─ vortex.slice(i32, len=2) -> vortex.primitive(i32, len=2)  [execute vortex.slice]
-//!    └─ vortex.slice(i32, len=2) ->* vortex.primitive(i32, len=2)  [optimize]
-//!       └─ vortex.slice(i32, len=2) -> vortex.primitive(i32, len=2)  [reduce_parent ...]
+//! [execute_until AnyCanonical]
+//! vortex.filter(i32, len=2)
+//! └─(0) vortex.filter(i32, len=4)
+//!    └─(0) vortex.primitive(i32, len=6)
+//!
+//! 1. execute vortex.filter @root: vortex.filter(i32, len=2) -> vortex.slice(i32, len=2)
+//! 2. execute vortex.filter @0: vortex.filter(i32, len=4) -> vortex.primitive(i32, len=4)
+//!    = vortex.slice(i32, len=2)
+//!      └─(0) vortex.primitive(i32, len=4)
+//! 3. execute vortex.slice @root: vortex.slice(i32, len=2) -> vortex.primitive(i32, len=2)
+//!    │ [optimize]
+//!    │ vortex.slice(i32, len=2)
+//!    │ └─(0) vortex.primitive(i32, len=4)
+//!    │ 1. reduce_parent static:SliceReduceAdaptor(Primitive) slot=0 @root: ...
+//!    = vortex.primitive(i32, len=2)
 //! ```
 //!
-//! Consecutive steps under one pass chain: each step's `lhs` is the previous step's `rhs`. A
-//! step whose summary is unchanged names the child slot it replaced, as `a[i <- new_child]`.
-//! At [`TraceResolution::Attempts`](super::TraceResolution::Attempts), rules and kernels that
-//! were tried and declined before a step appear as `x ...` leaves under that step.
+//! Lines in a step's `│` gutter happened inside that step: a nested `optimize` or
+//! `execute_until` pass, builder appends, and at
+//! [`TraceResolution::Attempts`](super::TraceResolution::Attempts) the rules and kernels that
+//! were tried and declined (`x ...`). The `=` block is the whole tree after the step; it is
+//! printed only when the step changed the shape beneath the rewritten node, not just the node
+//! itself. A nested pass whose root is a node of the enclosing tree is named by path; otherwise
+//! its own tree is printed.
 
 use std::fmt;
 use std::fmt::Display;
 
 use vortex_error::VortexExpect;
 
-use super::ArraySummary;
 use super::TraceDisplay;
 use super::TraceEvent;
+use crate::ArrayRef;
 
-/// A derivation-tree rendering of a [`TraceDisplay`]; see the module docs.
+/// A step-by-step rendering of a [`TraceDisplay`]; see the module docs.
 pub struct DerivationDisplay<'a> {
     pub(super) trace: &'a TraceDisplay,
 }
 
 impl Display for DerivationDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (idx, node) in build(self.trace).iter().enumerate() {
+        let mut out = String::new();
+        for (idx, pass) in build(self.trace).iter().enumerate() {
             if idx > 0 {
-                writeln!(f)?;
+                out.push('\n');
             }
-            render(f, node, "")?;
+            pass.render(&mut out, "", true);
         }
-        Ok(())
+        f.write_str(out.trim_end_matches('\n'))
     }
 }
 
-/// A judgement (a step or a whole pass) with the premises that justify it, or a bare note.
-struct Node {
-    text: String,
-    children: Vec<Node>,
+/// The array tree as displayed: one summary per node, children in slot order.
+#[derive(Clone)]
+struct Tree {
+    array: ArrayRef,
+    children: Vec<(usize, Tree)>,
 }
 
-impl Node {
-    fn leaf(text: String) -> Self {
+impl Tree {
+    fn of(array: &ArrayRef) -> Self {
         Self {
-            text,
-            children: Vec::new(),
+            array: array.clone(),
+            children: array
+                .slots()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, slot)| slot.as_ref().map(|child| (idx, Tree::of(child))))
+                .collect(),
+        }
+    }
+
+    fn same_shape(&self, other: &Tree) -> bool {
+        self.children.len() == other.children.len()
+            && self.children.iter().zip(&other.children).all(|(a, b)| {
+                a.0 == b.0 && a.1.array.to_string() == b.1.array.to_string() && a.1.same_shape(&b.1)
+            })
+    }
+
+    /// Finds `array` by identity and returns its slot path.
+    fn find(&self, array: &ArrayRef) -> Option<Vec<usize>> {
+        if ArrayRef::ptr_eq(&self.array, array) {
+            return Some(Vec::new());
+        }
+        self.children.iter().find_map(|(idx, child)| {
+            child.find(array).map(|mut path| {
+                path.insert(0, *idx);
+                path
+            })
+        })
+    }
+
+    fn render(&self, out: &mut String, prefix: &str) {
+        out.push_str(&self.array.to_string());
+        out.push('\n');
+        let last = self.children.len().saturating_sub(1);
+        for (pos, (idx, child)) in self.children.iter().enumerate() {
+            let (branch, extend) = if pos == last {
+                ("└─", "   ")
+            } else {
+                ("├─", "│  ")
+            };
+            out.push_str(&format!("{prefix}{branch}({idx}) "));
+            child.render(out, &format!("{prefix}{extend}"));
         }
     }
 }
 
-fn render(f: &mut fmt::Formatter<'_>, node: &Node, prefix: &str) -> fmt::Result {
-    f.write_str(&node.text)?;
-    let last = node.children.len().saturating_sub(1);
-    for (idx, child) in node.children.iter().enumerate() {
-        let (branch, extend) = if idx == last {
-            ("└─ ", "   ")
-        } else {
-            ("├─ ", "│  ")
-        };
-        write!(f, "\n{prefix}{branch}")?;
-        render(f, child, &format!("{prefix}{extend}"))?;
+fn path_text(path: &[usize]) -> String {
+    if path.is_empty() {
+        "root".to_string()
+    } else {
+        path.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
     }
-    Ok(())
+}
+
+/// Something that happened inside a step, before its result was known.
+enum Inner {
+    Note(String),
+    Pass(Pass),
+}
+
+struct Step {
+    title: String,
+    inner: Vec<Inner>,
+    after: Option<Tree>,
+}
+
+/// An `execute_until`, `optimize`, or single-step pass.
+struct Pass {
+    label: String,
+    /// The path of the root within the enclosing tree, when it is a node of that tree.
+    at: Option<Vec<usize>>,
+    start: Tree,
+    steps: Vec<Step>,
+    /// Inner items that no step consumed.
+    trailing: Vec<Inner>,
+}
+
+impl Pass {
+    fn render(&self, out: &mut String, prefix: &str, top_level: bool) {
+        match &self.at {
+            Some(path) if !top_level => {
+                out.push_str(&format!("{prefix}[{} @{}]\n", self.label, path_text(path)));
+            }
+            _ => {
+                out.push_str(&format!("{prefix}[{}]\n", self.label));
+                out.push_str(prefix);
+                self.start.render(out, prefix);
+            }
+        }
+        if top_level && !self.steps.is_empty() {
+            out.push('\n');
+        }
+        for (idx, step) in self.steps.iter().enumerate() {
+            out.push_str(&format!("{prefix}{}. {}\n", idx + 1, step.title));
+            let gutter = format!("{prefix}   │ ");
+            for inner in &step.inner {
+                render_inner(inner, out, &gutter);
+            }
+            if let Some(after) = &step.after {
+                out.push_str(&format!("{prefix}   = "));
+                after.render(out, &format!("{prefix}     "));
+            }
+        }
+        for inner in &self.trailing {
+            render_inner(inner, out, &format!("{prefix}   "));
+        }
+    }
+}
+
+fn render_inner(inner: &Inner, out: &mut String, prefix: &str) {
+    match inner {
+        Inner::Note(text) => out.push_str(&format!("{prefix}{text}\n")),
+        Inner::Pass(pass) => pass.render(out, prefix, false),
+    }
 }
 
 enum FrameKind {
     Root,
-    /// An `execute_until`, `optimize`, or single-step pass over `lhs`.
-    Chain {
-        lhs: ArraySummary,
+    Pass {
         label: String,
+        root: ArrayRef,
+        /// The path of `root` within the enclosing pass's tree, when it is a node of it.
+        at: Option<Vec<usize>>,
         single_step: bool,
+        steps: Vec<Step>,
+        pending: Vec<Inner>,
     },
     /// A child slot focused by `ExecuteSlot`; closed by `pop_frame` or a stack kernel.
     Slot {
-        parent: ArraySummary,
+        parent: ArrayRef,
         slot_idx: usize,
     },
     /// A builder driven by `AppendChild`; closed by `builder finish`.
@@ -102,83 +213,34 @@ enum FrameKind {
 
 struct Frame {
     kind: FrameKind,
-    /// Steps taken so far in this frame.
-    nodes: Vec<Node>,
-    /// Nested blocks and declined attempts waiting to become premises of the next step.
-    pending: Vec<Node>,
     /// The array the next step in this frame rewrites.
-    current: Option<ArraySummary>,
-    /// How many steps this frame has recorded.
-    steps: usize,
+    current: Option<ArrayRef>,
 }
 
-impl Frame {
-    fn new(kind: FrameKind, current: Option<&ArraySummary>) -> Self {
-        Self {
-            kind,
-            nodes: Vec::new(),
-            pending: Vec::new(),
-            current: current.cloned(),
-            steps: 0,
-        }
-    }
-}
-
-/// Describes `rhs` as the result of rewriting `lhs`.
-///
-/// Array summaries hide children, so a rewrite that only replaced a child slot would print as
-/// `a -> a`. When the encoding and summary are unchanged, the differing slots are listed
-/// instead, in evaluation-context notation: `a[i <- new_child]`.
-fn describe_rewrite(lhs: Option<&ArraySummary>, rhs: &ArraySummary) -> String {
-    let Some(lhs) = lhs else {
-        return rhs.to_string();
-    };
-    let (lhs, rhs_array) = (&lhs.0, &rhs.0);
-    if lhs.encoding_id() != rhs_array.encoding_id()
-        || lhs.slots().len() != rhs_array.slots().len()
-        || lhs.to_string() != rhs_array.to_string()
-    {
-        return rhs.to_string();
-    }
-    let changed: Vec<String> = lhs
-        .slots()
-        .iter()
-        .zip(rhs_array.slots())
-        .enumerate()
-        .filter_map(|(idx, (before, after))| {
-            let after = after.as_ref()?;
-            let before = before.as_ref().map(ToString::to_string);
-            (before.as_deref() != Some(&after.to_string())).then(|| format!("{idx} <- {after}"))
-        })
-        .collect();
-    if changed.is_empty() {
-        rhs.to_string()
-    } else {
-        format!("{rhs}[{}]", changed.join(", "))
-    }
-}
-
-struct Builder {
-    frames: Vec<Frame>,
-}
-
-fn build(trace: &TraceDisplay) -> Vec<Node> {
+fn build(trace: &TraceDisplay) -> Vec<Pass> {
     let hidden = trace.hidden_events();
     let mut builder = Builder {
-        frames: vec![Frame::new(FrameKind::Root, None)],
+        frames: vec![Frame {
+            kind: FrameKind::Root,
+            current: None,
+        }],
+        passes: Vec::new(),
     };
     for (idx, event) in trace.events.iter().enumerate() {
         if !hidden[idx] {
             builder.event(event);
         }
     }
-    // Blocks left open by an error path are closed with what was recorded.
+    // Passes left open by an error path are closed with what was recorded.
     while builder.frames.len() > 1 {
         builder.close_top();
     }
-    let mut root = builder.frames.pop().vortex_expect("root frame");
-    root.nodes.append(&mut root.pending);
-    root.nodes
+    builder.passes
+}
+
+struct Builder {
+    frames: Vec<Frame>,
+    passes: Vec<Pass>,
 }
 
 impl Builder {
@@ -188,43 +250,115 @@ impl Builder {
             .vortex_expect("root frame is never popped")
     }
 
-    fn push(&mut self, kind: FrameKind, current: &ArraySummary) {
-        self.frames.push(Frame::new(kind, Some(current)));
+    fn push(&mut self, kind: FrameKind, current: &ArrayRef) {
+        self.frames.push(Frame {
+            kind,
+            current: Some(current.clone()),
+        });
     }
 
     fn pop(&mut self) -> Option<Frame> {
         (self.frames.len() > 1).then(|| self.frames.pop()).flatten()
     }
 
-    fn current_encoding(&mut self) -> String {
-        self.top()
-            .current
-            .as_ref()
-            .map_or_else(|| "?".to_string(), |a| a.0.encoding_id().to_string())
+    fn current(&self) -> Option<&ArrayRef> {
+        self.frames.last().and_then(|frame| frame.current.as_ref())
     }
 
-    /// Records a declined attempt or note that will justify the next step.
+    /// The index of the innermost pass frame.
+    fn pass_index(&self) -> Option<usize> {
+        self.frames
+            .iter()
+            .rposition(|frame| matches!(frame.kind, FrameKind::Pass { .. }))
+    }
+
+    /// The slot path from the innermost pass root to the current array.
+    fn path(&self) -> Vec<usize> {
+        let start = self.pass_index().map_or(0, |idx| idx + 1);
+        self.frames[start..]
+            .iter()
+            .filter_map(|frame| match &frame.kind {
+                FrameKind::Slot { slot_idx, .. } => Some(*slot_idx),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The whole tree of the innermost pass, with `leaf` in place of the current array.
+    fn compose(&self, leaf: &ArrayRef) -> Tree {
+        let start = self.pass_index().map_or(0, |idx| idx + 1);
+        let mut tree = Tree::of(leaf);
+        for frame in self.frames[start..].iter().rev() {
+            let FrameKind::Slot { parent, slot_idx } = &frame.kind else {
+                continue;
+            };
+            let children = parent
+                .slots()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, slot)| {
+                    if idx == *slot_idx {
+                        Some((idx, tree.clone()))
+                    } else {
+                        slot.as_ref().map(|child| (idx, Tree::of(child)))
+                    }
+                })
+                .collect();
+            tree = Tree {
+                array: parent.clone(),
+                children,
+            };
+        }
+        tree
+    }
+
+    fn pending(&mut self) -> Option<&mut Vec<Inner>> {
+        let idx = self.pass_index()?;
+        match &mut self.frames[idx].kind {
+            FrameKind::Pass { pending, .. } => Some(pending),
+            _ => None,
+        }
+    }
+
     fn note(&mut self, text: String) {
-        self.top().pending.push(Node::leaf(text));
+        if let Some(pending) = self.pending() {
+            pending.push(Inner::Note(text));
+        }
     }
 
-    /// Records the step `current -> output` justified by `rule`, taking pending nodes as its
-    /// leading premises followed by `extra`.
-    fn step(&mut self, rule: String, output: &ArraySummary, mut extra: Vec<Node>) {
-        let frame = self.top();
-        let lhs = frame
-            .current
-            .as_ref()
+    /// The whole tree of the innermost pass as it stands now.
+    fn before(&self) -> Option<Tree> {
+        self.current().map(|current| self.compose(current))
+    }
+
+    /// Records the step `current -> output` justified by `rule` at the current path.
+    fn step(&mut self, rule: &str, output: &ArrayRef) {
+        let before = self.before();
+        self.step_from(before, rule, output);
+    }
+
+    /// Records a step whose tree `before` it was captured earlier, when the frames that
+    /// produced it have since been popped.
+    fn step_from(&mut self, before: Option<Tree>, rule: &str, output: &ArrayRef) {
+        let lhs_text = self
+            .current()
             .map_or_else(|| "?".to_string(), ToString::to_string);
-        let rhs = describe_rewrite(frame.current.as_ref(), output);
-        let mut children = std::mem::take(&mut frame.pending);
-        children.append(&mut extra);
-        frame.nodes.push(Node {
-            text: format!("{lhs} -> {rhs}  [{rule}]"),
-            children,
-        });
-        frame.current = Some(output.clone());
-        frame.steps += 1;
+        let path = path_text(&self.path());
+        let title = format!("{rule} @{path}: {lhs_text} -> {output}");
+        let after_tree = self.compose(output);
+        let after = match before {
+            Some(before) if before.same_shape(&after_tree) => None,
+            _ => Some(after_tree),
+        };
+        let Some(idx) = self.pass_index() else { return };
+        if let FrameKind::Pass { steps, pending, .. } = &mut self.frames[idx].kind {
+            steps.push(Step {
+                title,
+                inner: std::mem::take(pending),
+                after,
+            });
+        }
+        self.top().current = Some(output.clone());
     }
 
     fn close_top(&mut self) {
@@ -233,10 +367,7 @@ impl Builder {
         };
         match &frame.kind {
             FrameKind::Root => {}
-            FrameKind::Chain { .. } => {
-                let output = frame.current.clone();
-                self.close_chain(output.as_ref());
-            }
+            FrameKind::Pass { .. } => self.close_pass(),
             FrameKind::Slot { .. } => self.close_slot(None),
             FrameKind::Builder => {
                 let output = frame.current.clone();
@@ -245,100 +376,78 @@ impl Builder {
         }
     }
 
-    fn close_chain(&mut self, output: Option<&ArraySummary>) {
-        let Some(mut frame) = self.pop() else { return };
-        let FrameKind::Chain { lhs, label, .. } = frame.kind else {
+    fn open_pass(&mut self, label: String, root: &ArrayRef, single_step: bool) {
+        let at = self
+            .current()
+            .map(|current| self.compose(current))
+            .and_then(|tree| tree.find(root));
+        self.push(
+            FrameKind::Pass {
+                label,
+                root: root.clone(),
+                at,
+                single_step,
+                steps: Vec::new(),
+                pending: Vec::new(),
+            },
+            root,
+        );
+    }
+
+    fn close_pass(&mut self) {
+        let Some(frame) = self.pop() else { return };
+        let FrameKind::Pass {
+            label,
+            root,
+            at,
+            steps,
+            pending,
+            ..
+        } = frame.kind
+        else {
             return;
         };
-        let rhs = output
-            .or(frame.current.as_ref())
-            .map_or_else(|| "?".to_string(), ToString::to_string);
-        frame.nodes.append(&mut frame.pending);
-        self.top().pending.push(Node {
-            text: format!("{lhs} ->* {rhs}  [{label}]"),
-            children: frame.nodes,
-        });
+        let pass = Pass {
+            label,
+            at,
+            start: Tree::of(&root),
+            steps,
+            trailing: pending,
+        };
+        match self.pending() {
+            Some(pending) => pending.push(Inner::Pass(pass)),
+            None => self.passes.push(pass),
+        }
     }
 
     fn close_if_single_step(&mut self) {
         if matches!(
             self.top().kind,
-            FrameKind::Chain {
+            FrameKind::Pass {
                 single_step: true,
                 ..
             }
         ) {
-            let output = self.top().current.clone();
-            self.close_chain(output.as_ref());
+            self.close_pass();
         }
     }
 
-    /// Closes a focused slot. With `output` (from `pop_frame`) the parent is rewritten to it by
-    /// congruence over the child's steps. Without (a stack kernel consumed the frame), the
-    /// child's steps so far still justify a congruence step; if there were none the focus is
-    /// only noted.
-    fn close_slot(&mut self, output: Option<&ArraySummary>) {
-        let Some(mut frame) = self.pop() else { return };
-        let FrameKind::Slot { parent, slot_idx } = frame.kind else {
+    /// Leaves a focused slot. With `output` (from `pop_frame`) the parent is restored to it.
+    fn close_slot(&mut self, output: Option<&ArrayRef>) {
+        let Some(frame) = self.pop() else { return };
+        let FrameKind::Slot { .. } = frame.kind else {
             return;
         };
-        let child = frame
-            .current
-            .as_ref()
-            .map_or_else(|| "?".to_string(), ToString::to_string);
-        if frame.steps == 0 && output.is_none() {
-            self.note(format!("focus slot={slot_idx} {child}"));
-            self.top().pending.append(&mut frame.pending);
-            return;
-        }
-        frame.nodes.append(&mut frame.pending);
-        let rule = format!("slot {slot_idx}");
-        match output {
-            Some(output) => {
-                self.top().current = Some(parent);
-                self.step(rule, output, frame.nodes);
-            }
-            None => {
-                // The child's steps are known but the rewritten parent was never materialized.
-                let top = self.top();
-                let mut children = std::mem::take(&mut top.pending);
-                children.extend(frame.nodes);
-                top.nodes.push(Node {
-                    text: format!("{parent} -> {parent}[{slot_idx} <- {child}]  [{rule}]"),
-                    children,
-                });
-                top.current = Some(parent);
-                top.steps += 1;
-            }
+        if let Some(output) = output {
+            self.top().current = Some(output.clone());
         }
     }
 
-    /// Attaches nested work recorded after an `append` to that append rather than the next one.
-    fn attach_pending_to_last(&mut self) {
-        let frame = self.top();
-        if frame.pending.is_empty() {
-            return;
-        }
-        match frame.nodes.last_mut() {
-            Some(node) => node.children.append(&mut frame.pending),
-            None => frame.nodes.append(&mut frame.pending),
-        }
-    }
-
-    fn close_builder(&mut self, output: Option<&ArraySummary>) {
-        self.attach_pending_to_last();
-        let Some(frame) = self.pop() else { return };
+    fn close_builder(&mut self, output: Option<&ArrayRef>) {
+        let Some(_) = self.pop() else { return };
         match output {
-            Some(output) => self.step("builder".to_string(), output, frame.nodes),
-            None => {
-                let top = self.top();
-                let mut children = std::mem::take(&mut top.pending);
-                children.extend(frame.nodes);
-                top.nodes.push(Node {
-                    text: "? -> ?  [builder]".to_string(),
-                    children,
-                });
-            }
+            Some(output) => self.step("builder", output),
+            None => self.note("builder: unfinished".to_string()),
         }
         self.close_if_single_step();
     }
@@ -347,135 +456,112 @@ impl Builder {
         match event {
             TraceEvent::OptimizeStart { root, session } => {
                 let session = if *session { " session" } else { "" };
-                self.push(
-                    FrameKind::Chain {
-                        lhs: root.clone(),
-                        label: format!("optimize{session}"),
-                        single_step: false,
-                    },
-                    root,
-                );
+                self.open_pass(format!("optimize{session}"), &root.0, false);
             }
-            TraceEvent::OptimizeLoopStart { array } => self.top().current = Some(array.clone()),
+            TraceEvent::OptimizeLoopStart { array } => self.top().current = Some(array.0.clone()),
             TraceEvent::OptimizeLoopEnd
             | TraceEvent::ExecuteUntilDoneCheck { .. }
             | TraceEvent::PhaseNone { .. }
             | TraceEvent::ExecuteEncoding { .. } => {}
-            TraceEvent::OptimizeDone { output, .. } => {
-                if matches!(self.top().kind, FrameKind::Chain { .. }) {
-                    self.close_chain(Some(output));
+            TraceEvent::OptimizeDone { .. } => {
+                if matches!(self.top().kind, FrameKind::Pass { .. }) {
+                    self.close_pass();
                 }
             }
             TraceEvent::OptimizeRecursiveStart { root } => {
-                self.top().current = Some(root.clone());
+                self.top().current = Some(root.0.clone());
             }
             TraceEvent::OptimizeRecursiveSlot {
-                slot_idx, output, ..
+                slot_idx,
+                input,
+                output,
             } => {
-                // There is no event for the rewritten parent; describe the slot directly.
-                let parent = self.top().current.clone();
-                let parent_text = parent
-                    .as_ref()
-                    .map_or_else(|| "?".to_string(), ToString::to_string);
-                let text = format!(
-                    "{parent_text} -> {parent_text}[{slot_idx} <- {output}]  [slot {slot_idx}]"
-                );
-                let top = self.top();
-                let children = std::mem::take(&mut top.pending);
-                top.nodes.push(Node { text, children });
-                top.steps += 1;
+                let path = path_text(&[self.path(), vec![*slot_idx]].concat());
+                self.note(format!("optimize_recursive @{path}: {input} -> {output}"));
             }
             TraceEvent::ReduceAttempt { rule, outcome, .. } => {
                 self.note(format!("x reduce {rule}: {outcome}"));
             }
             TraceEvent::ReduceApplied { rule, output, .. } => {
-                self.step(format!("reduce {rule}"), output, Vec::new());
+                self.step(&format!("reduce {rule}"), &output.0);
             }
             TraceEvent::ParentReduceAttempt {
-                child,
                 slot_idx,
                 source,
                 rule,
                 outcome,
                 ..
             } => self.note(format!(
-                "x reduce_parent {source}:{rule} slot={slot_idx} child={child}: {outcome}"
+                "x reduce_parent {source}:{rule} slot={slot_idx}: {outcome}"
             )),
             TraceEvent::ParentReduceApplied {
-                child,
                 slot_idx,
                 source,
                 rule,
                 output,
                 ..
             } => self.step(
-                format!("reduce_parent {source}:{rule} slot={slot_idx} child={child}"),
-                output,
-                Vec::new(),
+                &format!("reduce_parent {source}:{rule} slot={slot_idx}"),
+                &output.0,
             ),
-            TraceEvent::ExecuteUntilStart { target, root } => self.push(
-                FrameKind::Chain {
-                    lhs: root.clone(),
-                    label: format!("execute_until {target}"),
-                    single_step: false,
-                },
-                root,
-            ),
-            TraceEvent::ExecuteUntilIteration { current, .. } => {
-                self.top().current = Some(current.clone());
+            TraceEvent::ExecuteUntilStart { target, root } => {
+                self.open_pass(format!("execute_until {target}"), &root.0, false);
             }
-            TraceEvent::ExecuteUntilReturn { output } => {
-                if matches!(self.top().kind, FrameKind::Chain { .. }) {
-                    self.close_chain(Some(output));
+            TraceEvent::ExecuteUntilIteration { current, .. } => {
+                self.top().current = Some(current.0.clone());
+            }
+            TraceEvent::ExecuteUntilReturn { .. } => {
+                if matches!(self.top().kind, FrameKind::Pass { .. }) {
+                    self.close_pass();
                 }
             }
-            TraceEvent::ExecuteUntilPopFrame { output, .. } => self.close_slot(Some(output)),
+            TraceEvent::ExecuteUntilPopFrame { output, .. } => self.close_slot(Some(&output.0)),
             TraceEvent::ExecuteParentAttempt {
                 phase,
-                child,
                 slot_idx,
                 source,
                 kernel,
                 outcome,
                 ..
             } => self.note(format!(
-                "x {phase} {source}:{kernel} slot={slot_idx} child={child}: {outcome}"
+                "x {phase} {source}:{kernel} slot={slot_idx}: {outcome}"
             )),
             TraceEvent::ExecuteParentApplied {
                 phase,
-                child,
                 slot_idx,
                 source,
                 kernel,
                 output,
                 ..
             } => {
+                let before = self.before();
                 if *phase == "stack_execute_parent"
                     && matches!(self.top().kind, FrameKind::Slot { .. })
                 {
-                    self.close_slot(None);
+                    // The kernel rewrote the suspended parent, consuming the focused slot.
+                    let Some(frame) = self.pop() else { return };
+                    if let FrameKind::Slot { parent, .. } = frame.kind {
+                        self.top().current = Some(parent);
+                    }
                 }
-                self.step(
-                    format!("{phase} {source}:{kernel} slot={slot_idx} child={child}"),
-                    output,
-                    Vec::new(),
+                self.step_from(
+                    before,
+                    &format!("{phase} {source}:{kernel} slot={slot_idx}"),
+                    &output.0,
                 );
             }
             TraceEvent::ExecuteOptimized {
                 output, changed, ..
             } => {
                 if *changed {
-                    self.step("optimize_ctx".to_string(), output, Vec::new());
-                } else {
+                    self.step("optimize_ctx", &output.0);
+                } else if let Some(pending) = self.pending() {
                     // An optimize pass that changed nothing justifies nothing; keep only
-                    // premises that carry information of their own.
-                    let frame = self.top();
-                    let pending = std::mem::take(&mut frame.pending);
-                    frame.nodes.extend(
-                        pending.into_iter().filter(|node| {
-                            !(node.text.contains(" ->* ") && node.children.is_empty())
-                        }),
-                    );
+                    // items that carry information of their own.
+                    pending.retain(|inner| match inner {
+                        Inner::Pass(pass) => !pass.steps.is_empty(),
+                        Inner::Note(_) => true,
+                    });
                 }
             }
             TraceEvent::SlotTransition {
@@ -484,25 +570,18 @@ impl Builder {
                 parent,
                 child,
             } => match *step {
-                "ExecuteSlot" => {
-                    self.push(
-                        FrameKind::Slot {
-                            parent: parent.clone(),
-                            slot_idx: *slot_idx,
-                        },
-                        child,
-                    );
-                }
-                _ => {
-                    self.attach_pending_to_last();
-                    self.top()
-                        .nodes
-                        .push(Node::leaf(format!("append slot={slot_idx} {child}")));
-                }
+                "ExecuteSlot" => self.push(
+                    FrameKind::Slot {
+                        parent: parent.0.clone(),
+                        slot_idx: *slot_idx,
+                    },
+                    &child.0,
+                ),
+                _ => self.note(format!("append ({slot_idx}) {child}")),
             },
             TraceEvent::BuilderEvent { action, array, .. } => match *action {
-                "start" => self.push(FrameKind::Builder, array),
-                "finish" => self.close_builder(Some(array)),
+                "start" => self.push(FrameKind::Builder, &array.0),
+                "finish" => self.close_builder(Some(&array.0)),
                 _ => {}
             },
             TraceEvent::ExecuteDone { array } => {
@@ -510,20 +589,17 @@ impl Builder {
                     // `builder finish` follows and carries the real output.
                     return;
                 }
-                let encoding = self.current_encoding();
-                self.step(format!("execute {encoding}"), array, Vec::new());
+                let encoding = self
+                    .current()
+                    .map_or_else(|| "?".to_string(), |a| a.encoding_id().to_string());
+                self.step(&format!("execute {encoding}"), &array.0);
                 self.close_if_single_step();
             }
-            TraceEvent::SingleStepStart { array } => self.push(
-                FrameKind::Chain {
-                    lhs: array.clone(),
-                    label: "execute_step".to_string(),
-                    single_step: true,
-                },
-                array,
-            ),
+            TraceEvent::SingleStepStart { array } => {
+                self.open_pass("execute_step".to_string(), &array.0, true);
+            }
             TraceEvent::SingleStepApplied { phase, output, .. } => {
-                self.step(phase.to_string(), output, Vec::new());
+                self.step(phase, &output.0);
                 self.close_if_single_step();
             }
         }

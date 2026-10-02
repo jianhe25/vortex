@@ -415,10 +415,16 @@ fn trace_optimize_parent_reduce_fixpoint_attempts() -> VortexResult<()> {
       done output=vortex.filter(i32, len=2)
     ");
 
-    // The log line above reads `filter -> filter`; the derivation shows which slot changed.
+    // The log line above reads `filter -> filter`; the tree after the step shows what changed.
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
-    vortex.filter(i32, len=2) ->* vortex.filter(i32, len=2)  [optimize]
-    └─ vortex.filter(i32, len=2) -> vortex.filter(i32, len=2)[0 <- vortex.primitive(i32, len=6)]  [reduce_parent static:FilterReduceAdaptor(Filter) slot=0 child=vortex.filter(i32, len=4)]
+    [optimize]
+    vortex.filter(i32, len=2)
+    └─(0) vortex.filter(i32, len=4)
+       └─(0) vortex.primitive(i32, len=6)
+
+    1. reduce_parent static:FilterReduceAdaptor(Filter) slot=0 @root: vortex.filter(i32, len=2) -> vortex.filter(i32, len=2)
+       = vortex.filter(i32, len=2)
+         └─(0) vortex.primitive(i32, len=6)
     ");
 
     let mut ctx = ExecutionCtx::new(VortexSession::empty().with::<ArraySession>());
@@ -458,17 +464,25 @@ fn trace_optimize_parent_reduce_fixpoint_attempts() -> VortexResult<()> {
       return output=vortex.primitive(i32, len=2)
     ");
 
-    // The same execution as a derivation: the child focused by `ExecuteSlot` is reduced under
-    // its own header and justifies the congruence step on the parent, and the slice's optimize
-    // pass is a premise of the step that executed it.
+    // The same execution step by step: step 2 rewrites the child at `@0`, and the optimize pass
+    // the slice ran inside step 3 sits in that step's gutter.
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
-    vortex.filter(i32, len=2) ->* vortex.primitive(i32, len=2)  [execute_until AnyCanonical]
-    ├─ vortex.filter(i32, len=2) -> vortex.slice(i32, len=2)  [execute vortex.filter]
-    ├─ vortex.slice(i32, len=2) -> vortex.slice(i32, len=2)[0 <- vortex.primitive(i32, len=4)]  [slot 0]
-    │  └─ vortex.filter(i32, len=4) -> vortex.primitive(i32, len=4)  [execute vortex.filter]
-    └─ vortex.slice(i32, len=2) -> vortex.primitive(i32, len=2)  [execute vortex.slice]
-       └─ vortex.slice(i32, len=2) ->* vortex.primitive(i32, len=2)  [optimize]
-          └─ vortex.slice(i32, len=2) -> vortex.primitive(i32, len=2)  [reduce_parent static:SliceReduceAdaptor(Primitive) slot=0 child=vortex.primitive(i32, len=4)]
+    [execute_until AnyCanonical]
+    vortex.filter(i32, len=2)
+    └─(0) vortex.filter(i32, len=4)
+       └─(0) vortex.primitive(i32, len=6)
+
+    1. execute vortex.filter @root: vortex.filter(i32, len=2) -> vortex.slice(i32, len=2)
+    2. execute vortex.filter @0: vortex.filter(i32, len=4) -> vortex.primitive(i32, len=4)
+       = vortex.slice(i32, len=2)
+         └─(0) vortex.primitive(i32, len=4)
+    3. execute vortex.slice @root: vortex.slice(i32, len=2) -> vortex.primitive(i32, len=2)
+       │ [optimize]
+       │ vortex.slice(i32, len=2)
+       │ └─(0) vortex.primitive(i32, len=4)
+       │ 1. reduce_parent static:SliceReduceAdaptor(Primitive) slot=0 @root: vortex.slice(i32, len=2) -> vortex.primitive(i32, len=2)
+       │    = vortex.primitive(i32, len=2)
+       = vortex.primitive(i32, len=2)
     ");
 
     Ok(())
@@ -569,14 +583,17 @@ fn trace_execution_stack_parent_kernel_attempts(
       return output=vortex.primitive(i32, len=3)
     ");
 
-    // At `Attempts` resolution the declined kernels become premises of the step that won.
+    // At `Attempts` resolution the declined kernels appear in the gutter of the step that won.
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
-    vortex.test.stack-parent(i32, len=3) ->* vortex.primitive(i32, len=3)  [execute_until AnyCanonical]
-    └─ vortex.test.stack-parent(i32, len=3) -> vortex.primitive(i32, len=3)  [stack_execute_parent session[1]:execute_parent_fn slot=0 child=vortex.test.stack-child(i32, len=3)]
-       ├─ x child_execute_parent session[0]:execute_parent_fn slot=0 child=vortex.test.stack-child(i32, len=3): declined
-       ├─ x child_execute_parent session[1]:execute_parent_fn slot=0 child=vortex.test.stack-child(i32, len=3): declined
-       ├─ focus slot=0 vortex.test.stack-child(i32, len=3)
-       └─ x stack_execute_parent session[0]:execute_parent_fn slot=0 child=vortex.test.stack-child(i32, len=3): declined
+    [execute_until AnyCanonical]
+    vortex.test.stack-parent(i32, len=3)
+    └─(0) vortex.test.stack-child(i32, len=3)
+
+    1. stack_execute_parent session[1]:execute_parent_fn slot=0 @root: vortex.test.stack-parent(i32, len=3) -> vortex.primitive(i32, len=3)
+       │ x child_execute_parent session[0]:execute_parent_fn slot=0: declined
+       │ x child_execute_parent session[1]:execute_parent_fn slot=0: declined
+       │ x stack_execute_parent session[0]:execute_parent_fn slot=0: declined
+       = vortex.primitive(i32, len=3)
     ");
 
     Ok(())
@@ -624,11 +641,18 @@ fn trace_execution_chunked_append_child_flow() -> VortexResult<()> {
     ");
 
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
-    vortex.chunked(i32, len=5) ->* vortex.primitive(i32, len=5)  [execute_until AnyCanonical]
-    └─ vortex.chunked(i32, len=5) -> vortex.primitive(i32, len=5)  [builder]
-       ├─ append slot=1 vortex.primitive(i32, len=2)
-       ├─ append slot=2 vortex.primitive(i32, len=1)
-       └─ append slot=3 vortex.primitive(i32, len=2)
+    [execute_until AnyCanonical]
+    vortex.chunked(i32, len=5)
+    ├─(0) vortex.primitive(u64, len=4)
+    ├─(1) vortex.primitive(i32, len=2)
+    ├─(2) vortex.primitive(i32, len=1)
+    └─(3) vortex.primitive(i32, len=2)
+
+    1. builder @root: vortex.chunked(i32, len=5) -> vortex.primitive(i32, len=5)
+       │ append (1) vortex.primitive(i32, len=2)
+       │ append (2) vortex.primitive(i32, len=1)
+       │ append (3) vortex.primitive(i32, len=2)
+       = vortex.primitive(i32, len=5)
     ");
 
     Ok(())
@@ -724,12 +748,40 @@ fn trace_filter_on_struct_with_complex_children() -> VortexResult<()> {
       done output=vortex.struct({name=utf8, score=i64}, len=3)
     ");
 
-    // The rule optimizes the field it pushes into before it fires, so that pass is its premise.
+    // The rule optimizes the field it pushes into before it fires, so that pass is in its gutter.
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
-    vortex.filter({name=utf8, score=i64}, len=3) ->* vortex.struct({name=utf8, score=i64}, len=3)  [optimize]
-    └─ vortex.filter({name=utf8, score=i64}, len=3) -> vortex.struct({name=utf8, score=i64}, len=3)  [reduce FilterStructRule]
-       └─ vortex.filter(utf8, len=3) ->* vortex.dict(utf8, len=3)  [optimize]
-          └─ vortex.filter(utf8, len=3) -> vortex.dict(utf8, len=3)  [reduce_parent static:FilterReduceAdaptor(Dict) slot=0 child=vortex.dict(utf8, len=5)]
+    [optimize]
+    vortex.filter({name=utf8, score=i64}, len=3)
+    └─(0) vortex.struct({name=utf8, score=i64}, len=5)
+       ├─(1) vortex.dict(utf8, len=5)
+       │  ├─(0) vortex.primitive(u32, len=5)
+       │  └─(1) vortex.varbinview(utf8, len=3)
+       └─(2) vortex.chunked(i64, len=5)
+          ├─(0) vortex.primitive(u64, len=3)
+          ├─(1) vortex.primitive(i64, len=2)
+          └─(2) vortex.primitive(i64, len=3)
+
+    1. reduce FilterStructRule @root: vortex.filter({name=utf8, score=i64}, len=3) -> vortex.struct({name=utf8, score=i64}, len=3)
+       │ [optimize]
+       │ vortex.filter(utf8, len=3)
+       │ └─(0) vortex.dict(utf8, len=5)
+       │    ├─(0) vortex.primitive(u32, len=5)
+       │    └─(1) vortex.varbinview(utf8, len=3)
+       │ 1. reduce_parent static:FilterReduceAdaptor(Dict) slot=0 @root: vortex.filter(utf8, len=3) -> vortex.dict(utf8, len=3)
+       │    = vortex.dict(utf8, len=3)
+       │      ├─(0) vortex.filter(u32, len=3)
+       │      │  └─(0) vortex.primitive(u32, len=5)
+       │      └─(1) vortex.varbinview(utf8, len=3)
+       = vortex.struct({name=utf8, score=i64}, len=3)
+         ├─(1) vortex.dict(utf8, len=3)
+         │  ├─(0) vortex.filter(u32, len=3)
+         │  │  └─(0) vortex.primitive(u32, len=5)
+         │  └─(1) vortex.varbinview(utf8, len=3)
+         └─(2) vortex.filter(i64, len=3)
+            └─(0) vortex.chunked(i64, len=5)
+               ├─(0) vortex.primitive(u64, len=3)
+               ├─(1) vortex.primitive(i64, len=2)
+               └─(2) vortex.primitive(i64, len=3)
     ");
 
     let optimized = traced.output;
