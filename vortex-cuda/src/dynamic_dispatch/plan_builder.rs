@@ -75,7 +75,7 @@ pub struct MaterializedPlan {
 
 fn cuda_bit_width(bp: &impl BitPackedArrayExt) -> VortexResult<u8> {
     bp.constant_bit_width_opt().ok_or_else(|| {
-        vortex_err!("CUDA does not support BitPacked blocks with different bit widths")
+        vortex_err!("CUDA requires BitPacked block offsets to be a constant-width sequence")
     })
 }
 
