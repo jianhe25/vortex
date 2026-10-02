@@ -216,6 +216,15 @@ fn take_views<O: UnsignedPType, I: IntegerPType + AsPrimitive<usize>>(
         }
     };
 
+    // A source smaller than the index list is gathered many times over (a dictionary's values,
+    // for one), so build each source view once and copy 16 bytes per output row, rather than
+    // re-deriving a view from the offsets and bytes for every output row.
+    let source_len = offsets.len() - 1;
+    if source_len < indices.len() {
+        let views: Buffer<BinaryView> = Buffer::from_trusted_len_iter((0..source_len).map(build));
+        return gather_views(&views, indices, mask);
+    }
+
     match mask.bit_buffer() {
         AllOr::All => Buffer::from_trusted_len_iter(indices.iter().map(|i| build(i.as_()))),
         AllOr::None => {
@@ -225,6 +234,28 @@ fn take_views<O: UnsignedPType, I: IntegerPType + AsPrimitive<usize>>(
             Buffer::from_trusted_len_iter(buffer.iter().zip(indices.iter()).map(|(valid, i)| {
                 if valid {
                     build(i.as_())
+                } else {
+                    BinaryView::default()
+                }
+            }))
+        }
+    }
+}
+
+fn gather_views<I: IntegerPType + AsPrimitive<usize>>(
+    views: &[BinaryView],
+    indices: &[I],
+    mask: &Mask,
+) -> Buffer<BinaryView> {
+    match mask.bit_buffer() {
+        AllOr::All => Buffer::from_trusted_len_iter(indices.iter().map(|i| views[i.as_()])),
+        AllOr::None => {
+            Buffer::from_trusted_len_iter(iter::repeat_n(BinaryView::default(), indices.len()))
+        }
+        AllOr::Some(buffer) => {
+            Buffer::from_trusted_len_iter(buffer.iter().zip(indices.iter()).map(|(valid, i)| {
+                if valid {
+                    views[i.as_()]
                 } else {
                     BinaryView::default()
                 }
@@ -869,6 +900,36 @@ mod tests {
             &array.into_array(),
             &mut array_session().create_execution_ctx(),
         );
+    }
+
+    const LONG: &str = "a value longer than twelve bytes";
+
+    /// A source shorter than the index list takes the gather-once path; every row, inlined or
+    /// not, null or not, must still come back right.
+    #[rstest]
+    #[case(
+        PrimitiveArray::from_iter([2u8, 0, 1, 1, 2, 0, 0, 1]).into_array(),
+        vec![Some(LONG), Some("a"), None, None, Some(LONG), Some("a"), Some("a"), None],
+    )]
+    #[case(
+        PrimitiveArray::from_option_iter([Some(2u32), None, Some(1), Some(1), None, Some(0), Some(0), Some(1)]).into_array(),
+        vec![Some(LONG), None, None, None, None, Some("a"), Some("a"), None],
+    )]
+    fn test_take_small_source_many_indices(
+        #[case] indices: crate::ArrayRef,
+        #[case] expected: Vec<Option<&str>>,
+    ) -> VortexResult<()> {
+        let source = VarBinArray::from_iter(
+            [Some("a"), None, Some(LONG)],
+            DType::Utf8(Nullability::Nullable),
+        );
+        let taken = source.take(indices)?;
+        assert_arrays_eq!(
+            taken,
+            VarBinViewArray::from_iter_nullable_str(expected),
+            &mut array_session().create_execution_ctx()
+        );
+        Ok(())
     }
 
     #[test]
