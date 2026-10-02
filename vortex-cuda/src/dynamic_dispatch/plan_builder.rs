@@ -162,11 +162,16 @@ fn is_dyn_dispatch_cast_compatible(array: &ArrayRef) -> bool {
 /// Returns `true` if a registered standalone kernel can decode the entire
 /// `array` tree in a single launch without recursing into `execute_cuda`
 /// for child encodings.
+///
+/// `FoR` requires a constant reference, and `BitPacked` requires sequence block
+/// offsets describing a constant bit width.
 pub fn has_standalone_kernel(array: &ArrayRef) -> bool {
     let id = array.encoding_id();
 
-    // Leaf encodings: no children to recurse into.
-    if id == BitPacked.id() || id == Sequence.id() {
+    if id == BitPacked.id() {
+        return is_bitpacked_with_constant_bw(array);
+    }
+    if id == Sequence.id() {
         return true;
     }
 
@@ -178,15 +183,21 @@ pub fn has_standalone_kernel(array: &ArrayRef) -> bool {
         }
         let child = for_arr.encoded();
         if child.encoding_id() == BitPacked.id() {
-            return true;
+            return is_bitpacked_with_constant_bw(child);
         }
         if let Some(slice) = child.as_opt::<Slice>() {
-            return slice.child().encoding_id() == BitPacked.id();
+            return is_bitpacked_with_constant_bw(slice.child());
         }
         return false;
     }
 
     false
+}
+
+fn is_bitpacked_with_constant_bw(array: &ArrayRef) -> bool {
+    array
+        .as_opt::<BitPacked>()
+        .is_some_and(|array| array.constant_bit_width_opt().is_some())
 }
 
 /// Patch payload attached to the op that consumes it.
@@ -909,13 +920,49 @@ impl FusedPlan {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use vortex::array::IntoArray;
     use vortex::array::arrays::PrimitiveArray;
+    use vortex::array::arrays::SliceArray;
     use vortex::array::builtins::ArrayBuiltins;
+    use vortex::buffer::Buffer;
+    use vortex::buffer::ByteBuffer;
+    use vortex::buffer::buffer;
     use vortex::dtype::DType;
     use vortex::dtype::Nullability;
 
     use super::*;
+
+    #[rstest]
+    #[case::equal_steps(buffer![0u64, 512, 1024])]
+    #[case::different_widths(buffer![0u64, 384, 1024])]
+    fn materialized_bitpacked_offsets_have_no_standalone_kernel(
+        #[case] offsets: Buffer<u64>,
+    ) -> VortexResult<()> {
+        let bitpacked = BitPacked::try_new_with_block_offsets(
+            BufferHandle::new_host(ByteBuffer::zeroed(1024)),
+            PType::U32,
+            Validity::NonNullable,
+            None,
+            offsets.into_array(),
+            2048,
+            0,
+        )?
+        .into_array();
+        assert!(!has_standalone_kernel(&bitpacked));
+        assert!(matches!(
+            DispatchPlan::new(&bitpacked, CudaDispatchMode::Auto)?,
+            DispatchPlan::Unfused
+        ));
+
+        let for_bitpacked = FoR::try_new(bitpacked.clone(), 100u32.into())?.into_array();
+        assert!(!has_standalone_kernel(&for_bitpacked));
+
+        let sliced = SliceArray::new(bitpacked, 100..1500).into_array();
+        let for_sliced = FoR::try_new(sliced, 100u32.into())?.into_array();
+        assert!(!has_standalone_kernel(&for_sliced));
+        Ok(())
+    }
 
     #[test]
     fn cast_to_non_primitive_target_is_not_dyn_dispatch_compatible() -> VortexResult<()> {

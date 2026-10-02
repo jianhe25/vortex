@@ -100,11 +100,12 @@ pub(crate) fn block_offsets_from_constant_bit_width(
 }
 
 /// Check that `offsets` holds `num_blocks + 1` boundaries spanning `packed_len` bytes, each block a
-/// whole number of 128-byte rows of at most 64 bits.
+/// whole number of 128-byte rows with a bit width supported by `ptype`.
 ///
 /// Boundaries are only inspected when they are a sequence or materialized on the host.
 pub(crate) fn validate_block_offsets(
     offsets: &ArrayRef,
+    ptype: PType,
     num_blocks: usize,
     packed_len: usize,
 ) -> VortexResult<()> {
@@ -119,11 +120,12 @@ pub(crate) fn validate_block_offsets(
         num_blocks + 1,
         offsets.len()
     );
+    let max_bit_width = ptype.bit_width() as u64;
     if let Some(sequence) = offsets.as_opt::<Sequence>() {
         let step = sequence.multiplier().cast::<u64>()?;
         vortex_ensure!(
-            step % 128 == 0 && step / 128 <= 64,
-            "Block offsets step {step} is not a supported bit width"
+            step % 128 == 0 && step / 128 <= max_bit_width,
+            "Block offsets step {step} is not a supported bit width for {ptype}"
         );
         let span = step * num_blocks as u64;
         vortex_ensure!(
@@ -137,8 +139,8 @@ pub(crate) fn validate_block_offsets(
         for pair in boundaries.windows(2) {
             let size = pair[1].checked_sub(pair[0]);
             vortex_ensure!(
-                size.is_some_and(|size| size % 128 == 0 && size / 128 <= 64),
-                "Block boundaries {} and {} do not hold a supported bit width",
+                size.is_some_and(|size| size % 128 == 0 && size / 128 <= max_bit_width),
+                "Block boundaries {} and {} do not hold a supported bit width for {ptype}",
                 pair[0],
                 pair[1]
             );
@@ -152,13 +154,19 @@ pub(crate) fn validate_block_offsets(
     Ok(())
 }
 
+/// The packed payload and children extracted from a [`BitPackedArray`].
 pub struct BitPackedParts {
+    /// The position of the first logical value within the first packed block.
     pub offset: u16,
     /// Byte boundaries of the packed blocks, including the trailing end boundary.
     pub block_offsets: ArrayRef,
+    /// The number of logical values in the array.
     pub len: usize,
+    /// The buffer containing the packed blocks.
     pub packed: BufferHandle,
+    /// Exception values and their positions in the array.
     pub patches: Option<Patches>,
+    /// The validity of the logical values.
     pub validity: Validity,
 }
 
@@ -179,47 +187,11 @@ impl Display for BitPackedData {
 }
 
 impl BitPackedData {
-    /// Create a new bitpacked array using a buffer of packed data.
+    /// Create the packed payload and patch metadata for a [`BitPackedArray`].
     ///
-    /// The packed data should be interpreted as a sequence of values with size `bit_width`.
-    ///
-    /// # Errors
-    ///
-    /// This method returns errors if any of the metadata is inconsistent, for example the packed
-    /// buffer provided does not have the right size according to the supplied length and target
-    /// PType.
-    ///
-    /// # Safety
-    ///
-    /// For signed arrays, it is the caller's responsibility to ensure that there are no values
-    /// that can be interpreted once unpacked to the provided PType.
-    ///
-    /// This invariant is upheld by the compressor, but callers must ensure this if they wish to
-    /// construct a new `BitPackedArray` from parts.
-    ///
-    /// See also the [`encode`][Self::encode] method on this type for a safe path to create a new
-    /// bit-packed array.
-    /// A safe constructor for a `BitPackedArray` from its components:
-    ///
-    /// * `packed` is ByteBuffer holding the compressed data that was packed with FastLanes
-    ///   bit-packing to a `bit_width` bits per value. `length` is the length of the original
-    ///   vector. Note that the packed is padded with zeros to the next multiple of 1024 elements
-    ///   if `length` is not divisible by 1024.
-    /// * `ptype` of the original data
-    /// * `validity` to track any nulls
-    /// * `patches` optionally provided for values that did not pack
-    ///
-    /// Any failure in validation will result in an error.
-    ///
-    /// # Validation
-    ///
-    /// * The `ptype` must be an integer
-    /// * `validity` must have `length` len
-    /// * Any patches must have any `array_len` equal to `length`
-    /// * The `packed` buffer must be exactly sized to hold `length` values of `bit_width` rounded
-    ///   up to the next multiple of 1024.
-    ///
-    /// Any violation of these preconditions will result in an error.
+    /// Returns an error if `offset` is outside the first 1024-value block. The dtype, length,
+    /// validity, patches, and block boundaries are validated when the payload is assembled into
+    /// an array, for example by [`crate::BitPacked::try_new_with_block_offsets`].
     pub fn try_new(
         packed: BufferHandle,
         patches: Option<Patches>,
@@ -303,7 +275,7 @@ impl BitPackedData {
     }
 
     /// Accessor for bit unpacked chunks
-    pub fn unpacked_chunks<'a, T: BitPackedIter>(
+    pub(crate) fn unpacked_chunks<'a, T: BitPackedIter>(
         &'a self,
         dtype: &DType,
         bit_width: u8,
@@ -371,16 +343,6 @@ pub trait BitPackedArrayExt: BitPackedArraySlotsExt {
         self.constant_bit_width_opt().ok_or_else(|| {
             vortex_err!("BitPacked blocks with different bit widths are not supported")
         })
-    }
-
-    /// Calculate the maximum value that **can** be contained by this array, given its constant
-    /// bit width.
-    ///
-    /// Note that this value need not actually be present in the array.
-    #[inline]
-    fn max_packed_value(&self) -> Option<usize> {
-        self.constant_bit_width_opt()
-            .map(|bit_width| (1 << bit_width) - 1)
     }
 
     #[inline]

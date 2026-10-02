@@ -12,6 +12,8 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::assert_arrays_eq;
 use vortex_array::buffer::BufferHandle;
+use vortex_array::builders::ArrayBuilder;
+use vortex_array::builders::PrimitiveBuilder;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
@@ -129,6 +131,68 @@ fn casts_with_materialized_block_offsets_decline(
 #[case::nullable(Ok(Sequence::try_new_typed(0u64, 896, Nullability::Nullable, 4)?.into_array()))]
 fn invalid_block_offsets_are_rejected(#[case] offsets: VortexResult<ArrayRef>) -> VortexResult<()> {
     assert!(with_block_offsets(&uniform()?, offsets?).is_err());
+    Ok(())
+}
+
+#[rstest]
+fn block_width_must_fit_ptype(
+    #[values(
+        PType::U8, PType::I8, PType::U16, PType::I16, PType::U32, PType::I32, PType::U64,
+        PType::I64
+    )]
+    ptype: PType,
+    #[values(false, true)] materialized: bool,
+    #[values(false, true)] too_wide: bool,
+) -> VortexResult<()> {
+    let bit_width = u8::try_from(ptype.bit_width())? + u8::from(too_wide);
+    let step = 128 * u64::from(bit_width);
+    let offsets = if materialized {
+        buffer![0u64, step].into_array()
+    } else {
+        sequence(0, step, 2)?
+    };
+    let result = BitPacked::try_new_with_block_offsets(
+        BufferHandle::new_host(ByteBuffer::zeroed(128 * usize::from(bit_width))),
+        ptype,
+        Validity::NonNullable,
+        None,
+        offsets,
+        1024,
+        0,
+    );
+    assert_eq!(result.is_err(), too_wide);
+    Ok(())
+}
+
+#[rstest]
+#[case::equal_steps(buffer![0u64, 512, 1024])]
+#[case::different_widths(buffer![0u64, 384, 1024])]
+fn unsupported_offsets_leave_builder_unchanged(
+    #[case] offsets: vortex_buffer::Buffer<u64>,
+) -> VortexResult<()> {
+    let mut ctx = SESSION.create_execution_ctx();
+    let array = BitPacked::try_new_with_block_offsets(
+        BufferHandle::new_host(ByteBuffer::zeroed(1024)),
+        PType::U32,
+        Validity::AllValid,
+        None,
+        offsets.into_array(),
+        2048,
+        0,
+    )?;
+    let mut builder = PrimitiveBuilder::<u32>::with_capacity_in(
+        Nullability::Nullable,
+        array.len() + 2,
+        ctx.allocator(),
+    );
+    builder.append_null();
+    assert!(array.append_to_builder(&mut builder, &mut ctx).is_err());
+    builder.append_value(7);
+    assert_arrays_eq!(
+        builder.finish_into_primitive(),
+        PrimitiveArray::from_option_iter([None, Some(7u32)]),
+        &mut ctx
+    );
     Ok(())
 }
 

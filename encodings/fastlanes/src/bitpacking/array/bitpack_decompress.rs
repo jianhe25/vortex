@@ -17,7 +17,6 @@ use vortex_array::match_each_integer_ptype;
 use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_array::patches::Patches;
 use vortex_array::scalar::Scalar;
-use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::BitPacked;
@@ -114,18 +113,19 @@ where
     }
 
     let len = array.len();
+    let mut scratch = [const { MaybeUninit::<F>::uninit() }; FL_CHUNK_SIZE];
+    let mut chunks = array.unpacked_chunks::<F>(&mut scratch)?;
+    let validity = array.validity()?.execute_mask(len, ctx)?;
     let mut uninit_range = builder.uninit_range(len);
 
     // SAFETY: We initialize all `len` values below via `decode` and the patch loop.
     unsafe {
-        uninit_range.append_mask(&array.validity()?.execute_mask(len, ctx)?);
+        uninit_range.append_mask(&validity);
     }
 
     // SAFETY: `decode` writes a value to every slot in this range.
     let uninit_slice = unsafe { uninit_range.slice_uninit_mut(0, len) };
 
-    let mut scratch = [const { MaybeUninit::<F>::uninit() }; FL_CHUNK_SIZE];
-    let mut chunks = array.unpacked_chunks::<F>(&mut scratch)?;
     decode(&mut chunks, uninit_slice, &map);
 
     if let Some(patches) = array.patches() {
@@ -176,7 +176,7 @@ pub fn unpack_single(array: ArrayView<'_, BitPacked>, index: usize) -> VortexRes
         }
     });
     // Cast to fix signedness and nullability
-    Ok(scalar.cast(array.dtype()).vortex_expect("cast failure"))
+    scalar.cast(array.dtype())
 }
 
 /// # Safety
@@ -227,6 +227,7 @@ mod tests {
     use vortex_buffer::Buffer;
     use vortex_buffer::BufferMut;
     use vortex_buffer::buffer;
+    use vortex_error::VortexExpect;
     use vortex_session::VortexSession;
 
     use super::*;

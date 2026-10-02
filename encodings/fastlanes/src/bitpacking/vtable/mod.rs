@@ -109,7 +109,12 @@ impl VTable for BitPacked {
         );
         let bp_slots = BitPackedSlotsView::from_slots(slots);
         let num_blocks = (len + data.offset as usize).div_ceil(FL_CHUNK_SIZE);
-        validate_block_offsets(bp_slots.block_offsets, num_blocks, data.packed.len())?;
+        validate_block_offsets(
+            bp_slots.block_offsets,
+            dtype.as_ptype(),
+            num_blocks,
+            data.packed.len(),
+        )?;
 
         let validity = child_to_validity(bp_slots.validity_child, dtype.nullability());
         let patches =

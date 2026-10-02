@@ -101,7 +101,7 @@ pub struct UnpackedChunks<'a, T: PhysicalPType, S: UnpackStrategy<T>> {
 pub type BitUnpackedChunks<'a, T> = UnpackedChunks<'a, T, BitPackingStrategy>;
 
 impl<'a, T: BitPacked> BitUnpackedChunks<'a, T> {
-    pub fn try_new(
+    pub(crate) fn try_new(
         array: &'a BitPackedData,
         bit_width: u8,
         len: usize,
