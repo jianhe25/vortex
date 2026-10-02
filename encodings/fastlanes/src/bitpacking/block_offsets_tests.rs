@@ -93,8 +93,14 @@ fn unsigned_block_offsets_are_supported(
             PrimitiveArray::from_iter([127 as T, 255 as T]).into_array()
         })
     } else {
-        Sequence::try_new(127u64.into(), 128u64.into(), ptype, Nullability::NonNullable, 2)?
-            .into_array()
+        Sequence::try_new(
+            127u64.into(),
+            128u64.into(),
+            ptype,
+            Nullability::NonNullable,
+            2,
+        )?
+        .into_array()
     };
     let array = BitPacked::try_new_with_block_offsets(
         BufferHandle::new_host(ByteBuffer::zeroed(128)),

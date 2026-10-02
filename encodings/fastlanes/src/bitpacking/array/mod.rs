@@ -134,24 +134,36 @@ pub(crate) fn validate_block_offsets(
         && primitive.buffer_handle().is_on_host()
     {
         let span = match_each_unsigned_integer_ptype!(primitive.ptype(), |T| {
-            let boundaries = primitive.as_slice::<T>();
-            for pair in boundaries.windows(2) {
-                let size = u64::from(pair[1]).checked_sub(u64::from(pair[0]));
-                vortex_ensure!(
-                    size.is_some_and(|size| size % 128 == 0 && size / 128 <= max_bit_width),
-                    "Block boundaries {} and {} do not hold a supported bit width for {ptype}",
-                    pair[0],
-                    pair[1]
-                );
-            }
-            u64::from(boundaries[num_blocks]) - u64::from(boundaries[0])
-        });
+            validate_boundaries(primitive.as_slice::<T>(), ptype)
+        })?;
         vortex_ensure!(
             span == packed_len as u64,
             "Block offsets span {span} bytes, but the packed buffer has {packed_len}"
         );
     }
     Ok(())
+}
+
+/// Check that each block between `boundaries` is a whole number of 128-byte rows with a bit width
+/// supported by `ptype`, returning the number of bytes the boundaries span.
+fn validate_boundaries<T: Copy + Display>(boundaries: &[T], ptype: PType) -> VortexResult<u64>
+where
+    u64: From<T>,
+{
+    let max_bit_width = ptype.bit_width() as u64;
+    for pair in boundaries.windows(2) {
+        let size = u64::from(pair[1]).checked_sub(u64::from(pair[0]));
+        vortex_ensure!(
+            size.is_some_and(|size| size % 128 == 0 && size / 128 <= max_bit_width),
+            "Block boundaries {} and {} do not hold a supported bit width for {ptype}",
+            pair[0],
+            pair[1]
+        );
+    }
+    Ok(match boundaries {
+        [first, .., last] => u64::from(*last) - u64::from(*first),
+        _ => 0,
+    })
 }
 
 /// The packed payload and children extracted from a [`BitPackedArray`].
