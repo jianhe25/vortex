@@ -4,6 +4,7 @@
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BitBufferMut;
 use vortex_error::VortexResult;
+use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
 use super::SumV2;
@@ -18,10 +19,12 @@ use crate::aggregate_fn::fns::sum::sum_float_all;
 use crate::aggregate_fn::fns::sum::sum_signed_all;
 use crate::aggregate_fn::fns::sum::sum_unsigned_all;
 use crate::aggregate_fn::kernels::DynGroupedAggregateKernel;
+use crate::arrays::Bool;
 use crate::arrays::BoolArray;
 use crate::arrays::Primitive;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::StructArray;
+use crate::arrays::bool::BoolArrayExt;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
 use crate::match_each_native_ptype;
@@ -42,6 +45,80 @@ impl DynGroupedAggregateKernel for PrimitiveGroupedSumV2EncodingKernel {
             return Ok(None);
         };
         try_grouped_sum(groups, ctx, options.skip_nans)
+    }
+}
+
+/// Encoding-specific grouped [`SumV2`] kernel for boolean element arrays.
+///
+/// The sum of a group of booleans is the number of valid `true` values, so each group is a
+/// popcount over its range of bits.
+#[derive(Debug)]
+pub(crate) struct BoolGroupedSumV2EncodingKernel;
+
+impl DynGroupedAggregateKernel for BoolGroupedSumV2EncodingKernel {
+    fn grouped_aggregate(
+        &self,
+        aggregate_fn: &AggregateFnRef,
+        groups: &GroupedArray,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        if aggregate_fn.as_opt::<SumV2>().is_none() || !groups.elements().is::<Bool>() {
+            return Ok(None);
+        }
+        let elements = groups.elements().clone().downcast::<Bool>();
+        let group_ranges = groups.group_ranges(ctx)?;
+        let group_validity = groups.group_validity(ctx)?;
+        let elem_mask = elements
+            .as_ref()
+            .validity()?
+            .execute_mask(elements.as_ref().len(), ctx)?;
+
+        // Only valid `true` values count, and a group with no valid values sums to null.
+        let bits = elements.to_bit_buffer();
+        let (valid_true, valid) = match elem_mask.bit_buffer() {
+            AllOr::All => (bits, None),
+            AllOr::None => (BitBuffer::new_unset(bits.len()), Some(BitBuffer::new_unset(bits.len()))),
+            AllOr::Some(validity) => (&bits & validity, Some(validity.clone())),
+        };
+
+        let group_count = group_ranges.len();
+        let mut is_empty = BitBufferMut::new_unset(group_count);
+        let sums = group_ranges.iter().enumerate().map(|(i, (offset, size))| {
+            if !group_validity.value(i) {
+                return 0u64;
+            }
+            let any_valid = match &valid {
+                None => size > 0,
+                Some(valid) => valid.slice(offset..offset + size).true_count() > 0,
+            };
+            if !any_valid {
+                // SAFETY: `i` comes from enumerating `group_ranges`, and the bitmap has one bit
+                // per group.
+                unsafe { is_empty.set_unchecked(i) };
+            }
+            valid_true.slice(offset..offset + size).true_count() as u64
+        });
+        let sums = PrimitiveArray::from_iter(sums);
+        let partial_fields = sum_v2_partial_fields(sums.dtype().clone());
+
+        // SAFETY: all three children have one value per group and match `partial_fields`; the
+        // struct validity is derived from the same group count.
+        Ok(Some(
+            unsafe {
+                StructArray::new_unchecked(
+                    vec![
+                        sums.into_array(),
+                        BoolArray::new(BitBuffer::new_unset(group_count), Validity::NonNullable)
+                            .into_array(),
+                        BoolArray::new(is_empty.freeze(), Validity::NonNullable).into_array(),
+                    ],
+                    partial_fields,
+                    group_count,
+                    Validity::from_mask(group_validity, Nullability::Nullable),
+                )
+            }
+            .into_array(),
+        ))
     }
 }
 

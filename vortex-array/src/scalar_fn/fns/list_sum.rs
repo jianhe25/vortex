@@ -285,6 +285,31 @@ mod tests {
     }
 
     #[test]
+    fn test_nullable_bool_elements() -> VortexResult<()> {
+        let elements = BoolArray::from_iter([
+            Some(true),
+            None,
+            Some(true),
+            None,
+            None,
+            Some(false),
+            Some(true),
+        ]);
+        let list = ListArray::try_new(
+            elements.into_array(),
+            buffer![0u32, 3, 5, 5, 7, 7].into_array(),
+            Validity::from_iter([true, true, true, true, false]),
+        )?
+        .into_array();
+        let result = list.apply(&list_sum(root()))?;
+
+        let mut ctx = array_session().create_execution_ctx();
+        let expected = PrimitiveArray::from_option_iter::<u64, _>([Some(2), None, None, Some(1), None]);
+        assert_arrays_eq!(result, expected, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
     fn test_nan_skipped_by_default() -> VortexResult<()> {
         let elements = PrimitiveArray::from_iter([1.0f64, f64::NAN, 2.0]);
         let list = ListArray::try_new(
