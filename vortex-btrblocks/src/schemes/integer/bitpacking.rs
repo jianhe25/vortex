@@ -17,6 +17,7 @@ use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::EstimateVerdict;
 use vortex_error::VortexResult;
 use vortex_fastlanes::BitPacked;
+use vortex_fastlanes::BitPackedArrayExt;
 use vortex_fastlanes::bitpack_compress::bit_width_histogram;
 use vortex_fastlanes::bitpack_compress::bitpack_encode;
 use vortex_fastlanes::bitpack_compress::find_best_bit_width;
@@ -87,17 +88,18 @@ impl Scheme for BitPackingScheme {
 
         let packed_stats = packed.statistics().to_owned();
         let ptype = packed.dtype().as_ptype();
+        let bit_width = packed.constant_bit_width()?;
         let mut parts = BitPacked::into_parts(packed);
 
         let array = if use_experimental_patches() {
             let patches = parts.patches.take();
             // Transpose patches into G-ALP style PatchedArray, wrapping an inner BitPackedArray.
-            let array = BitPacked::try_new_with_block_offsets(
+            let array = BitPacked::try_new(
                 parts.packed,
                 ptype,
                 parts.validity,
                 None,
-                parts.block_offsets,
+                bit_width,
                 parts.len,
                 parts.offset,
             )?
@@ -117,12 +119,12 @@ impl Scheme for BitPackingScheme {
                 .map(|p| compress_patches(p, exec_ctx))
                 .transpose()?;
             parts.patches = patches;
-            BitPacked::try_new_with_block_offsets(
+            BitPacked::try_new(
                 parts.packed,
                 ptype,
                 parts.validity,
                 parts.patches,
-                parts.block_offsets,
+                bit_width,
                 parts.len,
                 parts.offset,
             )?

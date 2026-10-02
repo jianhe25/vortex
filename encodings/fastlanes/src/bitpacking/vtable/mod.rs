@@ -252,7 +252,7 @@ impl BitPacked {
     /// `block_offsets` must be non-nullable unsigned integers with one boundary per block and a
     /// trailing end boundary. Each block's bit width is derived from the distance between its
     /// boundaries.
-    pub fn try_new_with_block_offsets(
+    pub(crate) fn try_new_with_block_offsets(
         packed: BufferHandle,
         ptype: PType,
         validity: Validity,

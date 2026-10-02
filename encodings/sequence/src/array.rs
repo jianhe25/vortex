@@ -477,11 +477,8 @@ impl Sequence {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that:
-    /// - `ptype`, `base`, and `multiplier` are integers.
-    /// - `length` is greater than zero.
-    /// - `base` and every value `base + i * multiplier` for `i` in `0..length` fit `ptype`.
-    pub unsafe fn new_unchecked(
+    /// Caller must ensure the sequence is logically compatible with the provided dtype and len.
+    pub(crate) unsafe fn new_unchecked(
         base: PValue,
         multiplier: PValue,
         ptype: PType,

@@ -915,6 +915,9 @@ impl FusedPlan {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use vortex::array::Array;
+    use vortex::array::ArrayParts;
+    use vortex::array::ArraySlots;
     use vortex::array::IntoArray;
     use vortex::array::arrays::PrimitiveArray;
     use vortex::array::arrays::SliceArray;
@@ -924,6 +927,8 @@ mod tests {
     use vortex::buffer::buffer;
     use vortex::dtype::DType;
     use vortex::dtype::Nullability;
+    use vortex::encodings::fastlanes::BitPackedData;
+    use vortex::encodings::fastlanes::BitPackedSlots;
 
     use super::*;
 
@@ -933,14 +938,13 @@ mod tests {
     fn materialized_bitpacked_offsets_have_no_standalone_kernel(
         #[case] offsets: Buffer<u64>,
     ) -> VortexResult<()> {
-        let bitpacked = BitPacked::try_new_with_block_offsets(
-            BufferHandle::new_host(ByteBuffer::zeroed(1024)),
-            PType::U32,
-            Validity::NonNullable,
-            None,
-            offsets.into_array(),
-            2048,
-            0,
+        let mut slots: ArraySlots = std::iter::repeat_n(None, BitPackedSlots::COUNT).collect();
+        slots[BitPackedSlots::BLOCK_OFFSETS] = Some(offsets.into_array());
+        let data =
+            BitPackedData::try_new(BufferHandle::new_host(ByteBuffer::zeroed(1024)), None, 0)?;
+        let dtype = DType::Primitive(PType::U32, Nullability::NonNullable);
+        let bitpacked = Array::<BitPacked>::try_from_parts(
+            ArrayParts::new(BitPacked, dtype, 2048, data).with_slots(slots),
         )?
         .into_array();
         assert!(!has_standalone_kernel(&bitpacked));

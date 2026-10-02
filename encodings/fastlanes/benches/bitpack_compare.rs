@@ -29,6 +29,7 @@ use vortex_buffer::Alignment;
 use vortex_buffer::BufferMut;
 use vortex_fastlanes::BitPacked;
 use vortex_fastlanes::BitPackedArray;
+use vortex_fastlanes::BitPackedArrayExt;
 use vortex_fastlanes::BitPackedData;
 use vortex_session::VortexSession;
 
@@ -57,13 +58,14 @@ const BIT_WIDTHS: &[u8] = &[4, 16];
 /// page boundary makes the layout, and therefore the measurement, reproducible.
 fn page_aligned(array: BitPackedArray) -> BitPackedArray {
     let ptype = array.dtype().as_ptype();
+    let bit_width = array.constant_bit_width().unwrap();
     let parts = BitPacked::into_parts(array);
-    BitPacked::try_new_with_block_offsets(
+    BitPacked::try_new(
         parts.packed.ensure_aligned(Alignment::new(4096)).unwrap(),
         ptype,
         parts.validity,
         parts.patches,
-        parts.block_offsets,
+        bit_width,
         parts.len,
         parts.offset,
     )

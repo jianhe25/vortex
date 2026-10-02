@@ -77,27 +77,11 @@ pub(crate) fn block_offsets_from_constant_bit_width(
     bit_width: u8,
     num_chunks: usize,
 ) -> VortexResult<ArrayRef> {
+    let len = num_chunks
+        .checked_add(1)
+        .ok_or_else(|| vortex_err!("Block offsets length does not fit in usize"))?;
     let step = 128 * u64::from(bit_width);
-    vortex_ensure!(
-        num_chunks < usize::MAX,
-        "Block offsets length does not fit in usize"
-    );
-    vortex_ensure!(
-        u64::try_from(num_chunks).is_ok_and(|chunks| chunks.checked_mul(step).is_some()),
-        "Uniform block offsets do not fit in u64"
-    );
-
-    // SAFETY: The sequence has at least one entry, an integer base of zero, and a nonnegative
-    // integer step. Its final value fits u64 by the check above, so every boundary does too.
-    let offsets = unsafe {
-        Sequence::new_unchecked(
-            0u64.into(),
-            step.into(),
-            PType::U64,
-            Nullability::NonNullable,
-            num_chunks + 1,
-        )
-    };
+    let offsets = Sequence::try_new_typed(0u64, step, Nullability::NonNullable, len)?;
     Ok(offsets.into_array())
 }
 
@@ -224,7 +208,7 @@ impl BitPackedData {
     ///
     /// Returns an error if `offset` is outside the first 1024-value block. The dtype, length,
     /// validity, patches, and block boundaries are validated when the payload is assembled into
-    /// an array, for example by [`crate::BitPacked::try_new_with_block_offsets`].
+    /// an array, for example by [`crate::BitPacked::try_new`].
     pub fn try_new(
         packed: BufferHandle,
         patches: Option<Patches>,
