@@ -77,7 +77,10 @@ impl DynGroupedAggregateKernel for BoolGroupedSumV2EncodingKernel {
         let bits = elements.to_bit_buffer();
         let (valid_true, valid) = match elem_mask.bit_buffer() {
             AllOr::All => (bits, None),
-            AllOr::None => (BitBuffer::new_unset(bits.len()), Some(BitBuffer::new_unset(bits.len()))),
+            AllOr::None => (
+                BitBuffer::new_unset(bits.len()),
+                Some(BitBuffer::new_unset(bits.len())),
+            ),
             AllOr::Some(validity) => (&bits & validity, Some(validity.clone())),
         };
 

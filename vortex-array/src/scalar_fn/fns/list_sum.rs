@@ -304,7 +304,8 @@ mod tests {
         let result = list.apply(&list_sum(root()))?;
 
         let mut ctx = array_session().create_execution_ctx();
-        let expected = PrimitiveArray::from_option_iter::<u64, _>([Some(2), None, None, Some(1), None]);
+        let expected =
+            PrimitiveArray::from_option_iter::<u64, _>([Some(2), None, None, Some(1), None]);
         assert_arrays_eq!(result, expected, &mut ctx);
         Ok(())
     }
