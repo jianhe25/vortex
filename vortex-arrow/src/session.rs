@@ -244,9 +244,54 @@ pub struct ArrowSession {
     exporters: ArrowExporterRegistry,
     exporters_by_vortex: VortexExporterRegistry,
     importers: ArrowImporterRegistry,
+    export_options: ArrowExportOptions,
+}
+
+/// Options controlling how Vortex arrays are exported to Arrow.
+///
+/// Configure them on a session with
+/// `session.get_mut::<ArrowSession>().set_export_options(options)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ArrowExportOptions {
+    /// Whether to compact the data buffers of `Utf8View` / `BinaryView` arrays before export.
+    ///
+    /// Compaction drops string data no longer referenced by any view (for example after a
+    /// filter or take), which shrinks the exported arrays but costs a scan of the views and
+    /// possibly a copy of the string data. Disable it when the exported arrays are short-lived
+    /// and export throughput matters more than retained memory.
+    ///
+    /// Defaults to `true`.
+    pub compact_byte_views: bool,
+}
+
+impl Default for ArrowExportOptions {
+    fn default() -> Self {
+        Self {
+            compact_byte_views: true,
+        }
+    }
+}
+
+impl ArrowExportOptions {
+    /// Set whether `Utf8View` / `BinaryView` buffers are compacted before export.
+    pub fn with_compact_byte_views(mut self, compact_byte_views: bool) -> Self {
+        self.compact_byte_views = compact_byte_views;
+        self
+    }
 }
 
 impl ArrowSession {
+    /// The options applied when exporting Vortex arrays to Arrow.
+    pub fn export_options(&self) -> ArrowExportOptions {
+        self.export_options
+    }
+
+    /// Replace the options applied when exporting Vortex arrays to Arrow.
+    pub fn set_export_options(&mut self, options: ArrowExportOptions) {
+        self.export_options = options;
+    }
+
     /// Register an [`ArrowExportVTable`] under its target Arrow extension Id (for dispatch)
     /// and its source Vortex extension Id (for schema inference).
     pub fn register_exporter(&self, exporter: ArrowExportVTableRef) {

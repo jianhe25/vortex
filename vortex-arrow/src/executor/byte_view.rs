@@ -16,6 +16,7 @@ use vortex_error::VortexResult;
 
 use crate::dtype::from_arrow_data_type;
 use crate::null_buffer::to_null_buffer;
+use crate::session::ArrowSessionExt;
 
 /// Convert a canonical VarBinViewArray directly to Arrow.
 pub fn canonical_varbinview_to_arrow<T: ByteViewType>(
@@ -62,16 +63,28 @@ pub(super) fn to_arrow_byte_view<T: ByteViewType>(
 
     let array = array.execute::<ArrayRef>(ctx)?;
     let varbinview = array.execute::<VarBinViewArray>(ctx)?;
-    execute_varbinview_to_arrow::<T>(&varbinview, ctx)
+    if ctx.session().arrow().export_options().compact_byte_views {
+        execute_varbinview_to_arrow::<T>(&varbinview, ctx)
+    } else {
+        canonical_varbinview_to_arrow::<T>(&varbinview, ctx)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::Array;
+    use arrow_array::cast::AsArray;
     use arrow_array::types::StringViewType;
+    use arrow_schema::DataType;
+    use arrow_schema::Field;
+    use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
+    use vortex_session::SessionExt;
 
     use super::*;
+    use crate::ArrowExportOptions;
+    use crate::ArrowSession;
 
     #[test]
     fn empty_views_are_aligned() -> VortexResult<()> {
@@ -81,6 +94,39 @@ mod tests {
         let arrow = canonical_varbinview_to_arrow::<StringViewType>(&array, &mut ctx)?;
 
         assert!(arrow.is_empty());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::compact(true, 100)]
+    #[case::no_compact(false, 64 * 100)]
+    fn export_respects_compact_byte_views(
+        #[case] compact_byte_views: bool,
+        #[case] expected_buffer_bytes: usize,
+    ) -> VortexResult<()> {
+        let long = "x".repeat(100);
+        let array = VarBinViewArray::from_iter_str((0..64).map(|_| long.as_str()))
+            .into_array()
+            .slice(0..1)?;
+
+        let session = array_session();
+        session.get_mut::<ArrowSession>().set_export_options(
+            ArrowExportOptions::default().with_compact_byte_views(compact_byte_views),
+        );
+        let mut ctx = session.create_execution_ctx();
+
+        let field = Field::new("", DataType::Utf8View, false);
+        let arrow = session
+            .arrow()
+            .execute_arrow(array, Some(&field), &mut ctx)?;
+        let buffer_bytes: usize = arrow
+            .as_string_view()
+            .data_buffers()
+            .iter()
+            .map(|b| b.len())
+            .sum();
+
+        assert_eq!(buffer_bytes, expected_buffer_bytes);
         Ok(())
     }
 }
