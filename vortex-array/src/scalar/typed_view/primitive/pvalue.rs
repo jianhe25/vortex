@@ -207,6 +207,7 @@ macro_rules! as_primitive {
 
 impl PValue {
     /// The smallest value of the given primitive type.
+    #[inline]
     pub fn min_value(ptype: PType) -> Self {
         match_each_native_ptype!(ptype, |T| {
             PValue::from(<T as LowerBounded>::min_value())
@@ -214,6 +215,7 @@ impl PValue {
     }
 
     /// The largest value of the given primitive type.
+    #[inline]
     pub fn max_value(ptype: PType) -> Self {
         match_each_native_ptype!(ptype, |T| {
             PValue::from(<T as UpperBounded>::max_value())
