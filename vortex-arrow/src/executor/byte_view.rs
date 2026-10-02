@@ -16,7 +16,7 @@ use vortex_error::VortexResult;
 
 use crate::dtype::from_arrow_data_type;
 use crate::null_buffer::to_null_buffer;
-use crate::session::ArrowSessionExt;
+use crate::session::ArrowExportOptions;
 
 /// Convert a canonical VarBinViewArray directly to Arrow.
 pub fn canonical_varbinview_to_arrow<T: ByteViewType>(
@@ -53,6 +53,7 @@ pub fn execute_varbinview_to_arrow<T: ByteViewType>(
 
 pub(super) fn to_arrow_byte_view<T: ByteViewType>(
     array: ArrayRef,
+    options: &ArrowExportOptions,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
     // First we cast the array into the desired ByteView type.
@@ -63,7 +64,7 @@ pub(super) fn to_arrow_byte_view<T: ByteViewType>(
 
     let array = array.execute::<ArrayRef>(ctx)?;
     let varbinview = array.execute::<VarBinViewArray>(ctx)?;
-    if ctx.session().arrow().export_options().compact_byte_views {
+    if options.compact_byte_views {
         execute_varbinview_to_arrow::<T>(&varbinview, ctx)
     } else {
         canonical_varbinview_to_arrow::<T>(&varbinview, ctx)
@@ -80,11 +81,10 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::array_session;
-    use vortex_session::SessionExt;
 
     use super::*;
     use crate::ArrowExportOptions;
-    use crate::ArrowSession;
+    use crate::ArrowSessionExt;
 
     #[test]
     fn empty_views_are_aligned() -> VortexResult<()> {
@@ -110,15 +110,14 @@ mod tests {
             .slice(0..1)?;
 
         let session = array_session();
-        session.get_mut::<ArrowSession>().set_export_options(
-            ArrowExportOptions::default().with_compact_byte_views(compact_byte_views),
-        );
         let mut ctx = session.create_execution_ctx();
+        let options = ArrowExportOptions::default().with_compact_byte_views(compact_byte_views);
 
         let field = Field::new("", DataType::Utf8View, false);
-        let arrow = session
-            .arrow()
-            .execute_arrow(array, Some(&field), &mut ctx)?;
+        let arrow =
+            session
+                .arrow()
+                .execute_arrow_with_options(array, Some(&field), &options, &mut ctx)?;
         let buffer_bytes: usize = arrow
             .as_string_view()
             .data_buffers()

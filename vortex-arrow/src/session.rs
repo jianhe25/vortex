@@ -244,13 +244,12 @@ pub struct ArrowSession {
     exporters: ArrowExporterRegistry,
     exporters_by_vortex: VortexExporterRegistry,
     importers: ArrowImporterRegistry,
-    export_options: ArrowExportOptions,
 }
 
 /// Options controlling how Vortex arrays are exported to Arrow.
 ///
-/// Configure them on a session with
-/// `session.get_mut::<ArrowSession>().set_export_options(options)`.
+/// Pass them per call to [`ArrowSession::execute_arrow_with_options`]; they apply to the whole
+/// exported array, including nested children.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ArrowExportOptions {
@@ -282,16 +281,6 @@ impl ArrowExportOptions {
 }
 
 impl ArrowSession {
-    /// The options applied when exporting Vortex arrays to Arrow.
-    pub fn export_options(&self) -> ArrowExportOptions {
-        self.export_options
-    }
-
-    /// Replace the options applied when exporting Vortex arrays to Arrow.
-    pub fn set_export_options(&mut self, options: ArrowExportOptions) {
-        self.export_options = options;
-    }
-
     /// Register an [`ArrowExportVTable`] under its target Arrow extension Id (for dispatch)
     /// and its source Vortex extension Id (for schema inference).
     pub fn register_exporter(&self, exporter: ArrowExportVTableRef) {
@@ -579,11 +568,26 @@ impl ArrowSession {
     ///
     /// With `target = None` the fallback path picks the array's preferred Arrow physical type
     /// and executes directly into that, ignoring extension types.
-    #[expect(clippy::disallowed_methods, reason = "interning a dynamic id")]
     pub fn execute_arrow(
         &self,
         array: ArrayRef,
         target: Option<&Field>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrowArrayRef> {
+        self.execute_arrow_with_options(array, target, &ArrowExportOptions::default(), ctx)
+    }
+
+    /// Execute a Vortex array into an Arrow array, as [`execute_arrow`][Self::execute_arrow],
+    /// with the given [`ArrowExportOptions`] instead of the defaults.
+    ///
+    /// The options apply to the canonical export path, including nested children. Registered
+    /// [`ArrowExportVTable`] plugins do not receive them.
+    #[expect(clippy::disallowed_methods, reason = "interning a dynamic id")]
+    pub fn execute_arrow_with_options(
+        &self,
+        array: ArrayRef,
+        target: Option<&Field>,
+        options: &ArrowExportOptions,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrowArrayRef> {
         // NOTE(aduffy): this looks strange, but we do this to keep target_field as &Field so
@@ -631,10 +635,10 @@ impl ArrowSession {
                 "unsupported Arrow extension type encountered, falling back to naive execution"
             );
 
-            return execute_arrow_naive(current, Some(target_field.data_type()), ctx);
+            return execute_arrow_naive(current, Some(target_field.data_type()), options, ctx);
         }
 
-        execute_arrow_naive(array, target.map(|field| field.data_type()), ctx)
+        execute_arrow_naive(array, target.map(|field| field.data_type()), options, ctx)
     }
 
     /// Decode an Arrow array into a Vortex array.

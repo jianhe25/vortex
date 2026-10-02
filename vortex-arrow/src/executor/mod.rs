@@ -59,6 +59,7 @@ use crate::executor::struct_::to_arrow_struct;
 use crate::executor::temporal::to_arrow_date;
 use crate::executor::temporal::to_arrow_time;
 use crate::executor::temporal::to_arrow_timestamp;
+use crate::session::ArrowExportOptions;
 use crate::session::ArrowSessionExt;
 
 /// Trait for executing a Vortex array to produce an Arrow array.
@@ -126,6 +127,7 @@ impl ArrowArrayExecutor for ArrayRef {
 pub(crate) fn execute_arrow_naive(
     array: ArrayRef,
     data_type: Option<&DataType>,
+    options: &ArrowExportOptions,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrowArrayRef> {
     let len = array.len();
@@ -153,21 +155,25 @@ pub(crate) fn execute_arrow_naive(
         DataType::LargeBinary => to_arrow_byte_array::<LargeBinaryType>(array, ctx),
         DataType::Utf8 => to_arrow_byte_array::<Utf8Type>(array, ctx),
         DataType::LargeUtf8 => to_arrow_byte_array::<LargeUtf8Type>(array, ctx),
-        DataType::BinaryView => to_arrow_byte_view::<BinaryViewType>(array, ctx),
-        DataType::Utf8View => to_arrow_byte_view::<StringViewType>(array, ctx),
+        DataType::BinaryView => to_arrow_byte_view::<BinaryViewType>(array, options, ctx),
+        DataType::Utf8View => to_arrow_byte_view::<StringViewType>(array, options, ctx),
         // TODO(joe): pass down preferred
-        DataType::List(elements_field) => to_arrow_list::<i32>(array, elements_field, ctx),
+        DataType::List(elements_field) => to_arrow_list::<i32>(array, elements_field, options, ctx),
         // TODO(joe): pass down preferred
-        DataType::LargeList(elements_field) => to_arrow_list::<i64>(array, elements_field, ctx),
-        // TODO(joe): pass down preferred
-        DataType::FixedSizeList(elements_field, list_size) => {
-            to_arrow_fixed_list(array, *list_size, elements_field, ctx)
+        DataType::LargeList(elements_field) => {
+            to_arrow_list::<i64>(array, elements_field, options, ctx)
         }
         // TODO(joe): pass down preferred
-        DataType::ListView(elements_field) => to_arrow_list_view::<i32>(array, elements_field, ctx),
+        DataType::FixedSizeList(elements_field, list_size) => {
+            to_arrow_fixed_list(array, *list_size, elements_field, options, ctx)
+        }
+        // TODO(joe): pass down preferred
+        DataType::ListView(elements_field) => {
+            to_arrow_list_view::<i32>(array, elements_field, options, ctx)
+        }
         // TODO(joe): pass down preferred
         DataType::LargeListView(elements_field) => {
-            to_arrow_list_view::<i64>(array, elements_field, ctx)
+            to_arrow_list_view::<i64>(array, elements_field, options, ctx)
         }
         DataType::Struct(fields) => {
             let fields = if data_type.is_none() {
@@ -175,11 +181,11 @@ pub(crate) fn execute_arrow_naive(
             } else {
                 Some(fields)
             };
-            to_arrow_struct(array, fields, ctx)
+            to_arrow_struct(array, fields, options, ctx)
         }
         // TODO(joe): pass down preferred
         DataType::Dictionary(codes_type, values_type) => {
-            to_arrow_dictionary(array, codes_type, values_type, ctx)
+            to_arrow_dictionary(array, codes_type, values_type, options, ctx)
         }
         dt @ DataType::Decimal32(..) => to_arrow_decimal(array, dt, ctx),
         dt @ DataType::Decimal64(..) => to_arrow_decimal(array, dt, ctx),
@@ -187,13 +193,13 @@ pub(crate) fn execute_arrow_naive(
         dt @ DataType::Decimal256(..) => to_arrow_decimal(array, dt, ctx),
         // TODO(joe): pass down preferred
         DataType::RunEndEncoded(ends_type, values_type) => {
-            to_arrow_run_end(array, ends_type.data_type(), values_type, ctx)
+            to_arrow_run_end(array, ends_type.data_type(), values_type, options, ctx)
         }
         dt @ (DataType::Date32 | DataType::Date64) => to_arrow_date(array, dt, ctx),
         dt @ (DataType::Time32(_) | DataType::Time64(_)) => to_arrow_time(array, dt, ctx),
         dt @ DataType::Timestamp(..) => to_arrow_timestamp(array, dt, ctx),
         DataType::Map(entries_field, keys_sorted) => {
-            to_arrow_map(array, entries_field, *keys_sorted, ctx)
+            to_arrow_map(array, entries_field, *keys_sorted, options, ctx)
         }
         DataType::FixedSizeBinary(_)
         | DataType::Duration(_)
