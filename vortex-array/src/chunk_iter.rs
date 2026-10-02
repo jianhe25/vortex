@@ -37,6 +37,9 @@
 //!   fixed stack scratch chunk.
 //! - Chunks are producer-owned scratch: a sink may mutate one freely — wrappers rely on this to
 //!   transform values in place — and its contents are invalid once `accept` returns.
+//! - A sink may offer the memory it would copy a chunk into (`ChunkSink::destination`), so the
+//!   producer decodes straight into it and reports it with `accept_written`. Materializing then
+//!   costs no copy out of scratch.
 //! - Validity is *not* streamed. Positions that are logically null hold unspecified but
 //!   initialized values, matching what `execute` produces; read `array.validity()` separately.
 //! - Primitive-typed arrays only.
@@ -64,6 +67,7 @@ use std::sync::atomic::Ordering;
 
 use num_traits::AsPrimitive;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 
 use crate::AnyCanonical;
@@ -218,6 +222,26 @@ impl<'a> ChunkMut<'a> {
 pub trait ChunkSink {
     /// Accept the next chunk of decompressed values.
     fn accept(&mut self, chunk: ChunkMut<'_>, row_range: Range<usize>) -> VortexResult<()>;
+
+    /// Offer the memory the sink would copy rows `row_range` into, so the producer can decode them
+    /// there directly and spare the copy. A producer that takes it writes every value of it and
+    /// then calls [`Self::accept_written`] with the same rows instead of [`Self::accept`].
+    ///
+    /// The memory may hold uninitialized values until the producer writes them. Sinks without
+    /// such memory, e.g. ones that fold values, return `None`, the default. Requesting the same
+    /// rows again returns the same memory with what was written to it, so adapters that transform
+    /// chunks in place forward their inner sink's destination and re-request it in
+    /// [`Self::accept_written`] to transform the written values.
+    fn destination(&mut self, row_range: Range<usize>) -> Option<ChunkMut<'_>> {
+        _ = row_range;
+        None
+    }
+
+    /// Accept rows `row_range`, which the producer wrote into the memory from
+    /// [`Self::destination`].
+    fn accept_written(&mut self, row_range: Range<usize>) -> VortexResult<()> {
+        vortex_bail!("accept_written for rows {row_range:?} of a sink that offers no destination")
+    }
 }
 
 impl<F> ChunkSink for F
@@ -461,11 +485,49 @@ impl<T: NativePType> ChunkSink for BuilderSink<'_, T> {
         self.dst[row_range].write_copy_of_slice(chunk.as_slice::<T>());
         Ok(())
     }
+
+    #[inline]
+    fn destination(&mut self, row_range: Range<usize>) -> Option<ChunkMut<'_>> {
+        let dst = &mut self.dst[row_range];
+        // SAFETY: `MaybeUninit<T>` has `T`'s layout, and producers only write a destination
+        // before anything reads it, as decoding into a builder's spare capacity does elsewhere.
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<T>(), dst.len()) };
+        Some(ChunkMut::new(dst))
+    }
+
+    #[inline]
+    fn accept_written(&mut self, _row_range: Range<usize>) -> VortexResult<()> {
+        Ok(())
+    }
 }
 
-/// Stream `len` rows through `sink` from one stack scratch chunk that `fill` writes before each
-/// emission. This is the shape of every leaf producer that generates its values (constants,
-/// sequences, runs) or copies them out of a buffer.
+/// Emit rows `row_range` of a stream of `ptype` values, decoded by `decode`: straight into the
+/// sink's destination when it offers one, else into `scratch`, which must hold at least
+/// `row_range.len()` values.
+///
+/// `T` may differ from `ptype` in signedness only, so signed types decode through their unsigned
+/// counterparts.
+#[inline]
+pub fn emit_with<T: NativePType>(
+    sink: &mut dyn ChunkSink,
+    ptype: PType,
+    row_range: Range<usize>,
+    scratch: &mut [T],
+    decode: impl FnOnce(&mut [T]) -> VortexResult<()>,
+) -> VortexResult<()> {
+    if let Some(destination) = sink.destination(row_range.clone()) {
+        decode(destination.retype::<T>().as_slice_mut::<T>())?;
+        return sink.accept_written(row_range);
+    }
+    let chunk = &mut scratch[..row_range.len()];
+    decode(chunk)?;
+    sink.accept(ChunkMut::new(chunk).retype_to(ptype), row_range)
+}
+
+/// Stream `len` rows through `sink`, each chunk written by `fill` into the sink's destination
+/// when it offers one, else into one stack scratch chunk. This is the shape of every leaf producer
+/// that generates its values (constants, sequences, runs) or copies them out of a buffer.
 pub fn stream_from_fn<T: NativePType>(
     len: usize,
     sink: &mut dyn ChunkSink,
@@ -475,9 +537,9 @@ pub fn stream_from_fn<T: NativePType>(
     let mut start = 0;
     while start < len {
         let end = (start + DECOMPRESS_CHUNK_LEN).min(len);
-        let chunk = &mut scratch[..end - start];
-        fill(chunk, start..end)?;
-        sink.accept(ChunkMut::new(chunk), start..end)?;
+        emit_with(sink, T::PTYPE, start..end, &mut scratch, |chunk| {
+            fill(chunk, start..end)
+        })?;
         start = end;
     }
     Ok(())
@@ -658,12 +720,20 @@ where
     if start >= end {
         return Ok(());
     }
+    let rows = start - window.start..end - window.start;
+    // A whole block decodes straight into the sink's destination when it offers one.
+    if rows.len() == DECOMPRESS_CHUNK_LEN
+        && let Some(destination) = inner.destination(rows.clone())
+    {
+        let mut destination = destination.retype::<O>();
+        let out = <&mut [O; DECOMPRESS_CHUNK_LEN]>::try_from(destination.as_slice_mut::<O>())
+            .unwrap_or_else(|_| unreachable!("a destination holds its rows"));
+        decode(index, input, out)?;
+        return inner.accept_written(rows);
+    }
     decode(index, input, output)?;
     let chunk = ChunkMut::new(&mut output[start - block_start..end - block_start]);
-    inner.accept(
-        chunk.retype_to(output_ptype),
-        start - window.start..end - window.start,
-    )
+    inner.accept(chunk.retype_to(output_ptype), rows)
 }
 
 #[cfg(debug_assertions)]
@@ -689,6 +759,20 @@ impl ChunkSink for CoverageCheckSink<'_> {
         );
         self.next_row = row_range.end;
         self.inner.accept(chunk, row_range)
+    }
+
+    fn destination(&mut self, row_range: Range<usize>) -> Option<ChunkMut<'_>> {
+        self.inner.destination(row_range)
+    }
+
+    fn accept_written(&mut self, row_range: Range<usize>) -> VortexResult<()> {
+        debug_assert_eq!(row_range.start, self.next_row, "non-contiguous chunk");
+        debug_assert!(
+            row_range.len() <= DECOMPRESS_CHUNK_LEN,
+            "chunk exceeds the chunk length"
+        );
+        self.next_row = row_range.end;
+        self.inner.accept_written(row_range)
     }
 }
 

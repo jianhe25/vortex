@@ -4,8 +4,8 @@
 //! Streaming chunked decompression for dictionaries of primitive values.
 //!
 //! The codes stream up from their own encoding (typically bit-packed), and each chunk of codes is
-//! gathered from the dictionary into a stack scratch chunk while L1-resident, so the codes are
-//! never materialized.
+//! gathered from the dictionary while L1-resident, straight into the output when materializing,
+//! so the codes are never materialized.
 
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -23,6 +23,7 @@ use crate::arrays::dict::DictArraySlotsExt;
 use crate::chunk_iter::ChunkMut;
 use crate::chunk_iter::ChunkSink;
 use crate::chunk_iter::DECOMPRESS_CHUNK_LEN;
+use crate::chunk_iter::emit_with;
 use crate::dtype::NativePType;
 use crate::match_each_integer_ptype;
 use crate::match_each_native_ptype;
@@ -55,7 +56,8 @@ pub(super) fn decompress_chunks(
     })
 }
 
-/// Gathers each chunk of codes from the dictionary into a scratch chunk and forwards it.
+/// Gathers each chunk of codes from the dictionary into the inner sink's destination, or a scratch
+/// chunk when it offers none, and forwards it.
 struct GatherSink<'a, C, V> {
     values: &'a [V],
     codes_validity: &'a Mask,
@@ -72,32 +74,53 @@ where
     #[inline]
     fn accept(&mut self, chunk: ChunkMut<'_>, rows: Range<usize>) -> VortexResult<()> {
         let codes = chunk.as_slice::<C>();
-        let out = &mut self.scratch[..codes.len()];
-        let values = self.values;
-        let max_code = codes.iter().copied().max().map_or(0, |code| code.as_());
-        if max_code < values.len() {
-            for (out, code) in out.iter_mut().zip(codes) {
-                // SAFETY: every code in the chunk is at most `max_code`, which is in bounds.
-                *out = unsafe { *values.get_unchecked(code.as_()) };
-            }
-        } else {
-            for (row, (out, code)) in rows.clone().zip(out.iter_mut().zip(codes)) {
-                let code: usize = code.as_();
-                *out = match values.get(code) {
-                    Some(&value) => value,
-                    None => {
-                        vortex_ensure!(
-                            !self.codes_validity.value(row),
-                            "Dict code {code} is out of bounds for {} values",
-                            values.len()
-                        );
-                        V::default()
-                    }
-                };
-            }
-        }
-        self.inner.accept(ChunkMut::new(out), rows)
+        let (values, codes_validity) = (self.values, self.codes_validity);
+        emit_with(
+            &mut *self.inner,
+            V::PTYPE,
+            rows.clone(),
+            &mut self.scratch,
+            |out| gather(codes, values, codes_validity, rows, out),
+        )
     }
+}
+
+/// Gather `values[codes]` into `out`, rejecting an out-of-bounds code only where it is valid.
+#[inline]
+fn gather<C, V>(
+    codes: &[C],
+    values: &[V],
+    codes_validity: &Mask,
+    rows: Range<usize>,
+    out: &mut [V],
+) -> VortexResult<()>
+where
+    C: NativePType + Ord + AsPrimitive<usize>,
+    V: NativePType,
+{
+    let max_code = codes.iter().copied().max().map_or(0, |code| code.as_());
+    if max_code < values.len() {
+        for (out, code) in out.iter_mut().zip(codes) {
+            // SAFETY: every code in the chunk is at most `max_code`, which is in bounds.
+            *out = unsafe { *values.get_unchecked(code.as_()) };
+        }
+        return Ok(());
+    }
+    for (row, (out, code)) in rows.zip(out.iter_mut().zip(codes)) {
+        let code: usize = code.as_();
+        *out = match values.get(code) {
+            Some(&value) => value,
+            None => {
+                vortex_ensure!(
+                    !codes_validity.value(row),
+                    "Dict code {code} is out of bounds for {} values",
+                    values.len()
+                );
+                V::default()
+            }
+        };
+    }
+    Ok(())
 }
 
 #[cfg(test)]

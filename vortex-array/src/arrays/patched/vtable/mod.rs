@@ -16,6 +16,7 @@ use std::ops::Range;
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
@@ -405,6 +406,19 @@ impl<V: NativePType> ChunkSink for PatchChunkSink<'_, V> {
     fn accept(&mut self, mut chunk: ChunkMut<'_>, rows: Range<usize>) -> VortexResult<()> {
         self.patches.apply(chunk.as_slice_mut::<V>(), rows.start);
         self.inner.accept(chunk, rows)
+    }
+
+    fn destination(&mut self, rows: Range<usize>) -> Option<ChunkMut<'_>> {
+        self.inner.destination(rows)
+    }
+
+    fn accept_written(&mut self, rows: Range<usize>) -> VortexResult<()> {
+        let mut chunk = self
+            .inner
+            .destination(rows.clone())
+            .ok_or_else(|| vortex_err!("Patched's destination for rows {rows:?} is gone"))?;
+        self.patches.apply(chunk.as_slice_mut::<V>(), rows.start);
+        self.inner.accept_written(rows)
     }
 }
 

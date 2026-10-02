@@ -13,6 +13,7 @@ use vortex_array::chunk_iter::ChunkPatches;
 use vortex_array::chunk_iter::ChunkSink;
 use vortex_array::dtype::NativePType;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 
 use crate::ALP;
 use crate::ALPArrayExt;
@@ -64,6 +65,25 @@ where
         let mut chunk = chunk.retype::<F>();
         self.patches.apply(chunk.as_slice_mut::<F>(), rows.start);
         self.inner.accept(chunk, rows)
+    }
+
+    /// The child writes encoded integers into the floats' destination, decoded in place after.
+    fn destination(&mut self, rows: Range<usize>) -> Option<ChunkMut<'_>> {
+        self.inner
+            .destination(rows)
+            .map(|chunk| chunk.retype::<F::ALPInt>())
+    }
+
+    fn accept_written(&mut self, rows: Range<usize>) -> VortexResult<()> {
+        let mut chunk = self
+            .inner
+            .destination(rows.clone())
+            .ok_or_else(|| vortex_err!("ALP's destination for rows {rows:?} is gone"))?
+            .retype::<F::ALPInt>();
+        F::decode_slice_inplace(chunk.as_slice_mut::<F::ALPInt>(), self.exponents);
+        let mut chunk = chunk.retype::<F>();
+        self.patches.apply(chunk.as_slice_mut::<F>(), rows.start);
+        self.inner.accept_written(rows)
     }
 }
 

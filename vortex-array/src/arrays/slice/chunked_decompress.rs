@@ -59,6 +59,18 @@ impl ChunkSink for TrimSink<'_> {
             start - self.range.start..end - self.range.start,
         )
     }
+
+    /// Only chunks wholly inside the slice can be written in place.
+    fn destination(&mut self, rows: Range<usize>) -> Option<ChunkMut<'_>> {
+        (self.range.start <= rows.start && rows.end <= self.range.end).then_some(())?;
+        self.inner
+            .destination(rows.start - self.range.start..rows.end - self.range.start)
+    }
+
+    fn accept_written(&mut self, rows: Range<usize>) -> VortexResult<()> {
+        self.inner
+            .accept_written(rows.start - self.range.start..rows.end - self.range.start)
+    }
 }
 
 #[cfg(test)]

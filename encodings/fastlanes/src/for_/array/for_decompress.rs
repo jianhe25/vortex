@@ -39,6 +39,7 @@ use crate::BitPacked;
 use crate::BitPackedArrayExt;
 use crate::FL_CHUNK_SIZE;
 use crate::FoRArray;
+use crate::bitpacking::chunked_decompress::stream_packed_chunks;
 use crate::for_::array::FoRArrayExt;
 use crate::for_::array::FoRArraySlotsExt;
 use crate::unpack_iter::for_each_packed_chunk;
@@ -438,8 +439,8 @@ fn decompress_chunks_typed<
     encoded.decompress_chunks(ctx, &mut adapter)
 }
 
-/// Unpack each chunk of `bp` into an L1-resident scratch chunk with its reference added by the
-/// fused kernel, patch it in place, and hand it to `sink`.
+/// Unpack each chunk of `bp` with its reference added by the fused kernel, straight into the
+/// sink's destination when it offers one, patch it in place, and hand it to `sink`.
 ///
 /// `chunk_reference` maps the index of a chunk, counted from the first chunk of `bp`, to its
 /// reference.
@@ -451,50 +452,19 @@ fn fused_decompress_chunks<
     ctx: &mut ExecutionCtx,
     sink: &mut dyn ChunkSink,
 ) -> VortexResult<()> {
-    let len = bp.len();
-    if len == 0 {
-        return Ok(());
-    }
     let offset = usize::from(bp.offset());
     let bit_width = bp.bit_width() as usize;
-
-    let mut patches = match bp.patches() {
+    let patches = match bp.patches() {
         None => ChunkPatches::new(Vec::new()),
         Some(patches) => ChunkPatches::try_from_patches(&patches, ctx, |row, value: T| {
             value.wrapping_add(&chunk_reference((offset + row) / FL_CHUNK_SIZE))
         })?,
     };
-
-    let mut scratch = [const { MaybeUninit::<T::Physical>::uninit() }; FL_CHUNK_SIZE];
-    let mut result = Ok(());
-    for_each_packed_chunk::<T, _>(
-        bp.packed_slice::<T::Physical>(),
-        bit_width,
-        offset,
-        len,
-        |packed, range| {
-            if result.is_err() {
-                return;
-            }
-            let reference = chunk_reference(range.start / FL_CHUNK_SIZE).as_();
-            // SAFETY: `packed` holds one chunk at `bit_width` and `scratch` has room for a chunk.
-            unsafe { unfor_pack_into(bit_width, packed, reference, &mut scratch) };
-            // `range` counts from the start of the first chunk, and the rows start at `offset`.
-            let skip = offset.saturating_sub(range.start);
-            let rows = range.start + skip - offset..range.end - offset;
-            // SAFETY: the unpack initialized the whole scratch chunk, `skip + rows.len()` is at
-            // most a chunk, and `T::Physical` is `T` with the same size and alignment.
-            let values = unsafe {
-                std::slice::from_raw_parts_mut(
-                    scratch.as_mut_ptr().add(skip).cast::<T>(),
-                    rows.len(),
-                )
-            };
-            patches.apply(values, rows.start);
-            result = sink.accept(ChunkMut::new(values), rows);
-        },
-    )?;
-    result
+    stream_packed_chunks::<T>(bp, patches, sink, |chunk, packed, out| {
+        let reference = chunk_reference(chunk).as_();
+        // SAFETY: `packed` holds one chunk at `bit_width`, and `out` holds a full chunk.
+        unsafe { T::Physical::unchecked_unfor_pack(bit_width, packed, reference, out) }
+    })
 }
 
 /// Adds the FoR references to each chunk a child streams up, in place, before forwarding it.
@@ -513,20 +483,53 @@ where
 {
     #[inline]
     fn accept(&mut self, mut chunk: ChunkMut<'_>, rows: Range<usize>) -> VortexResult<()> {
-        let values = chunk.as_slice_mut::<T>();
-        // The child's chunks need not line up with the FoR chunks, so one may span two of them.
-        let mut start = 0;
-        while start < values.len() {
-            let for_chunk = (self.offset + rows.start + start) / FL_CHUNK_SIZE;
-            let end =
-                ((for_chunk + 1) * FL_CHUNK_SIZE - self.offset - rows.start).min(values.len());
-            let reference = (self.chunk_reference)(for_chunk);
-            for value in &mut values[start..end] {
-                *value = value.wrapping_add(&reference);
-            }
-            start = end;
-        }
+        add_chunk_references(
+            &self.chunk_reference,
+            self.offset,
+            chunk.as_slice_mut::<T>(),
+            rows.start,
+        );
         self.inner.accept(chunk, rows)
+    }
+
+    fn destination(&mut self, rows: Range<usize>) -> Option<ChunkMut<'_>> {
+        self.inner.destination(rows)
+    }
+
+    fn accept_written(&mut self, rows: Range<usize>) -> VortexResult<()> {
+        let mut chunk = self
+            .inner
+            .destination(rows.clone())
+            .ok_or_else(|| vortex_err!("FoR's destination for rows {rows:?} is gone"))?;
+        add_chunk_references(
+            &self.chunk_reference,
+            self.offset,
+            chunk.as_slice_mut::<T>(),
+            rows.start,
+        );
+        self.inner.accept_written(rows)
+    }
+}
+
+/// Add the FoR references to `values`, which start at row `start`.
+///
+/// The values need not line up with the FoR chunks, so they may span two of them.
+#[inline]
+fn add_chunk_references<T: NativePType + WrappingAdd>(
+    chunk_reference: &impl Fn(usize) -> T,
+    offset: usize,
+    values: &mut [T],
+    start: usize,
+) {
+    let mut done = 0;
+    while done < values.len() {
+        let for_chunk = (offset + start + done) / FL_CHUNK_SIZE;
+        let end = ((for_chunk + 1) * FL_CHUNK_SIZE - offset - start).min(values.len());
+        let reference = chunk_reference(for_chunk);
+        for value in &mut values[done..end] {
+            *value = value.wrapping_add(&reference);
+        }
+        done = end;
     }
 }
 

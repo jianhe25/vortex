@@ -4,24 +4,26 @@
 //! Streaming chunked decompression for bit-packed arrays.
 //!
 //! This backs [`VTable::decompress_chunks`](vortex_array::vtable::VTable::decompress_chunks) for
-//! [`BitPacked`]: each FastLanes block is unpacked into a cache-resident scratch buffer, patches
-//! falling in that block are applied in place, and the block is handed to the sink, so the array
-//! is never materialized in full.
+//! [`BitPacked`]: each FastLanes block is unpacked straight into the sink's destination when it
+//! offers one, else into a cache-resident scratch buffer, patches falling in that block are
+//! applied in place, and the block is handed to the sink, so the array is never materialized in
+//! full.
 
-use std::mem::MaybeUninit;
-
+use fastlanes::BitPacking;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::chunk_iter::ChunkMut;
 use vortex_array::chunk_iter::ChunkPatches;
 use vortex_array::chunk_iter::ChunkSink;
+use vortex_array::chunk_iter::emit_with;
+use vortex_array::dtype::PhysicalPType;
 use vortex_array::match_each_integer_ptype;
 use vortex_error::VortexResult;
 
 use crate::BitPacked;
 use crate::BitPackedArrayExt;
 use crate::FL_CHUNK_SIZE;
-use crate::unpack_iter::BitPacked as BitPackedUnpack;
+use crate::unpack_iter::for_each_packed_chunk;
 
 pub(crate) fn decompress_chunks(
     array: ArrayView<'_, BitPacked>,
@@ -29,35 +31,75 @@ pub(crate) fn decompress_chunks(
     sink: &mut dyn ChunkSink,
 ) -> VortexResult<()> {
     match_each_integer_ptype!(array.dtype().as_ptype(), |T| {
-        decompress_chunks_typed::<T>(array, ctx, sink)
+        let patches = match array.patches() {
+            None => ChunkPatches::new(Vec::new()),
+            Some(patches) => ChunkPatches::try_from_patches(&patches, ctx, |_, value: T| value)?,
+        };
+        let bit_width = array.bit_width() as usize;
+        stream_packed_chunks::<T>(array, patches, sink, |_, packed, out| {
+            // SAFETY: `packed` holds one chunk at `bit_width`, and `out` holds a full chunk.
+            unsafe { BitPacking::unchecked_unpack(bit_width, packed, out) }
+        })
     })
 }
 
-fn decompress_chunks_typed<T: BitPackedUnpack>(
-    array: ArrayView<'_, BitPacked>,
-    ctx: &mut ExecutionCtx,
+/// Stream every chunk of `bp`, unpacked by `unpack(chunk, packed, out)` and then patched.
+///
+/// `chunk` counts from the first chunk of `bp`, and `out` holds a whole chunk. Whole chunks unpack
+/// straight into the sink's destination when it offers one; a partial first or last chunk unpacks
+/// into scratch and only its rows are forwarded.
+pub(crate) fn stream_packed_chunks<T>(
+    bp: ArrayView<'_, BitPacked>,
+    mut patches: ChunkPatches<T>,
     sink: &mut dyn ChunkSink,
-) -> VortexResult<()> {
-    if array.is_empty() {
+    unpack: impl Fn(usize, &[T::Physical], &mut [T::Physical]),
+) -> VortexResult<()>
+where
+    T: PhysicalPType<Physical: BitPacking>,
+{
+    let len = bp.len();
+    if len == 0 {
         return Ok(());
     }
-
-    let mut patches = match array.patches() {
-        None => ChunkPatches::new(Vec::new()),
-        Some(patches) => ChunkPatches::try_from_patches(&patches, ctx, |_, value: T| value)?,
-    };
-
-    let mut scratch = [const { MaybeUninit::<T>::uninit() }; FL_CHUNK_SIZE];
-    let mut chunks = array.unpacked_chunks::<T>(&mut scratch)?;
+    let offset = usize::from(bp.offset());
+    let mut scratch = [T::default(); FL_CHUNK_SIZE];
     let mut result = Ok(());
-    chunks.for_each_unpacked_chunk(|chunk, rows| {
-        if result.is_err() {
-            return;
-        }
-        patches.apply(chunk, rows.start);
-        result = sink.accept(ChunkMut::new(chunk), rows);
-    });
+    for_each_packed_chunk::<T, _>(
+        bp.packed_slice::<T::Physical>(),
+        bp.bit_width() as usize,
+        offset,
+        len,
+        |packed, range| {
+            if result.is_err() {
+                return;
+            }
+            let chunk = range.start / FL_CHUNK_SIZE;
+            // `range` counts from the start of the first chunk, and the rows start at `offset`.
+            let skip = offset.saturating_sub(range.start);
+            let rows = range.start + skip - offset..range.end - offset;
+            let start = rows.start;
+            result = if rows.len() == FL_CHUNK_SIZE {
+                emit_with(sink, T::PTYPE, rows, &mut scratch, |out| {
+                    unpack(chunk, packed, physical_mut(out));
+                    patches.apply(out, start);
+                    Ok(())
+                })
+            } else {
+                unpack(chunk, packed, physical_mut(&mut scratch));
+                let values = &mut scratch[skip..skip + rows.len()];
+                patches.apply(values, start);
+                sink.accept(ChunkMut::new(values), rows)
+            };
+        },
+    )?;
     result
+}
+
+/// View values as their physical type, which the FastLanes kernels write.
+fn physical_mut<T: PhysicalPType>(values: &mut [T]) -> &mut [T::Physical] {
+    // SAFETY: `T::Physical` is `T` with the same size and alignment, and every bit pattern is
+    // valid for both.
+    unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast(), values.len()) }
 }
 
 #[cfg(test)]

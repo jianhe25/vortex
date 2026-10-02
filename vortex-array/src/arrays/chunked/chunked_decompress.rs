@@ -49,6 +49,16 @@ impl ChunkSink for OffsetSink<'_> {
         self.inner
             .accept(chunk, self.start + rows.start..self.start + rows.end)
     }
+
+    fn destination(&mut self, rows: Range<usize>) -> Option<ChunkMut<'_>> {
+        self.inner
+            .destination(self.start + rows.start..self.start + rows.end)
+    }
+
+    fn accept_written(&mut self, rows: Range<usize>) -> VortexResult<()> {
+        self.inner
+            .accept_written(self.start + rows.start..self.start + rows.end)
+    }
 }
 
 #[cfg(test)]

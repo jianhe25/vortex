@@ -15,6 +15,7 @@ use vortex_array::dtype::NativePType;
 use vortex_array::dtype::PType;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_err;
 use zigzag::ZigZag as ExternalZigZag;
 
 use crate::ZigZag;
@@ -72,6 +73,25 @@ where
             *value = (self.decode)(*value);
         }
         self.inner.accept(chunk, rows)
+    }
+
+    /// The child writes unsigned encodings into the signed destination, decoded in place after.
+    fn destination(&mut self, rows: Range<usize>) -> Option<ChunkMut<'_>> {
+        self.inner
+            .destination(rows)
+            .map(|chunk| chunk.retype_to(T::PTYPE.to_unsigned()))
+    }
+
+    fn accept_written(&mut self, rows: Range<usize>) -> VortexResult<()> {
+        let mut chunk = self
+            .inner
+            .destination(rows.clone())
+            .ok_or_else(|| vortex_err!("ZigZag's destination for rows {rows:?} is gone"))?
+            .retype::<T>();
+        for value in chunk.as_slice_mut::<T>() {
+            *value = (self.decode)(*value);
+        }
+        self.inner.accept_written(rows)
     }
 }
 
