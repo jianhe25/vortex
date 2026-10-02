@@ -162,10 +162,12 @@ impl Scheme for DeltaScheme {
                 let full_width = primitive.ptype().bit_width() as f64;
                 let len = primitive.len();
 
-                // Delta's best case is residuals collapsing to a single bit. If even that, after
-                // the penalty, can't beat the incumbent, skip before doing the encode work.
+                // Delta's best case is residuals that compress away entirely, leaving roughly one
+                // bit per value of bases. If even that, after the penalty, can't beat the
+                // incumbent, skip before doing the encode work. Residuals routinely compress below
+                // one bit each, so the bound must not assume a bit per residual.
                 let threshold = best_so_far.and_then(EstimateScore::finite_ratio);
-                if threshold.is_some_and(|t| penalized_ratio(len, full_width, 1.0) <= t) {
+                if threshold.is_some_and(|t| penalized_ratio(len, full_width, 0.0) <= t) {
                     return Ok(EstimateVerdict::Skip);
                 }
 
