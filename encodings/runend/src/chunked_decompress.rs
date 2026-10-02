@@ -82,6 +82,7 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::SliceArray;
     use vortex_array::test_harness::assert_streams_like_execute;
     use vortex_error::VortexResult;
     use vortex_session::VortexSession;
@@ -106,5 +107,21 @@ mod tests {
         assert_streams_like_execute(&array, &mut ctx)?;
         // Slicing leaves an offset into the first run.
         assert_streams_like_execute(&array.slice(517..4013)?, &mut ctx)
+    }
+
+    /// The executor never streams past a node it is executing toward: exporters execute until a
+    /// run-end array to hand it over as is, even behind lazy slices.
+    #[test]
+    fn executor_stops_at_run_end_behind_slices() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = PrimitiveArray::from_iter([7i64, 7, 8, 8]).into_array();
+        let runend = RunEnd::encode(values, &mut ctx)?.into_array();
+        let wrapped =
+            SliceArray::new(SliceArray::new(runend, 0..4).into_array(), 0..4).into_array();
+        // Executing to canonical streams this chain of three.
+        assert!(wrapped.should_execute_via_chunks());
+
+        assert!(wrapped.execute_until::<RunEnd>(&mut ctx)?.is::<RunEnd>());
+        Ok(())
     }
 }

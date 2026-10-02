@@ -66,14 +66,17 @@ use num_traits::AsPrimitive;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
+use crate::AnyCanonical;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::arrays::PrimitiveArray;
 use crate::builders::PrimitiveBuilder;
 use crate::dtype::NativePType;
 use crate::dtype::PType;
+use crate::executor::DonePredicate;
 use crate::match_each_native_ptype;
 use crate::match_each_unsigned_integer_ptype;
+use crate::matcher::Matcher;
 use crate::patches::Patches;
 
 /// The target number of elements per streamed chunk.
@@ -234,11 +237,12 @@ impl ArrayRef {
         self.dtype().is_primitive() && self.dyn_array().supports_decompress_chunks(self)
     }
 
-    /// Returns whether the executor will canonicalize this array by streaming chunks (see
-    /// [`should_execute_via_chunks`]). Exposed for diagnostics and tests.
+    /// Returns whether the executor will canonicalize this array by streaming chunks when
+    /// executing it to canonical (see [`should_execute_via_chunks`]). Exposed for diagnostics and
+    /// tests.
     #[doc(hidden)]
     pub fn should_execute_via_chunks(&self) -> bool {
-        should_execute_via_chunks(self)
+        should_execute_via_chunks(self, AnyCanonical::matches)
     }
 
     /// Stream the array's decompressed values through `sink` in cache-resident chunks.
@@ -362,16 +366,25 @@ const MIN_STREAMING_CHAIN: usize = 3;
 /// the child straight into the output buffer and compact in place, so streaming would only add a
 /// copy. Streaming them is still available to consumers that never materialize, via
 /// [`ArrayRef::decompress_chunks`].
-fn streaming_chain_len(array: &ArrayRef) -> usize {
+///
+/// Returns `None` when a node the chain would decode through satisfies `is_done`: the executor
+/// is executing toward that node, e.g. to export a run-end array as is, and streaming to
+/// canonical would skip past it.
+fn streaming_chain_len(array: &ArrayRef, is_done: DonePredicate) -> Option<usize> {
     if !array.supports_decompress_chunks() {
-        return 0;
+        return Some(0);
     }
-    1 + array
-        .children_iter()
-        .filter(|child| !child.is_canonical() && child.len() == array.len())
-        .map(streaming_chain_len)
-        .max()
-        .unwrap_or(0)
+    let mut longest = 0;
+    for child in array.children_iter() {
+        if child.len() != array.len() || child.is_canonical() {
+            continue;
+        }
+        if is_done(child) {
+            return None;
+        }
+        longest = longest.max(streaming_chain_len(child, is_done)?);
+    }
+    Some(1 + longest)
 }
 
 /// Whether the chain of same-length, non-canonical children below `array` reaches `depth`
@@ -392,13 +405,13 @@ fn spine_reaches(array: &ArrayRef, depth: usize) -> bool {
 ///
 /// True when streaming is enabled and the tree's streaming chain reaches
 /// [`MIN_STREAMING_CHAIN`] nodes — the depth at which streaming is measured to win.
-pub(crate) fn should_execute_via_chunks(array: &ArrayRef) -> bool {
+pub(crate) fn should_execute_via_chunks(array: &ArrayRef, is_done: DonePredicate) -> bool {
     CHUNKED_EXECUTE_ENABLED.load(Ordering::Relaxed)
         && !CHUNKED_EXECUTE_SUPPRESSED.get()
         // Only primitive arrays stream, and the dtype is the cheapest thing to check.
         && array.dtype().is_primitive()
         && spine_reaches(array, MIN_STREAMING_CHAIN)
-        && streaming_chain_len(array) >= MIN_STREAMING_CHAIN
+        && streaming_chain_len(array, is_done).is_some_and(|len| len >= MIN_STREAMING_CHAIN)
 }
 
 /// Execute a streaming-capable primitive array tree to a canonical [`PrimitiveArray`] by

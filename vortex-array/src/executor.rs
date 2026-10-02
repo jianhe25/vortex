@@ -272,7 +272,7 @@ impl ArrayRef {
             // enough to pay off, decompress blocks straight into the canonical builder while each
             // block is L1-resident, instead of materializing a full intermediate per level.
             if current_builder.is_none()
-                && crate::chunk_iter::should_execute_via_chunks(&current_array)
+                && crate::chunk_iter::should_execute_via_chunks(&current_array, is_done)
             {
                 let stats = current_array.statistics().to_array_stats();
                 let result = crate::chunk_iter::execute_via_chunks(&current_array, ctx)?;
