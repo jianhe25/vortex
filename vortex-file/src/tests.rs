@@ -2170,6 +2170,44 @@ async fn file_sum_preserves_overflow_across_chunks(
     Ok(())
 }
 
+#[rstest]
+#[case::arithmetic_nan_then_finite(vec![1.0], 1.0)]
+#[case::all_nan_finals(vec![f64::INFINITY, f64::NEG_INFINITY], 0.0)]
+#[tokio::test]
+async fn file_sum_skips_nan_chunk_finals(
+    #[case] second: Vec<f64>,
+    #[case] expected: f64,
+) -> VortexResult<()> {
+    let dtype = DType::Struct(
+        StructFields::from_iter([("numbers", DType::from(PType::F64))]),
+        Nullability::NonNullable,
+    );
+    let mut buf = ByteBufferMut::empty();
+    let mut writer = SESSION
+        .write_options()
+        .with_file_statistics(vec![Stat::Sum])
+        .writer(&mut buf, dtype);
+    for values in [vec![f64::INFINITY, f64::NEG_INFINITY], second] {
+        let array = StructArray::from_fields(&[(
+            "numbers",
+            PrimitiveArray::from_iter(values).into_array(),
+        )])?
+        .into_array();
+        writer.push(array).await?;
+    }
+    let summary = writer.finish().await?;
+    assert_eq!(
+        summary.footer().statistics().unwrap().stats_sets()[0].get(Stat::Sum),
+        Precision::exact(expected)
+    );
+    let file = SESSION.open_options().open_buffer(ByteBuffer::from(buf))?;
+    assert_eq!(
+        file.file_stats().unwrap().stats_sets()[0].get(Stat::Sum),
+        Precision::exact(expected)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_file_metadata_roundtrip() -> VortexResult<()> {
     let array =
