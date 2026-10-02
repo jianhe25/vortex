@@ -10,8 +10,8 @@
 //!
 //! The mask's run-slice representation is computed once up front and walked with a cursor, so no
 //! per-chunk mask slicing or allocation happens on the hot path. This mirrors the kernel used by
-//! the non-streaming path ([`filter_slice_mut_by_slices`](super::execute::slice)), but avoids
-//! materializing the child's full decompressed buffer first.
+//! the non-streaming path (`filter_slice_mut_by_slices`), but avoids materializing the child's
+//! full decompressed buffer first.
 
 use std::ops::Range;
 

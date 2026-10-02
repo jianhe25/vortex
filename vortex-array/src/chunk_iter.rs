@@ -52,9 +52,10 @@
 //! over an L1-resident block, at the cost of a final scratch-to-output copy when the consumer
 //! wants a buffer. So it wins outright for consumers that never materialize (folding values
 //! directly), and for materialization it wins once a tree is deep enough that the eliminated
-//! intermediates outweigh that copy — see [`MIN_STREAMING_CHAIN`] for the measured threshold the
-//! executor uses.
+//! intermediates outweigh that copy. The executor streams trees whose streaming chain reaches
+//! three nodes, the measured break-even (`MIN_STREAMING_CHAIN`).
 
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::Range;
@@ -310,29 +311,46 @@ impl ArrayRef {
 /// Global kill switch for the executor's stream-to-canonical shortcut (see
 /// [`execute_via_chunks`]). Enabled by default, subject to the depth rule in
 /// [`should_execute_via_chunks`]; set `VORTEX_CHUNKED_EXECUTE=0` to disable it entirely, or use
-/// [`set_chunked_execute_enabled`] at runtime (benchmarks and tests use this to compare both
-/// executor paths in one process).
+/// [`set_chunked_execute_enabled`] at runtime (benchmarks use this to compare both executor paths
+/// in one process).
 static CHUNKED_EXECUTE_ENABLED: std::sync::LazyLock<AtomicBool> = std::sync::LazyLock::new(|| {
     AtomicBool::new(!std::env::var("VORTEX_CHUNKED_EXECUTE").is_ok_and(|v| v == "0"))
 });
+
+thread_local! {
+    /// Set while [`without_chunked_execute`] runs, so only this thread executes level-wise.
+    static CHUNKED_EXECUTE_SUPPRESSED: Cell<bool> = const { Cell::new(false) };
+}
 
 #[doc(hidden)]
 pub fn set_chunked_execute_enabled(enabled: bool) {
     CHUNKED_EXECUTE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Run `f` with the executor's streaming shortcut disabled on this thread only, e.g. to compute a
+/// level-wise reference in a test without affecting tests running on other threads.
+#[doc(hidden)]
+pub fn without_chunked_execute<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHUNKED_EXECUTE_SUPPRESSED.set(self.0);
+        }
+    }
+    let _restore = Restore(CHUNKED_EXECUTE_SUPPRESSED.replace(true));
+    f()
+}
+
 /// Minimum streaming chain length for the executor to canonicalize via chunk streaming.
 ///
 /// Streaming trades one full-length intermediate buffer per encoding level for one pass over an
-/// L1-resident block, but pays a scratch-to-output copy at the end. That trade only pays off once
-/// a tree is deep enough. Measured on 4Mi-row `FoR`-over-`BitPacked` stacks (three rounds,
-/// medians): the marginal cost of an added level is ~0.83ms level-wise versus ~0.53ms streaming,
-/// so chains of 5 and 9 nodes run 1.24x and 1.46x faster streaming, while chains of 2-3 are
-/// within noise or slightly slower (their level-wise paths decode straight into the destination
-/// via `decode_into`, leaving no intermediate to eliminate). Streaming also has far tighter tail
-/// latency: p100/median ~1.2x versus 2.5-5x for level-wise, which repeatedly allocates
-/// full-length intermediates.
-const MIN_STREAMING_CHAIN: usize = 4;
+/// L1-resident block, but pays a scratch-to-output copy at the end, so it pays off once a tree has
+/// an intermediate to eliminate. On nested `FoR` over `BitPacked` (medians of three runs, with
+/// mimalloc), streaming runs 0.89x, 1.07x, 1.10x and 1.13x as fast as level-wise execution at
+/// chains of 2, 3, 4 and 9 nodes for 64Ki rows, and 1.07x, 1.64x, 1.95x and 2.64x for 4Mi rows,
+/// whose intermediates no longer fit in cache. A chain of 2, one encoding over its leaf, usually
+/// decodes straight into the destination level-wise, leaving nothing to eliminate.
+const MIN_STREAMING_CHAIN: usize = 3;
 
 /// Length of the streaming chain rooted at `array`: the number of consecutive
 /// streaming-capable nodes from the root down to and including the deepest leaf producer.
@@ -360,11 +378,12 @@ fn streaming_chain_len(array: &ArrayRef) -> usize {
 /// nodes, counting `array` itself.
 ///
 /// This walk makes no encoding calls, so the executor turns away the common shallow trees before
-/// asking any encoding whether it streams.
+/// asking any encoding whether it streams. A canonical child ends the chain, but checking that
+/// costs more than the rest of the walk, so it is checked only for children deep enough to count.
 fn spine_reaches(array: &ArrayRef, depth: usize) -> bool {
     depth <= 1
         || array.children_iter().any(|child| {
-            child.len() == array.len() && !child.is_canonical() && spine_reaches(child, depth - 1)
+            child.len() == array.len() && spine_reaches(child, depth - 1) && !child.is_canonical()
         })
 }
 
@@ -375,6 +394,9 @@ fn spine_reaches(array: &ArrayRef, depth: usize) -> bool {
 /// [`MIN_STREAMING_CHAIN`] nodes — the depth at which streaming is measured to win.
 pub(crate) fn should_execute_via_chunks(array: &ArrayRef) -> bool {
     CHUNKED_EXECUTE_ENABLED.load(Ordering::Relaxed)
+        && !CHUNKED_EXECUTE_SUPPRESSED.get()
+        // Only primitive arrays stream, and the dtype is the cheapest thing to check.
+        && array.dtype().is_primitive()
         && spine_reaches(array, MIN_STREAMING_CHAIN)
         && streaming_chain_len(array) >= MIN_STREAMING_CHAIN
 }

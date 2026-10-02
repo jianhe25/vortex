@@ -13,6 +13,7 @@ use vortex_array::dtype::NativePType;
 use vortex_array::match_each_native_ptype;
 use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_error::VortexResult;
+use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 
 use crate::RunEnd;
@@ -32,39 +33,43 @@ pub(crate) fn decompress_chunks(
     let ends = array.ends().clone().execute::<PrimitiveArray>(ctx)?;
     let values = array.values().clone().execute::<PrimitiveArray>(ctx)?;
     let (offset, len) = (array.offset(), array.len());
+    // Resolving the ends once keeps the per-run loop to a load and a fill.
+    let ends: Vec<usize> = match_each_unsigned_integer_ptype!(ends.ptype(), |E| {
+        trimmed_ends_iter(ends.as_slice::<E>(), offset, len).collect()
+    });
+    vortex_ensure!(
+        ends.len() == values.len(),
+        "RunEnd has {} ends but {} values",
+        ends.len(),
+        values.len()
+    );
     match_each_native_ptype!(values.ptype(), |T| {
-        match_each_unsigned_integer_ptype!(ends.ptype(), |E| {
-            stream_runs(
-                trimmed_ends_iter(ends.as_slice::<E>(), offset, len),
-                values.as_slice::<T>(),
-                len,
-                sink,
-            )
-        })
+        stream_runs(&ends, values.as_slice::<T>(), len, sink)
     })
 }
 
 /// Expand the runs ending at `ends` (relative to the array) with `values` into `len` rows.
 fn stream_runs<T: NativePType>(
-    ends: impl Iterator<Item = usize>,
+    ends: &[usize],
     values: &[T],
     len: usize,
     sink: &mut dyn ChunkSink,
 ) -> VortexResult<()> {
-    let mut runs = ends.zip(values.iter().copied());
-    let mut run = runs.next();
+    let mut run = 0;
     stream_from_fn(len, sink, |chunk: &mut [T], rows| {
         let mut row = rows.start;
         while row < rows.end {
-            let (end, value) =
-                run.ok_or_else(|| vortex_err!("RunEnd runs end before row {row}"))?;
-            if end <= row {
-                run = runs.next();
-                continue;
-            }
+            let end = *ends
+                .get(run)
+                .ok_or_else(|| vortex_err!("RunEnd runs end before row {row}"))?;
             let fill_end = end.min(rows.end);
-            chunk[row - rows.start..fill_end - rows.start].fill(value);
-            row = fill_end;
+            if fill_end > row {
+                chunk[row - rows.start..fill_end - rows.start].fill(values[run]);
+                row = fill_end;
+            }
+            if end <= row {
+                run += 1;
+            }
         }
         Ok(())
     })

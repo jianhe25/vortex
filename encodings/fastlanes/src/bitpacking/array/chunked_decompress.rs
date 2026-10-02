@@ -199,6 +199,7 @@ mod executor_tests {
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::chunk_iter::execute_via_chunks;
+    use vortex_array::chunk_iter::without_chunked_execute;
     use vortex_array::scalar::Scalar;
     use vortex_array::validity::Validity;
     use vortex_buffer::Buffer;
@@ -222,8 +223,8 @@ mod executor_tests {
         Ok(array)
     }
 
-    /// Streaming a tree to canonical must match level-wise execution exactly, including
-    /// validity, at every stack depth.
+    /// Streaming a tree to canonical, directly or through the executor's shortcut, must match
+    /// level-wise execution exactly, including validity, at every stack depth.
     #[rstest::rstest]
     #[case::single(1)]
     #[case::pair(2)]
@@ -234,9 +235,11 @@ mod executor_tests {
         assert!(array.supports_decompress_chunks());
 
         let streaming = execute_via_chunks(&array, &mut ctx)?;
-        let levelwise = array.execute::<PrimitiveArray>(&mut ctx)?;
+        let executed = array.clone().execute::<PrimitiveArray>(&mut ctx)?;
+        let levelwise = without_chunked_execute(|| array.execute::<PrimitiveArray>(&mut ctx))?;
 
         assert_arrays_eq!(streaming, levelwise, &mut ctx);
+        assert_arrays_eq!(executed, levelwise, &mut ctx);
         Ok(())
     }
 
@@ -246,9 +249,9 @@ mod executor_tests {
     fn executor_depth_rule() -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
 
+        assert!(!for_stack(0, &mut ctx)?.should_execute_via_chunks());
         assert!(!for_stack(1, &mut ctx)?.should_execute_via_chunks());
-        assert!(!for_stack(2, &mut ctx)?.should_execute_via_chunks());
-        assert!(for_stack(3, &mut ctx)?.should_execute_via_chunks());
+        assert!(for_stack(2, &mut ctx)?.should_execute_via_chunks());
         assert!(for_stack(8, &mut ctx)?.should_execute_via_chunks());
 
         // A Filter root streams, but never through the executor: its level-wise kernel already

@@ -68,7 +68,7 @@ fn rle_decode_typed<V, I>(
 ) -> VortexResult<PrimitiveArray>
 where
     V: NativePType + RLE + Clone + Copy,
-    I: NativePType + Into<usize>,
+    I: NativePType + Ord + Into<usize>,
 {
     let values = array.values().clone().execute::<PrimitiveArray>(ctx)?;
     let values = values.as_slice::<V>();
@@ -160,7 +160,7 @@ impl<'a, V: NativePType + RLE> ChunkDecoder<'a, V> {
     }
 
     /// Decode chunk `chunk_idx`, counted from the first chunk of the indices, into `out`.
-    pub(crate) fn decode<I: NativePType + Into<usize>>(
+    pub(crate) fn decode<I: NativePType + Ord + Into<usize>>(
         &self,
         chunk_idx: usize,
         chunk_indices: &[I; FL_CHUNK_SIZE],
@@ -245,13 +245,10 @@ fn decode_chunk_checked<V, I>(
 ) -> VortexResult<()>
 where
     V: RLE,
-    I: Copy + Into<usize>,
+    I: Copy + Ord + Into<usize>,
 {
-    let max_index: usize = chunk_indices
-        .iter()
-        .map(|idx| (*idx).into())
-        .max()
-        .unwrap_or_default();
+    // Reduce in the index type: widening every index to `usize` first is several times slower.
+    let max_index: usize = chunk_indices.iter().copied().max().map_or(0, Into::into);
     vortex_ensure!(
         max_index < num_chunk_values as usize,
         "RLE index {max_index} out of bounds for chunk {chunk_idx} with {num_chunk_values} values"

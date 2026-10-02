@@ -76,7 +76,7 @@ fn stream_chunks<V, I>(
 ) -> VortexResult<()>
 where
     V: NativePType + FastLanesRLE,
-    I: NativePType + Into<usize>,
+    I: NativePType + Ord + Into<usize>,
 {
     let mut adapter = BlockDecodeSink::new(
         array.offset(),

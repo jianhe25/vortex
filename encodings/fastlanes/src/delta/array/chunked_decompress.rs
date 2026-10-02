@@ -97,7 +97,6 @@ mod tests {
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::ChunkedArray;
     use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::dtype::NativePType;
     use vortex_array::test_harness::assert_streams_like_execute;
     use vortex_error::VortexResult;
 
@@ -118,10 +117,7 @@ mod tests {
     }
 
     /// Delta-encode `values`, re-encoding the deltas as `deltas`.
-    fn delta_array<T: NativePType>(
-        values: PrimitiveArray,
-        deltas: Deltas,
-    ) -> VortexResult<ArrayRef> {
+    fn delta_array(values: PrimitiveArray, deltas: Deltas) -> VortexResult<ArrayRef> {
         let mut ctx = SESSION.create_execution_ctx();
         let delta = Delta::try_from_primitive_array(&values, &mut ctx)?;
         let encoded = delta.deltas().clone();
@@ -152,10 +148,7 @@ mod tests {
             (0..5000u32).map(|i| (i % 37 != 0).then_some(1_000_000 + i * 3 + i % 7)),
         );
         let signed = PrimitiveArray::from_iter((0..5000i64).map(|i| (i % 300) * 5 - 700));
-        for array in [
-            delta_array::<u32>(unsigned, deltas)?,
-            delta_array::<i64>(signed, deltas)?,
-        ] {
+        for array in [delta_array(unsigned, deltas)?, delta_array(signed, deltas)?] {
             assert_streams_like_execute(&array, &mut ctx)?;
             assert_streams_like_execute(&array.slice(517..4013)?, &mut ctx)?;
         }

@@ -15,6 +15,7 @@ use crate::arrays::PrimitiveArray;
 use crate::arrays::bool::BoolArrayExt;
 use crate::assert_arrays_eq;
 use crate::chunk_iter::execute_via_chunks;
+use crate::chunk_iter::without_chunked_execute;
 
 #[cfg(not(codspeed))]
 pub mod trace;
@@ -48,21 +49,15 @@ pub fn to_int_indices(indices_bits: BoolArray, ctx: &mut ExecutionCtx) -> Vortex
 /// Assert that `array` streams through
 /// [`ArrayRef::decompress_chunks`](crate::ArrayRef::decompress_chunks) to the same values and
 /// validity as executing it level-wise.
-///
-/// The tree must be shallow enough that the executor does not stream it too, or the comparison
-/// would prove nothing.
 pub fn assert_streams_like_execute(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<()> {
     assert!(
         array.supports_decompress_chunks(),
         "{} does not support decompress_chunks",
         array.encoding_id()
     );
-    assert!(
-        !array.should_execute_via_chunks(),
-        "the executor streams this tree, so execution is no independent reference"
-    );
     let streamed = execute_via_chunks(array, ctx)?;
-    let executed = array.clone().execute::<PrimitiveArray>(ctx)?;
+    // The executor would stream a deep enough tree too, which would make no independent reference.
+    let executed = without_chunked_execute(|| array.clone().execute::<PrimitiveArray>(ctx))?;
     assert_arrays_eq!(streamed, executed, ctx);
     Ok(())
 }
