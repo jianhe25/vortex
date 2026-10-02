@@ -101,7 +101,10 @@ static CPU_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         false,
     )]
     .into_iter()
-    .chain(TAGS.iter().map(|tag| Field::new(*tag, DataType::Utf8, false)))
+    .chain(
+        TAGS.iter()
+            .map(|tag| Field::new(*tag, DataType::Utf8, false)),
+    )
     .chain(
         METRICS
             .iter()
@@ -475,7 +478,10 @@ cpu,1451606410000000000,59,4,25,60,23,62,5,47,80,38
 
         assert_eq!(rows, 3);
         assert_eq!(
-            batches.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
             vec![2, 1]
         );
 
