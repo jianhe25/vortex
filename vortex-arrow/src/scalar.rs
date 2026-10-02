@@ -6,14 +6,22 @@
 use std::sync::Arc;
 
 use arrow_array::Scalar as ArrowScalar;
+use arrow_array::types::Decimal32Type;
+use arrow_array::types::Decimal64Type;
+use arrow_array::types::Decimal128Type;
+use arrow_array::types::Decimal256Type;
+use arrow_array::types::DecimalType;
 use arrow_array::*;
 use arrow_buffer::NullBuffer;
 use arrow_buffer::OffsetBuffer;
+use arrow_schema::DECIMAL32_MAX_PRECISION;
+use arrow_schema::DECIMAL64_MAX_PRECISION;
+use arrow_schema::DECIMAL128_MAX_PRECISION;
 use arrow_schema::Field;
 use arrow_schema::Fields;
+use num_traits::ToPrimitive;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::PType;
-use vortex_array::dtype::i256;
 use vortex_array::extension::datetime::AnyTemporal;
 use vortex_array::extension::datetime::TemporalMetadata;
 use vortex_array::extension::datetime::TimeUnit;
@@ -117,19 +125,29 @@ fn decimal_to_arrow(scalar: DecimalScalar<'_>) -> Result<Arc<dyn Datum>, VortexE
     };
     let precision = decimal_dtype.precision();
     let scale = decimal_dtype.scale();
-    // TODO(joe): Replace with decimal32, etc. once Arrow supports them.
+    // The Arrow width is chosen from the precision, matching `to_data_type_naive`.
     match scalar.decimal_value() {
         Some(value) => {
             let value = value.as_i256();
-            if precision <= 38 {
-                let value = value.maybe_i128().ok_or_else(|| {
-                    vortex_err!(
-                        "Decimal value {value} cannot fit in Arrow Decimal128 for precision {precision}"
-                    )
-                })?;
-                decimal128_scalar(value, precision, scale)
-            } else {
-                decimal256_scalar(value, precision, scale)
+            let does_not_fit = || {
+                vortex_err!(
+                    "Decimal value {value} cannot fit in Arrow decimal for precision {precision}"
+                )
+            };
+            match precision {
+                0..=DECIMAL32_MAX_PRECISION => {
+                    let value = value.to_i32().ok_or_else(does_not_fit)?;
+                    decimal_scalar::<Decimal32Type>(value, precision, scale)
+                }
+                0..=DECIMAL64_MAX_PRECISION => {
+                    let value = value.to_i64().ok_or_else(does_not_fit)?;
+                    decimal_scalar::<Decimal64Type>(value, precision, scale)
+                }
+                0..=DECIMAL128_MAX_PRECISION => {
+                    let value = value.maybe_i128().ok_or_else(does_not_fit)?;
+                    decimal_scalar::<Decimal128Type>(value, precision, scale)
+                }
+                _ => decimal_scalar::<Decimal256Type>(value.into(), precision, scale),
             }
         }
         None => {
@@ -142,15 +160,12 @@ fn decimal_to_arrow(scalar: DecimalScalar<'_>) -> Result<Arc<dyn Datum>, VortexE
     }
 }
 
-fn decimal128_scalar(value: i128, precision: u8, scale: i8) -> Result<Arc<dyn Datum>, VortexError> {
-    let array = Decimal128Array::new_scalar(value)
-        .into_inner()
-        .with_precision_and_scale(precision, scale)?;
-    Ok(Arc::new(ArrowScalar::new(array)))
-}
-
-fn decimal256_scalar(value: i256, precision: u8, scale: i8) -> Result<Arc<dyn Datum>, VortexError> {
-    let array = Decimal256Array::new_scalar(value.into())
+fn decimal_scalar<T: DecimalType>(
+    value: T::Native,
+    precision: u8,
+    scale: i8,
+) -> Result<Arc<dyn Datum>, VortexError> {
+    let array = PrimitiveArray::<T>::new_scalar(value)
         .into_inner()
         .with_precision_and_scale(precision, scale)?;
     Ok(Arc::new(ArrowScalar::new(array)))

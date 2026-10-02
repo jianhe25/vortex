@@ -200,6 +200,19 @@ async fn main() -> anyhow::Result<()> {
                             .await?;
                         let time = timer.elapsed();
 
+                        // TEMP: dump results for cross-build comparison.
+                        if let Ok(dir) = std::env::var("VX_DUMP_DIR") {
+                            let mut out = String::new();
+                            if let Some(b) = batches.first() {
+                                out.push_str(&format!("{:?}\n", b.schema()));
+                            }
+                            out.push_str(&pretty_format_batches(&batches)?.to_string());
+                            std::fs::write(
+                                format!("{dir}/q{query_idx:03}_{}.txt", format.name()),
+                                out,
+                            )?;
+                        }
+
                         // Store plan for metrics (only store once per query/format combination)
                         if show_metrics {
                             let mut plans_mut = plans.lock();

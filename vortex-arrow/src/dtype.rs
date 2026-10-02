@@ -335,13 +335,12 @@ pub(crate) fn to_data_type_naive(dtype: &DType) -> VortexResult<DataType> {
             let scale = dt.scale();
 
             match precision {
-                // This code is commented out until DataFusion improves its support for smaller decimals.
-                // // DECIMAL32_MAX_PRECISION
-                // 0..=9 => DataType::Decimal32(precision, scale),
-                // // DECIMAL64_MAX_PRECISION
-                // 10..=18 => DataType::Decimal64(precision, scale),
+                // DECIMAL32_MAX_PRECISION
+                0..=9 => DataType::Decimal32(precision, scale),
+                // DECIMAL64_MAX_PRECISION
+                10..=18 => DataType::Decimal64(precision, scale),
                 // DECIMAL128_MAX_PRECISION
-                0..=38 => DataType::Decimal128(precision, scale),
+                19..=38 => DataType::Decimal128(precision, scale),
                 // DECIMAL256_MAX_PRECISION
                 39.. => DataType::Decimal256(precision, scale),
             }
