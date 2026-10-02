@@ -9,6 +9,7 @@ use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
+use vortex_array::scalar::PValue;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarValue;
 use vortex_array::scalar_fn::fns::between::BetweenKernel;
@@ -61,7 +62,7 @@ impl BetweenKernel for DecimalByteParts {
         let (lower_value, lower_strict) = match decimal_value_wrapper_to_primitive(lower_dv, ptype)
         {
             Ok(value) => (value, options.lower_strict),
-            Err(Sign::Negative) => (ptype.min_value().into(), StrictComparison::NonStrict),
+            Err(Sign::Negative) => (PValue::min_value(ptype).into(), StrictComparison::NonStrict),
             Err(Sign::Positive) => {
                 let validity = array.validity()?.union_nullability(nullability);
                 return Ok(Some(
@@ -72,7 +73,7 @@ impl BetweenKernel for DecimalByteParts {
         let (upper_value, upper_strict) = match decimal_value_wrapper_to_primitive(upper_dv, ptype)
         {
             Ok(value) => (value, options.upper_strict),
-            Err(Sign::Positive) => (ptype.max_value().into(), StrictComparison::NonStrict),
+            Err(Sign::Positive) => (PValue::max_value(ptype).into(), StrictComparison::NonStrict),
             Err(Sign::Negative) => {
                 let validity = array.validity()?.union_nullability(nullability);
                 return Ok(Some(
