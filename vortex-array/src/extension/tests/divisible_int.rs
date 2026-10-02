@@ -76,10 +76,16 @@ impl ExtVTable for DivisibleInt {
 
 #[cfg(test)]
 mod tests {
+    use vortex_buffer::buffer;
     use vortex_error::VortexResult;
 
     use super::DivisibleInt;
     use super::Divisor;
+    use crate::IntoArray;
+    use crate::VortexSessionExecute;
+    use crate::aggregate_fn::fns::is_sorted::is_sorted;
+    use crate::array_session;
+    use crate::arrays::ExtensionArray;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
@@ -127,5 +133,22 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A type that does not declare that it sorts by its storage values is never reported as
+    /// sorted, even when its storage is.
+    #[test]
+    fn is_sorted_requires_opt_in() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let ext_dtype = ExtDType::<DivisibleInt>::try_new(
+            Divisor(2),
+            DType::Primitive(PType::U64, Nullability::NonNullable),
+        )?;
+        assert!(!ext_dtype.sorts_by_storage());
+
+        let array =
+            ExtensionArray::new(ext_dtype.erased(), buffer![2u64, 4, 6].into_array()).into_array();
+        assert!(!is_sorted(&array, &mut ctx)?);
+        Ok(())
     }
 }

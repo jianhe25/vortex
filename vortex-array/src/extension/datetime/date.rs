@@ -109,6 +109,12 @@ impl ExtVTable for Date {
         Ok(())
     }
 
+    /// Temporal values are integer offsets from a fixed epoch in a single unit, so they sort as
+    /// their storage integers do.
+    fn sorts_by_storage(_ext_dtype: &ExtDType<Self>) -> bool {
+        true
+    }
+
     fn unpack_native<'a>(
         ext_dtype: &'a ExtDType<Self>,
         storage_value: &'a ScalarValue,

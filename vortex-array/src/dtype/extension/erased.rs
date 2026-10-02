@@ -47,6 +47,13 @@ impl ExtDTypeRef {
         self.0.storage_dtype()
     }
 
+    /// Whether values of this type sort in the same order as their storage values.
+    ///
+    /// See [`ExtVTable::sorts_by_storage`](crate::dtype::extension::ExtVTable::sorts_by_storage).
+    pub fn sorts_by_storage(&self) -> bool {
+        self.0.sorts_by_storage()
+    }
+
     /// Returns the nullability of the storage dtype.
     pub fn nullability(&self) -> Nullability {
         self.storage_dtype().nullability()

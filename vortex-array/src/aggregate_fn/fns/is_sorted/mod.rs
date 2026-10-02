@@ -241,8 +241,9 @@ pub fn make_is_sorted_partial_dtype(element_dtype: &DType) -> DType {
 
 /// Whether `is_sorted` can order values of `dtype`.
 ///
-/// Extension values order by their storage values, matching scalar comparison, so an extension
-/// type is supported whenever its storage type is. This covers the temporal types.
+/// An extension type is supported only when it declares that it sorts by its storage values
+/// ([`ExtVTable::sorts_by_storage`](crate::dtype::extension::ExtVTable::sorts_by_storage)), as the
+/// temporal types do, and its storage type is supported.
 fn is_sorted_supported_dtype(dtype: &DType) -> bool {
     match dtype {
         DType::Bool(_)
@@ -250,7 +251,9 @@ fn is_sorted_supported_dtype(dtype: &DType) -> bool {
         | DType::Decimal(..)
         | DType::Utf8(_)
         | DType::Binary(_) => true,
-        DType::Extension(ext) => is_sorted_supported_dtype(ext.storage_dtype()),
+        DType::Extension(ext) => {
+            ext.sorts_by_storage() && is_sorted_supported_dtype(ext.storage_dtype())
+        }
         DType::Null
         | DType::List(..)
         | DType::FixedSizeList(..)

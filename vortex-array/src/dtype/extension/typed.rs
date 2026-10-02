@@ -87,6 +87,13 @@ impl<V: ExtVTable> ExtDType<V> {
         &self.storage_dtype
     }
 
+    /// Whether values of this type sort in the same order as their storage values.
+    ///
+    /// See [`ExtVTable::sorts_by_storage`].
+    pub fn sorts_by_storage(&self) -> bool {
+        V::sorts_by_storage(self)
+    }
+
     /// Returns a new [`ExtDTypeRef`] with the given nullability.
     pub fn with_nullability(&self, nullability: Nullability) -> ExtDTypeRef {
         let storage_dtype = self.storage_dtype.with_nullability(nullability);
@@ -123,6 +130,7 @@ pub(super) trait DynExtDType: 'static + Send + Sync + super::sealed::Sealed {
     fn as_any(&self) -> &dyn Any;
     fn id(&self) -> ExtId;
     fn storage_dtype(&self) -> &DType;
+    fn sorts_by_storage(&self) -> bool;
     fn metadata_any(&self) -> &dyn Any;
     fn metadata_debug(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
     fn metadata_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result;
@@ -150,6 +158,10 @@ impl<V: ExtVTable> DynExtDType for ExtDType<V> {
 
     fn storage_dtype(&self) -> &DType {
         self.storage_dtype()
+    }
+
+    fn sorts_by_storage(&self) -> bool {
+        self.sorts_by_storage()
     }
 
     fn metadata_any(&self) -> &dyn Any {

@@ -48,6 +48,16 @@ pub trait ExtVTable: 'static + Sized + Send + Sync + Clone + Debug + Eq + Hash {
     /// extension metadata.
     fn validate_dtype(ext_dtype: &ExtDType<Self>) -> VortexResult<()>;
 
+    /// Whether values of this type sort in the same order as their storage values.
+    ///
+    /// Opting in lets order-based computations, such as
+    /// [`is_sorted`](crate::aggregate_fn::fns::is_sorted::is_sorted), run on the storage array.
+    /// Defaults to `false`: the storage order says nothing about the order of the extension
+    /// values unless the type declares it.
+    fn sorts_by_storage(_ext_dtype: &ExtDType<Self>) -> bool {
+        false
+    }
+
     // Methods related to the extension scalar values.
 
     /// Validate the given storage value is compatible with the extension type.
