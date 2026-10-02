@@ -42,7 +42,15 @@ EXPECTED_IDS = {
     "pr": tuple(
         benchmark_id
         for benchmark_id in REGULAR_IDS
-        if benchmark_id not in {"clickbench-sorted-nvme", "tpch-s3-10", "appian-nvme", "vortex-queries"}
+        if benchmark_id
+        not in {
+            "clickbench-sorted-nvme",
+            "tpch-s3-10",
+            "statpopgen",
+            "fineweb-s3",
+            "appian-nvme",
+            "vortex-queries",
+        }
     ),
     "pr-compact": COMPACT_IDS,
     "pr-all": PR_ALL_IDS,
@@ -103,6 +111,14 @@ def test_pr_all_covers_focused_presets() -> None:
             if source := preset.get(benchmark_id):
                 assert _targets(source) <= _targets(entry)
                 assert set(cast("list[str]", source["data_formats"])) <= set(cast("list[str]", entry["data_formats"]))
+
+
+def test_pr_full_covers_pr() -> None:
+    pr = {entry["id"]: entry for entry in _entries("pr")}
+    pr_full = {entry["id"]: entry for entry in _entries("pr-full")}
+
+    for benchmark_id, entry in pr.items():
+        assert _targets(entry) <= _targets(pr_full[benchmark_id])
 
 
 def test_resolver_rejects_empty_targets() -> None:
