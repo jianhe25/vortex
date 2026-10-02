@@ -373,9 +373,8 @@ pub trait BitPackedArrayExt: BitPackedArraySlotsExt {
     /// The bit width shared by every block, or an error if block offsets are not a sequence.
     #[inline]
     fn constant_bit_width(&self) -> VortexResult<u8> {
-        self.constant_bit_width_opt().ok_or_else(|| {
-            vortex_err!("BitPacked block offsets are not a constant-width sequence")
-        })
+        self.constant_bit_width_opt()
+            .ok_or_else(|| vortex_err!("BitPacked block offsets are not a constant-width sequence"))
     }
 
     #[inline]
