@@ -441,11 +441,13 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 if let Some(scalar_fn_expr) = node.downcast_ref::<ScalarFunctionExpr>()
                     && !can_scalar_fn_be_pushed_down(scalar_fn_expr, input_schema)
                 {
-                    scan_projection.extend(
-                        collect_columns(node)
-                            .into_iter()
-                            .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
-                    );
+                    for c in collect_columns(node) {
+                        push_unique(
+                            &mut scan_projection,
+                            c.name().to_string(),
+                            get_item(c.name(), root()),
+                        );
+                    }
 
                     leftover_projection.push(projection_expr.clone());
                     return Ok(TreeNodeRecursion::Stop);
@@ -458,11 +460,13 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                     && binary_expr.left().data_type(input_schema)?.is_decimal()
                     && binary_expr.right().data_type(input_schema)?.is_decimal()
                 {
-                    scan_projection.extend(
-                        collect_columns(node)
-                            .into_iter()
-                            .map(|c| (c.name().to_string(), get_item(c.name(), root()))),
-                    );
+                    for c in collect_columns(node) {
+                        push_unique(
+                            &mut scan_projection,
+                            c.name().to_string(),
+                            get_item(c.name(), root()),
+                        );
+                    }
 
                     leftover_projection.push(projection_expr.clone());
                     return Ok(TreeNodeRecursion::Stop);
@@ -473,10 +477,11 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
 
             // if we didn't stop early
             if matches!(r, TreeNodeRecursion::Continue) {
-                scan_projection.push((
+                push_unique(
+                    &mut scan_projection,
                     projection_expr.alias.clone(),
                     self.convert(projection_expr.expr.as_ref())?,
-                ));
+                );
                 leftover_projection.push(ProjectionExpr {
                     expr: Arc::new(df_expr::Column::new_with_schema(
                         projection_expr.alias.as_str(),
@@ -491,6 +496,17 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
             scan_projection: pack(scan_projection, Nullability::NonNullable),
             leftover_projection: leftover_projection.into(),
         })
+    }
+}
+
+/// Add `(name, expr)` to the scan projection unless the same entry is already there, so a column
+/// referenced by several projection expressions is only read and decoded once.
+fn push_unique(scan_projection: &mut Vec<(String, Expression)>, name: String, expr: Expression) {
+    if !scan_projection
+        .iter()
+        .any(|(existing_name, existing_expr)| *existing_name == name && *existing_expr == expr)
+    {
+        scan_projection.push((name, expr));
     }
 }
 
@@ -1204,6 +1220,39 @@ mod tests {
         let octet_length = octet_length_expr(expr, &test_schema);
 
         assert!(can_be_pushed_down_impl(&octet_length, &test_schema));
+    }
+
+    /// A column used by a pushed-down projection and by one that stays in DataFusion must only be
+    /// read once by the scan.
+    #[rstest]
+    fn test_split_projection_reads_shared_column_once(test_schema: Schema) -> DFResult<()> {
+        let name = Arc::new(df_expr::Column::new("name", 1)) as Arc<dyn PhysicalExpr>;
+        let field_name = Arc::new(df_expr::Literal::new(ScalarValue::Utf8(Some(
+            "value".to_string(),
+        )))) as Arc<dyn PhysicalExpr>;
+        let unpushable = Arc::new(ScalarFunctionExpr::try_new(
+            Arc::new(ScalarUDF::from(NamedStructFunc::new())),
+            vec![field_name, Arc::clone(&name)],
+            &test_schema,
+            Arc::new(ConfigOptions::new()),
+        )?) as Arc<dyn PhysicalExpr>;
+        let projection = ProjectionExprs::new([
+            ProjectionExpr::new(unpushable, "packed"),
+            ProjectionExpr::new(name, "name"),
+        ]);
+        let output_schema = projection.project_schema(&test_schema)?;
+
+        let processed = DefaultExpressionConvertor::default().split_projection(
+            projection,
+            &test_schema,
+            &output_schema,
+        )?;
+
+        assert_eq!(
+            processed.scan_projection,
+            pack([("name", get_item("name", root()))], Nullability::NonNullable)
+        );
+        Ok(())
     }
 
     #[rstest]
