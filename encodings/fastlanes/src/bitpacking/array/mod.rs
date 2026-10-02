@@ -7,6 +7,7 @@ use std::mem::MaybeUninit;
 
 use fastlanes::BitPacking;
 use vortex_array::ArrayRef;
+use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::TypedArrayRef;
@@ -120,50 +121,67 @@ pub(crate) fn validate_block_offsets(
     );
     let max_bit_width = ptype.bit_width() as u64;
     if let Some(sequence) = offsets.as_opt::<Sequence>() {
-        let step = sequence.multiplier().cast::<u64>()?;
-        vortex_ensure!(
-            step % 128 == 0 && step / 128 <= max_bit_width,
-            "Block offsets step {step} is not a supported bit width for {ptype}"
-        );
-        let span = step * num_blocks as u64;
-        vortex_ensure!(
-            span == packed_len as u64,
-            "Block offsets span {span} bytes, but the packed buffer has {packed_len}"
-        );
+        validate_sequence_offsets(sequence, max_bit_width, num_blocks, packed_len)
     } else if let Some(primitive) = offsets.as_opt::<Primitive>()
         && primitive.buffer_handle().is_on_host()
     {
-        let span = match_each_unsigned_integer_ptype!(primitive.ptype(), |T| {
-            validate_boundaries(primitive.as_slice::<T>(), ptype)
-        })?;
-        vortex_ensure!(
-            span == packed_len as u64,
-            "Block offsets span {span} bytes, but the packed buffer has {packed_len}"
-        );
+        match_each_unsigned_integer_ptype!(primitive.ptype(), |T| {
+            validate_primitive_offsets(primitive.as_slice::<T>(), max_bit_width, packed_len)
+        })
+    } else {
+        Ok(())
     }
+}
+
+/// Check that a sequence of `num_blocks + 1` boundaries steps by whole 128-byte rows of at most
+/// `max_bit_width` bits and spans `packed_len` bytes.
+fn validate_sequence_offsets(
+    offsets: ArrayView<'_, Sequence>,
+    max_bit_width: u64,
+    num_blocks: usize,
+    packed_len: usize,
+) -> VortexResult<()> {
+    let step = offsets.multiplier().cast::<u64>()?;
+    vortex_ensure!(
+        step % 128 == 0 && step / 128 <= max_bit_width,
+        "Block offsets step {step} is not a supported bit width (at most {max_bit_width} bits)"
+    );
+    let span = step * num_blocks as u64;
+    vortex_ensure!(
+        span == packed_len as u64,
+        "Block offsets span {span} bytes, but the packed buffer has {packed_len}"
+    );
     Ok(())
 }
 
-/// Check that each block between `boundaries` is a whole number of 128-byte rows with a bit width
-/// supported by `ptype`, returning the number of bytes the boundaries span.
-fn validate_boundaries<T: Copy + Display>(boundaries: &[T], ptype: PType) -> VortexResult<u64>
+/// Check that each block between `boundaries` is a whole number of 128-byte rows of at most
+/// `max_bit_width` bits, and that the boundaries span `packed_len` bytes.
+fn validate_primitive_offsets<T: Copy + Display>(
+    boundaries: &[T],
+    max_bit_width: u64,
+    packed_len: usize,
+) -> VortexResult<()>
 where
     u64: From<T>,
 {
-    let max_bit_width = ptype.bit_width() as u64;
     for pair in boundaries.windows(2) {
         let size = u64::from(pair[1]).checked_sub(u64::from(pair[0]));
         vortex_ensure!(
             size.is_some_and(|size| size % 128 == 0 && size / 128 <= max_bit_width),
-            "Block boundaries {} and {} do not hold a supported bit width for {ptype}",
+            "Block boundaries {} and {} do not hold a supported bit width (at most {max_bit_width} bits)",
             pair[0],
             pair[1]
         );
     }
-    Ok(match boundaries {
+    let span = match boundaries {
         [first, .., last] => u64::from(*last) - u64::from(*first),
         _ => 0,
-    })
+    };
+    vortex_ensure!(
+        span == packed_len as u64,
+        "Block offsets span {span} bytes, but the packed buffer has {packed_len}"
+    );
+    Ok(())
 }
 
 /// The packed payload and children extracted from a [`BitPackedArray`].
