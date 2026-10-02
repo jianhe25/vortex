@@ -209,7 +209,8 @@ pub struct VortexSource {
 }
 
 impl VortexSource {
-    /// The projection the Vortex scan evaluates, as shown by `EXPLAIN`.
+    /// The projection the Vortex scan evaluates, as shown by `EXPLAIN` when it computes more than
+    /// the columns it reads.
     ///
     /// This is computed against the table's file schema, so it matches what each file's scan
     /// evaluates unless the file's own schema differs.
@@ -218,15 +219,21 @@ impl VortexSource {
             .projection
             .project_schema(self.table_schema.table_schema())
             .ok()?;
+        let file_schema = self.table_schema.file_schema();
         let processed = process_projection(
             self.expression_convertor.as_ref(),
             self.options.projection_pushdown,
             &self.projection,
-            self.table_schema.file_schema(),
+            file_schema,
             &output_schema,
         )
         .ok()?;
-        Some(processed.scan_projection.to_string())
+        let columns_only = self
+            .expression_convertor
+            .no_pushdown_projection(self.projection.clone(), file_schema)
+            .ok()?;
+        (processed.scan_projection != columns_only.scan_projection)
+            .then(|| processed.scan_projection.to_string())
     }
 
     /// Creates a new `VortexSource` for a table schema and [`VortexSession`].

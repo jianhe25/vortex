@@ -344,15 +344,16 @@ async fn test_lambda_projection_with_pushdown() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Returns the projection the Vortex scan evaluates, as printed by `EXPLAIN`.
+/// Returns the projection the Vortex scan evaluates, as printed by `EXPLAIN`, or `none` when the
+/// scan only reads columns.
 async fn vortex_scan_projection(ctx: &SessionContext, sql: &str) -> anyhow::Result<String> {
     let explain = ctx.sql(&format!("EXPLAIN {sql}")).await?.collect().await?;
     let plan = pretty_format_batches(&explain)?.to_string();
     let marker = "vortex_projection: ";
-    let start = plan
-        .find(marker)
-        .ok_or_else(|| anyhow!("EXPLAIN plan did not show a Vortex scan projection:\n{plan}"))?
-        + marker.len();
+    // The plan omits the projection when the scan only reads columns.
+    let Some(start) = plan.find(marker).map(|start| start + marker.len()) else {
+        return Ok("none".to_string());
+    };
     let end = plan[start..]
         .find(" |")
         .map_or(plan.len(), |end| start + end);
@@ -443,7 +444,7 @@ async fn test_aggregate_argument_pushdown() -> anyhow::Result<()> {
     let without_rule = TestSessionContext::new(true);
     create_list_table(&without_rule).await?;
     let expected = without_rule.session.sql(query).await?.collect().await?;
-    assert_snapshot!(vortex_scan_projection(&without_rule.session, query).await?, @"pack(id: $.id, xs: $.xs)");
+    assert_snapshot!(vortex_scan_projection(&without_rule.session, query).await?, @"none");
 
     let with_rule = TestSessionContext::with_expression_pushdown();
     create_list_table(&with_rule).await?;
