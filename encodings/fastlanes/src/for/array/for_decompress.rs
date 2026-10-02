@@ -73,7 +73,9 @@ pub(crate) fn fused_decompress(
     })
 }
 
-fn fused_decompress_typed<T: PhysicalPType<Physical = T> + UnsignedPType + BitPackedPhysical + WrappingAdd>(
+fn fused_decompress_typed<
+    T: PhysicalPType<Physical = T> + UnsignedPType + BitPackedPhysical + WrappingAdd,
+>(
     for_: &FoRArray,
     bp: ArrayView<'_, BitPacked>,
     ctx: &mut ExecutionCtx,
@@ -244,7 +246,9 @@ fn fused_decompress_many_refs_typed<
 ///
 /// `chunk_reference` maps the index of a chunk, counted from the first chunk of `bp`, to its
 /// reference.
-fn fused_unpack<T: PhysicalPType<Physical = T> + UnsignedPType + BitPackedPhysical + WrappingAdd>(
+fn fused_unpack<
+    T: PhysicalPType<Physical = T> + UnsignedPType + BitPackedPhysical + WrappingAdd,
+>(
     for_: &FoRArray,
     bp: ArrayView<'_, BitPacked>,
     chunk_reference: impl Fn(usize) -> T,
