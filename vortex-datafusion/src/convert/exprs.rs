@@ -14,6 +14,7 @@ use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_functions::string::octet_length::OctetLengthFunc;
+use datafusion_functions_nested::array_sum::ArraySum;
 use datafusion_functions_nested::length::ArrayLength;
 use datafusion_physical_expr::DynamicFilterTracking;
 use datafusion_physical_expr::PhysicalExpr;
@@ -24,6 +25,7 @@ use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
 use vortex::VortexSessionDefault;
+use vortex::aggregate_fn::NumericalAggregateOpts;
 use vortex::dtype::Nullability;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
@@ -44,6 +46,7 @@ use vortex::scalar_fn::ScalarFnVTableExt;
 use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::like::Like;
 use vortex::scalar_fn::fns::like::LikeOptions;
+use vortex::scalar_fn::fns::list_sum::ListSum;
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex::session::VortexSession;
 use vortex_arrow::ArrowSessionExt;
@@ -227,6 +230,33 @@ impl DefaultExpressionConvertor {
         Ok(cast(list_length(input), return_dtype))
     }
 
+    /// Attempts to convert DataFusion's `array_sum` function (aliased as `list_sum`) to Vortex
+    /// `list_sum`.
+    ///
+    /// DataFusion coerces the argument to a list of `Float64` and sums it in `f64`, skipping null
+    /// elements and returning null for null, empty and all-null lists. NaN elements poison the
+    /// sum, so the Vortex sum must include them.
+    fn try_convert_array_sum(&self, scalar_fn: &ScalarFunctionExpr) -> DFResult<Expression> {
+        let [input] = scalar_fn.args() else {
+            return Err(exec_datafusion_err!(
+                "array_sum pushdown requires exactly one argument"
+            ));
+        };
+
+        let input = self.convert(input.as_ref())?;
+        let return_dtype = self
+            .session
+            .arrow()
+            .from_arrow_field(&Field::new(
+                "",
+                scalar_fn.return_type().clone(),
+                scalar_fn.nullable(),
+            ))
+            .map_err(|e| exec_datafusion_err!("Failed to convert return type to dtype: {e}"))?;
+        let sum = ListSum.new_expr(NumericalAggregateOpts::include_nans(), [input]);
+        Ok(cast(sum, return_dtype))
+    }
+
     /// Attempts to convert a DataFusion ScalarFunctionExpr to a Vortex expression.
     fn try_convert_scalar_function(&self, scalar_fn: &ScalarFunctionExpr) -> DFResult<Expression> {
         if let Some(octet_length_fn) =
@@ -239,6 +269,10 @@ impl DefaultExpressionConvertor {
             ScalarFunctionExpr::try_downcast_func::<ArrayLength>(scalar_fn)
         {
             return self.try_convert_array_length(array_length_fn);
+        }
+
+        if let Some(array_sum_fn) = ScalarFunctionExpr::try_downcast_func::<ArraySum>(scalar_fn) {
+            return self.try_convert_array_sum(array_sum_fn);
         }
 
         if let Some(get_field_fn) = ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn)
@@ -607,6 +641,7 @@ fn is_convertible_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
             ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(sf).is_some()
                 || ScalarFunctionExpr::try_downcast_func::<OctetLengthFunc>(sf).is_some()
                 || ScalarFunctionExpr::try_downcast_func::<ArrayLength>(sf).is_some()
+                || ScalarFunctionExpr::try_downcast_func::<ArraySum>(sf).is_some()
         })
 }
 
@@ -668,7 +703,7 @@ fn supported_data_types(dt: &DataType) -> bool {
 }
 
 /// Checks if a scalar function can be pushed down.
-/// Currently GetFieldFunc, OctetLengthFunc, and ArrayLength are supported.
+/// Currently GetFieldFunc, OctetLengthFunc, ArrayLength, and ArraySum are supported.
 fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
     if ScalarFunctionExpr::try_downcast_func::<GetFieldFunc>(scalar_fn).is_some() {
         // Field access is pushable only when its entire source is convertible.
@@ -684,8 +719,32 @@ fn can_scalar_fn_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema)
         return true;
     }
 
+    if ScalarFunctionExpr::try_downcast_func::<ArraySum>(scalar_fn)
+        .is_some_and(|array_sum| can_array_sum_be_pushed_down(array_sum, schema))
+    {
+        return true;
+    }
+
     ScalarFunctionExpr::try_downcast_func::<ArrayLength>(scalar_fn)
         .is_some_and(|array_length| can_array_length_be_pushed_down(array_length, schema))
+}
+
+fn can_array_sum_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
+    let [input] = scalar_fn.args() else {
+        return false;
+    };
+
+    // After coercion the argument is a list of `Float64`, usually a cast of a list column.
+    input
+        .data_type(schema)
+        .as_ref()
+        .is_ok_and(|data_type| match data_type {
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _) => field.data_type() == &DataType::Float64,
+            _ => false,
+        })
+        && is_convertible_expr(input)
 }
 
 fn can_octet_length_be_pushed_down(scalar_fn: &ScalarFunctionExpr, schema: &Schema) -> bool {
@@ -1204,6 +1263,28 @@ mod tests {
         let octet_length = octet_length_expr(expr, &test_schema);
 
         assert!(can_be_pushed_down_impl(&octet_length, &test_schema));
+    }
+
+    #[rstest]
+    fn test_array_sum_pushed_down_as_list_sum(test_schema: Schema) -> DFResult<()> {
+        let float_list = DataType::List(Arc::new(Field::new("item", DataType::Float64, true)));
+        let tags = Arc::new(df_expr::Column::new("tags", 5)) as Arc<dyn PhysicalExpr>;
+        let cast_tags =
+            Arc::new(df_expr::CastExpr::new(tags, float_list, None)) as Arc<dyn PhysicalExpr>;
+        let array_sum = Arc::new(ScalarFunctionExpr::try_new(
+            Arc::new(ScalarUDF::from(ArraySum::new())),
+            vec![cast_tags],
+            &test_schema,
+            Arc::new(ConfigOptions::new()),
+        )?) as Arc<dyn PhysicalExpr>;
+
+        assert!(can_be_pushed_down_impl(&array_sum, &test_schema));
+        let converted = DefaultExpressionConvertor::default().convert(array_sum.as_ref())?;
+        assert_snapshot!(
+            converted.to_string(),
+            @"cast(vortex.list.sum(cast($.tags as list(f64?)?), opts=skip_nans=false) as f64?)"
+        );
+        Ok(())
     }
 
     #[rstest]

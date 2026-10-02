@@ -188,6 +188,57 @@ async fn test_addition_pushdown() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `array_sum` is pushed into the scan as Vortex `list_sum` and must keep DataFusion's semantics:
+/// null elements are skipped, null/empty/all-null lists sum to null, and NaN poisons the sum.
+#[tokio::test]
+async fn test_array_sum_pushdown() -> anyhow::Result<()> {
+    let query = "SELECT id, array_sum(xs) AS int_sum, array_sum(ys) AS float_sum \
+                 FROM written_sums ORDER BY id";
+
+    let mut results = Vec::new();
+    for projection_pushdown in [false, true] {
+        let ctx = TestSessionContext::new(projection_pushdown);
+        datafusion_functions_nested::register_all(&mut *ctx.session.state_ref().write())?;
+
+        ctx.session
+            .sql(
+                "CREATE EXTERNAL TABLE written_sums \
+                        (id INT NOT NULL, xs INT[], ys DOUBLE[]) \
+                    STORED AS vortex \
+                    LOCATION '/sums/'",
+            )
+            .await?;
+        ctx.session
+            .sql(
+                "INSERT INTO written_sums VALUES \
+                    (1, make_array(1, NULL, 2), make_array(1.5, 2.5)), \
+                    (2, CAST(make_array() AS INT[]), make_array(1.5, CAST('NaN' AS DOUBLE))), \
+                    (3, NULL, NULL), \
+                    (4, make_array(CAST(NULL AS INT)), make_array(CAST(NULL AS DOUBLE), -1.0))",
+            )
+            .await?
+            .collect()
+            .await?;
+
+        let batches = ctx.session.sql(query).await?.collect().await?;
+        results.push(pretty_format_batches(&batches)?.to_string());
+    }
+
+    assert_eq!(results[0], results[1]);
+    assert_snapshot!(results[1], @r"
+    +----+---------+-----------+
+    | id | int_sum | float_sum |
+    +----+---------+-----------+
+    | 1  | 3.0     | 4.0       |
+    | 2  |         | NaN       |
+    | 3  |         |           |
+    | 4  |         | -1.0      |
+    +----+---------+-----------+
+    ");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_octet_length_pushdown() -> anyhow::Result<()> {
     let ctx = TestSessionContext::new(true);
