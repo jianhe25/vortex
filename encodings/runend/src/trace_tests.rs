@@ -54,6 +54,22 @@ fn trace_compare_on_runend() -> VortexResult<()> {
       reduce_parent static:RunEndScalarFnRule slot=0 parent=vortex.binary(bool, len=9) child=vortex.runend(i32, len=9) -> vortex.runend(bool, len=9)
       done output=vortex.runend(bool, len=9)
     ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
+    [optimize]
+    vortex.binary(bool, len=9)
+    ├─lhs: vortex.runend(i32, len=9)
+    │  ├─ends: vortex.primitive(u8, len=3)
+    │  └─values: vortex.primitive(i32, len=3)
+    └─rhs: vortex.constant(i32, len=9)
+
+    1. reduce_parent static:RunEndScalarFnRule from lhs
+       vortex.binary(bool, len=9)
+       -> vortex.runend(bool, len=9)
+          ├─ends: vortex.primitive(u8, len=3)
+          └─values: vortex.binary(bool, len=3)
+             ├─lhs: vortex.primitive(i32, len=3)
+             └─rhs: vortex.constant(i32, len=3)
+    ");
 
     let optimized = traced.output;
     let traced = trace_op(|| {
@@ -85,19 +101,19 @@ fn trace_compare_on_runend() -> VortexResult<()> {
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
     [execute_until AnyCanonical]
     vortex.runend(bool, len=9)
-    ├─(0) vortex.primitive(u8, len=3)
-    └─(1) vortex.binary(bool, len=3)
-       ├─(0) vortex.primitive(i32, len=3)
-       └─(1) vortex.constant(i32, len=3)
+    ├─ends: vortex.primitive(u8, len=3)
+    └─values: vortex.binary(bool, len=3)
+       ├─lhs: vortex.primitive(i32, len=3)
+       └─rhs: vortex.constant(i32, len=3)
 
-    1. execute vortex.runend, by (1)
+    1. execute vortex.runend, by D1
        vortex.runend(bool, len=9)
        -> vortex.bool(bool, len=9)
 
-    (1) execute_until AnyCanonical
+    D1: execute_until AnyCanonical
     vortex.binary(bool, len=3)
-    ├─(0) vortex.primitive(i32, len=3)
-    └─(1) vortex.constant(i32, len=3)
+    ├─lhs: vortex.primitive(i32, len=3)
+    └─rhs: vortex.constant(i32, len=3)
 
     1. execute vortex.binary
        vortex.binary(bool, len=3)
@@ -136,6 +152,22 @@ fn trace_filter_on_runend() -> VortexResult<()> {
       iter 2 current=vortex.primitive(i32, len=4) builder_active=false
       return output=vortex.primitive(i32, len=4)
     ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
+    [execute_until AnyCanonical]
+    vortex.filter(i32, len=4)
+    └─child: vortex.runend(i32, len=9)
+       ├─ends: vortex.primitive(u8, len=3)
+       └─values: vortex.primitive(i32, len=3)
+
+    1. child_execute_parent session[0]:execute_parent_fn from child
+       vortex.filter(i32, len=4)
+       -> vortex.dict(i32, len=4)
+          ├─codes: vortex.primitive(u32, len=4)
+          └─values: vortex.primitive(i32, len=3)
+    2. child_execute_parent session[0]:execute_parent_fn from values
+       vortex.dict(i32, len=4)
+       -> vortex.primitive(i32, len=4)
+    ");
 
     Ok(())
 }
@@ -165,6 +197,23 @@ fn trace_take_on_runend() -> VortexResult<()> {
         child_execute_parent session[0]:execute_parent_fn slot=1 parent=vortex.dict(i32, len=4) child=vortex.primitive(i32, len=3) -> vortex.primitive(i32, len=4)
       iter 2 current=vortex.primitive(i32, len=4) builder_active=false
       return output=vortex.primitive(i32, len=4)
+    ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
+    [execute_until AnyCanonical]
+    vortex.dict(i32, len=4)
+    ├─codes: vortex.primitive(u64, len=4)
+    └─values: vortex.runend(i32, len=9)
+       ├─ends: vortex.primitive(u8, len=3)
+       └─values: vortex.primitive(i32, len=3)
+
+    1. child_execute_parent session[0]:execute_parent_fn from values
+       vortex.dict(i32, len=4)
+       -> vortex.dict(i32, len=4)
+          ├─codes: vortex.primitive(u32, len=4)
+          └─values: vortex.primitive(i32, len=3)
+    2. child_execute_parent session[0]:execute_parent_fn from values
+       vortex.dict(i32, len=4)
+       -> vortex.primitive(i32, len=4)
     ");
 
     Ok(())

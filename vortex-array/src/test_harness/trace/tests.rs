@@ -380,6 +380,15 @@ optimize root=vortex.filter(i32, len=4) session=false
   reduce TrivialFilterRule: vortex.filter(i32, len=4) -> vortex.primitive(i32, len=4)
   done output=vortex.primitive(i32, len=4)
 ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
+    [optimize]
+    vortex.filter(i32, len=4)
+    └─child: vortex.primitive(i32, len=4)
+
+    1. reduce TrivialFilterRule
+       vortex.filter(i32, len=4)
+       -> vortex.primitive(i32, len=4)
+    ");
 
     Ok(())
 }
@@ -419,13 +428,13 @@ fn trace_optimize_parent_reduce_fixpoint_attempts() -> VortexResult<()> {
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
     [optimize]
     vortex.filter(i32, len=2)
-    └─(0) vortex.filter(i32, len=4)
-       └─(0) vortex.primitive(i32, len=6)
+    └─child: vortex.filter(i32, len=4)
+       └─child: vortex.primitive(i32, len=6)
 
-    1. reduce_parent static:FilterReduceAdaptor(Filter) slot=0
+    1. reduce_parent static:FilterReduceAdaptor(Filter) from child
        vortex.filter(i32, len=2)
        -> vortex.filter(i32, len=2)
-          └─(0) vortex.primitive(i32, len=6)
+          └─child: vortex.primitive(i32, len=6)
     ");
 
     let mut ctx = ExecutionCtx::new(VortexSession::empty().with::<ArraySession>());
@@ -470,33 +479,33 @@ fn trace_optimize_parent_reduce_fixpoint_attempts() -> VortexResult<()> {
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
     [execute_until AnyCanonical]
     vortex.filter(i32, len=2)
-    └─(0) vortex.filter(i32, len=4)
-       └─(0) vortex.primitive(i32, len=6)
+    └─child: vortex.filter(i32, len=4)
+       └─child: vortex.primitive(i32, len=6)
 
     1. execute vortex.filter
        vortex.filter(i32, len=2)
        -> vortex.slice(i32, len=2)
-    2. slot 0, by (1)
+    2. child reduced, by D1
        vortex.slice(i32, len=2)
        -> vortex.slice(i32, len=2)
-          └─(0) vortex.primitive(i32, len=4)
-    3. execute vortex.slice, by (2)
+          └─child: vortex.primitive(i32, len=4)
+    3. execute vortex.slice, by D2
        vortex.slice(i32, len=2)
        -> vortex.primitive(i32, len=2)
 
-    (1) slot 0 of vortex.slice(i32, len=2)
+    D1: child of vortex.slice(i32, len=2)
     vortex.filter(i32, len=4)
-    └─(0) vortex.primitive(i32, len=6)
+    └─child: vortex.primitive(i32, len=6)
 
     1. execute vortex.filter
        vortex.filter(i32, len=4)
        -> vortex.primitive(i32, len=4)
 
-    (2) optimize
+    D2: optimize
     vortex.slice(i32, len=2)
-    └─(0) vortex.primitive(i32, len=4)
+    └─child: vortex.primitive(i32, len=4)
 
-    1. reduce_parent static:SliceReduceAdaptor(Primitive) slot=0
+    1. reduce_parent static:SliceReduceAdaptor(Primitive) from child
        vortex.slice(i32, len=2)
        -> vortex.primitive(i32, len=2)
     ");
@@ -551,6 +560,28 @@ fn trace_execute_filter_with_scattered_mask() -> VortexResult<()> {
       iter 4 current=vortex.primitive(i32, len=2) builder_active=false
       return output=vortex.primitive(i32, len=2)
     ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
+    [execute_until AnyCanonical]
+    vortex.filter(i32, len=2)
+    └─child: vortex.filter(i32, len=4)
+       └─child: vortex.primitive(i32, len=6)
+
+    1. child reduced, by D1
+       vortex.filter(i32, len=2)
+       -> vortex.filter(i32, len=2)
+          └─child: vortex.primitive(i32, len=4)
+    2. execute vortex.filter
+       vortex.filter(i32, len=2)
+       -> vortex.primitive(i32, len=2)
+
+    D1: child of vortex.filter(i32, len=2)
+    vortex.filter(i32, len=4)
+    └─child: vortex.primitive(i32, len=6)
+
+    1. execute vortex.filter
+       vortex.filter(i32, len=4)
+       -> vortex.primitive(i32, len=4)
+    ");
 
     Ok(())
 }
@@ -604,17 +635,17 @@ fn trace_execution_stack_parent_kernel_attempts(
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
     [execute_until AnyCanonical]
     vortex.test.stack-parent(i32, len=3)
-    └─(0) vortex.test.stack-child(i32, len=3)
+    └─child: vortex.test.stack-child(i32, len=3)
 
-    1. stack_execute_parent session[1]:execute_parent_fn slot=0, by (1)
-       x child_execute_parent session[0]:execute_parent_fn slot=0: declined
-       x child_execute_parent session[1]:execute_parent_fn slot=0: declined
+    1. stack_execute_parent session[1]:execute_parent_fn from child, by D1
+       x child_execute_parent session[0]:execute_parent_fn from child: declined
+       x child_execute_parent session[1]:execute_parent_fn from child: declined
        vortex.test.stack-parent(i32, len=3)
        -> vortex.primitive(i32, len=3)
 
-    (1) slot 0 of vortex.test.stack-parent(i32, len=3)
+    D1: child of vortex.test.stack-parent(i32, len=3)
     vortex.test.stack-child(i32, len=3)
-       x stack_execute_parent session[0]:execute_parent_fn slot=0: declined
+       x stack_execute_parent session[0]:execute_parent_fn from child: declined
     ");
 
     Ok(())
@@ -664,15 +695,15 @@ fn trace_execution_chunked_append_child_flow() -> VortexResult<()> {
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
     [execute_until AnyCanonical]
     vortex.chunked(i32, len=5)
-    ├─(0) vortex.primitive(u64, len=4)
-    ├─(1) vortex.primitive(i32, len=2)
-    ├─(2) vortex.primitive(i32, len=1)
-    └─(3) vortex.primitive(i32, len=2)
+    ├─chunk_offsets: vortex.primitive(u64, len=4)
+    ├─chunks[0]: vortex.primitive(i32, len=2)
+    ├─chunks[1]: vortex.primitive(i32, len=1)
+    └─chunks[2]: vortex.primitive(i32, len=2)
 
     1. builder
-       append slot 1: vortex.primitive(i32, len=2)
-       append slot 2: vortex.primitive(i32, len=1)
-       append slot 3: vortex.primitive(i32, len=2)
+       append chunks[0]: vortex.primitive(i32, len=2)
+       append chunks[1]: vortex.primitive(i32, len=1)
+       append chunks[2]: vortex.primitive(i32, len=2)
        vortex.chunked(i32, len=5)
        -> vortex.primitive(i32, len=5)
     ");
@@ -713,6 +744,7 @@ fn trace_take_on_chunked() -> VortexResult<()> {
     // time, so the optimizer trace is empty.
     let traced = trace_op(|| take.optimize())?;
     insta::assert_snapshot!(traced.trace.to_string(), @"");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"");
 
     let optimized = traced.output;
     let traced = trace_op(|| {
@@ -734,6 +766,24 @@ fn trace_take_on_chunked() -> VortexResult<()> {
         child_execute_parent session[0]:execute_parent_fn slot=1 parent=vortex.dict(i32, len=4) child=vortex.primitive(i32, len=4) -> vortex.primitive(i32, len=4)
       iter 2 current=vortex.primitive(i32, len=4) builder_active=false
       return output=vortex.primitive(i32, len=4)
+    ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
+    [execute_until AnyCanonical]
+    vortex.dict(i32, len=4)
+    ├─codes: vortex.primitive(u64, len=4)
+    └─values: vortex.chunked(i32, len=5)
+       ├─chunk_offsets: vortex.primitive(u64, len=3)
+       ├─chunks[0]: vortex.primitive(i32, len=2)
+       └─chunks[1]: vortex.primitive(i32, len=3)
+
+    1. child_execute_parent session[0]:execute_parent_fn from values
+       vortex.dict(i32, len=4)
+       -> vortex.dict(i32, len=4)
+          ├─codes: vortex.primitive(u64, len=4)
+          └─values: vortex.primitive(i32, len=4)
+    2. child_execute_parent session[0]:execute_parent_fn from values
+       vortex.dict(i32, len=4)
+       -> vortex.primitive(i32, len=4)
     ");
 
     Ok(())
@@ -774,40 +824,40 @@ fn trace_filter_on_struct_with_complex_children() -> VortexResult<()> {
     insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
     [optimize]
     vortex.filter({name=utf8, score=i64}, len=3)
-    └─(0) vortex.struct({name=utf8, score=i64}, len=5)
-       ├─(1) vortex.dict(utf8, len=5)
-       │  ├─(0) vortex.primitive(u32, len=5)
-       │  └─(1) vortex.varbinview(utf8, len=3)
-       └─(2) vortex.chunked(i64, len=5)
-          ├─(0) vortex.primitive(u64, len=3)
-          ├─(1) vortex.primitive(i64, len=2)
-          └─(2) vortex.primitive(i64, len=3)
+    └─child: vortex.struct({name=utf8, score=i64}, len=5)
+       ├─name: vortex.dict(utf8, len=5)
+       │  ├─codes: vortex.primitive(u32, len=5)
+       │  └─values: vortex.varbinview(utf8, len=3)
+       └─score: vortex.chunked(i64, len=5)
+          ├─chunk_offsets: vortex.primitive(u64, len=3)
+          ├─chunks[0]: vortex.primitive(i64, len=2)
+          └─chunks[1]: vortex.primitive(i64, len=3)
 
-    1. reduce FilterStructRule, by (1)
+    1. reduce FilterStructRule, by D1
        vortex.filter({name=utf8, score=i64}, len=3)
        -> vortex.struct({name=utf8, score=i64}, len=3)
-          ├─(1) vortex.dict(utf8, len=3)
-          │  ├─(0) vortex.filter(u32, len=3)
-          │  │  └─(0) vortex.primitive(u32, len=5)
-          │  └─(1) vortex.varbinview(utf8, len=3)
-          └─(2) vortex.filter(i64, len=3)
-             └─(0) vortex.chunked(i64, len=5)
-                ├─(0) vortex.primitive(u64, len=3)
-                ├─(1) vortex.primitive(i64, len=2)
-                └─(2) vortex.primitive(i64, len=3)
+          ├─name: vortex.dict(utf8, len=3)
+          │  ├─codes: vortex.filter(u32, len=3)
+          │  │  └─child: vortex.primitive(u32, len=5)
+          │  └─values: vortex.varbinview(utf8, len=3)
+          └─score: vortex.filter(i64, len=3)
+             └─child: vortex.chunked(i64, len=5)
+                ├─chunk_offsets: vortex.primitive(u64, len=3)
+                ├─chunks[0]: vortex.primitive(i64, len=2)
+                └─chunks[1]: vortex.primitive(i64, len=3)
 
-    (1) optimize
+    D1: optimize
     vortex.filter(utf8, len=3)
-    └─(0) vortex.dict(utf8, len=5)
-       ├─(0) vortex.primitive(u32, len=5)
-       └─(1) vortex.varbinview(utf8, len=3)
+    └─child: vortex.dict(utf8, len=5)
+       ├─codes: vortex.primitive(u32, len=5)
+       └─values: vortex.varbinview(utf8, len=3)
 
-    1. reduce_parent static:FilterReduceAdaptor(Dict) slot=0
+    1. reduce_parent static:FilterReduceAdaptor(Dict) from child
        vortex.filter(utf8, len=3)
        -> vortex.dict(utf8, len=3)
-          ├─(0) vortex.filter(u32, len=3)
-          │  └─(0) vortex.primitive(u32, len=5)
-          └─(1) vortex.varbinview(utf8, len=3)
+          ├─codes: vortex.filter(u32, len=3)
+          │  └─child: vortex.primitive(u32, len=5)
+          └─values: vortex.varbinview(utf8, len=3)
     ");
 
     let optimized = traced.output;
@@ -834,6 +884,7 @@ fn trace_filter_on_struct_with_complex_children() -> VortexResult<()> {
       iter 0 current=vortex.struct({name=utf8, score=i64}, len=3) builder_active=false
       return output=vortex.struct({name=utf8, score=i64}, len=3)
     ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"");
 
     Ok(())
 }
@@ -854,6 +905,22 @@ fn trace_compare_on_dict() -> VortexResult<()> {
     optimize root=vortex.binary(bool, len=5) session=false
       reduce_parent static:DictionaryScalarFnValuesPushDownRule slot=0 parent=vortex.binary(bool, len=5) child=vortex.dict(i32, len=5) -> vortex.dict(bool, len=5)
       done output=vortex.dict(bool, len=5)
+    ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
+    [optimize]
+    vortex.binary(bool, len=5)
+    ├─lhs: vortex.dict(i32, len=5)
+    │  ├─codes: vortex.primitive(u32, len=5)
+    │  └─values: vortex.primitive(i32, len=3)
+    └─rhs: vortex.constant(i32, len=5)
+
+    1. reduce_parent static:DictionaryScalarFnValuesPushDownRule from lhs
+       vortex.binary(bool, len=5)
+       -> vortex.dict(bool, len=5)
+          ├─codes: vortex.primitive(u32, len=5)
+          └─values: vortex.binary(bool, len=3)
+             ├─lhs: vortex.primitive(i32, len=3)
+             └─rhs: vortex.constant(i32, len=3)
     ");
 
     let optimized = traced.output;
@@ -881,6 +948,32 @@ fn trace_compare_on_dict() -> VortexResult<()> {
       iter 4 current=vortex.bool(bool, len=5) builder_active=false
       return output=vortex.bool(bool, len=5)
     ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
+    [execute_until AnyCanonical]
+    vortex.dict(bool, len=5)
+    ├─codes: vortex.primitive(u32, len=5)
+    └─values: vortex.binary(bool, len=3)
+       ├─lhs: vortex.primitive(i32, len=3)
+       └─rhs: vortex.constant(i32, len=3)
+
+    1. values reduced, by D1
+       vortex.dict(bool, len=5)
+       -> vortex.dict(bool, len=5)
+          ├─codes: vortex.primitive(u32, len=5)
+          └─values: vortex.bool(bool, len=3)
+    2. child_execute_parent session[0]:execute_parent_fn from values
+       vortex.dict(bool, len=5)
+       -> vortex.bool(bool, len=5)
+
+    D1: values of vortex.dict(bool, len=5)
+    vortex.binary(bool, len=3)
+    ├─lhs: vortex.primitive(i32, len=3)
+    └─rhs: vortex.constant(i32, len=3)
+
+    1. execute vortex.binary
+       vortex.binary(bool, len=3)
+       -> vortex.bool(bool, len=3)
+    ");
 
     Ok(())
 }
@@ -905,6 +998,22 @@ fn trace_like_on_dict() -> VortexResult<()> {
     optimize root=vortex.like(bool, len=6) session=false
       reduce_parent static:LikeReduceAdaptor(Dict) slot=0 parent=vortex.like(bool, len=6) child=vortex.dict(utf8, len=6) -> vortex.dict(bool, len=6)
       done output=vortex.dict(bool, len=6)
+    ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
+    [optimize]
+    vortex.like(bool, len=6)
+    ├─child: vortex.dict(utf8, len=6)
+    │  ├─codes: vortex.primitive(u32, len=6)
+    │  └─values: vortex.varbinview(utf8, len=3)
+    └─pattern: vortex.constant(utf8, len=6)
+
+    1. reduce_parent static:LikeReduceAdaptor(Dict) from child
+       vortex.like(bool, len=6)
+       -> vortex.dict(bool, len=6)
+          ├─codes: vortex.primitive(u32, len=6)
+          └─values: vortex.like(bool, len=3)
+             ├─child: vortex.varbinview(utf8, len=3)
+             └─pattern: vortex.constant(utf8, len=3)
     ");
 
     let optimized = traced.output;
@@ -931,6 +1040,32 @@ fn trace_like_on_dict() -> VortexResult<()> {
         child_execute_parent session[0]:execute_parent_fn slot=1 parent=vortex.dict(bool, len=6) child=vortex.bool(bool, len=3) -> vortex.bool(bool, len=6)
       iter 4 current=vortex.bool(bool, len=6) builder_active=false
       return output=vortex.bool(bool, len=6)
+    ");
+    insta::assert_snapshot!(traced.trace.derivation().to_string(), @"
+    [execute_until AnyCanonical]
+    vortex.dict(bool, len=6)
+    ├─codes: vortex.primitive(u32, len=6)
+    └─values: vortex.like(bool, len=3)
+       ├─child: vortex.varbinview(utf8, len=3)
+       └─pattern: vortex.constant(utf8, len=3)
+
+    1. values reduced, by D1
+       vortex.dict(bool, len=6)
+       -> vortex.dict(bool, len=6)
+          ├─codes: vortex.primitive(u32, len=6)
+          └─values: vortex.bool(bool, len=3)
+    2. child_execute_parent session[0]:execute_parent_fn from values
+       vortex.dict(bool, len=6)
+       -> vortex.bool(bool, len=6)
+
+    D1: values of vortex.dict(bool, len=6)
+    vortex.like(bool, len=3)
+    ├─child: vortex.varbinview(utf8, len=3)
+    └─pattern: vortex.constant(utf8, len=3)
+
+    1. execute vortex.like
+       vortex.like(bool, len=3)
+       -> vortex.bool(bool, len=3)
     ");
 
     Ok(())

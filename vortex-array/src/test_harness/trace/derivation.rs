@@ -5,39 +5,39 @@
 //! the optimizer and executor implement.
 //!
 //! A derivation is one reduction sequence on one array: its starting tree, with each child
-//! labelled by slot index, followed by its steps. Each step is a pair, the array before and the
-//! array after, under the rule that justified it. A step that needed a reduction somewhere else
-//! first, such as a child slot the parent asked for or an optimize pass run inside an encoding's
-//! execute, cites it as `(n)`. Derivation `(n)` is written out in full further down, in the
-//! order it is first cited, the way a proof names a subderivation and gives it separately.
+//! labelled by its slot name, followed by its steps. Each step is a pair, the array before and
+//! the array after, under the rule that justified it. A step that needed another reduction
+//! first, such as a child the parent asked to have reduced or an optimize pass run inside an
+//! encoding's execute, cites it as `Dn`. Derivation `Dn` is written out in full further down, in
+//! the order it is first cited, the way a proof names a subderivation and gives it separately.
 //!
 //! ```text
 //! [execute_until AnyCanonical]
 //! vortex.filter(i32, len=2)
-//! └─(0) vortex.filter(i32, len=4)
-//!    └─(0) vortex.primitive(i32, len=6)
+//! └─child: vortex.filter(i32, len=4)
+//!    └─child: vortex.primitive(i32, len=6)
 //!
 //! 1. execute vortex.filter
 //!    vortex.filter(i32, len=2)
 //!    -> vortex.slice(i32, len=2)
-//! 2. slot 0, by (1)
+//! 2. child reduced, by D1
 //!    vortex.slice(i32, len=2)
 //!    -> vortex.slice(i32, len=2)
-//!       └─(0) vortex.primitive(i32, len=4)
-//! 3. execute vortex.slice, by (2)
-//!    vortex.slice(i32, len=2)
-//!    -> vortex.primitive(i32, len=2)
+//!       └─child: vortex.primitive(i32, len=4)
+//! 3. execute vortex.slice, by D2
+//!    ...
 //!
-//! (1) slot 0 of vortex.slice(i32, len=2)
+//! D1: child of vortex.slice(i32, len=2)
 //! vortex.filter(i32, len=4)
-//! └─(0) vortex.primitive(i32, len=6)
+//! └─child: vortex.primitive(i32, len=6)
 //!
 //! 1. execute vortex.filter
 //!    ...
 //! ```
 //!
 //! After a step, the whole tree below the array is printed only when the step changed it. When
-//! only the array itself changed, the right side is its one-line summary. At
+//! only the array itself changed, the right side is its one-line summary. Rules that act on a
+//! parent through one of its children name that child: `reduce_parent ... from codes`. At
 //! [`TraceResolution::Attempts`](super::TraceResolution::Attempts), rules and kernels that were
 //! tried and declined before a step are listed under it as `x ...`.
 
@@ -81,7 +81,8 @@ impl Display for DerivationDisplay<'_> {
 /// The array tree as displayed: one summary per node, children in slot order.
 struct Tree {
     array: ArrayRef,
-    children: Vec<(usize, Tree)>,
+    /// Children in slot order, labelled by slot name.
+    children: Vec<(String, Tree)>,
 }
 
 impl Tree {
@@ -92,7 +93,10 @@ impl Tree {
                 .slots()
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, slot)| slot.as_ref().map(|child| (idx, Tree::of(child))))
+                .filter_map(|(idx, slot)| {
+                    slot.as_ref()
+                        .map(|child| (array.slot_name(idx), Tree::of(child)))
+                })
                 .collect(),
         }
     }
@@ -109,13 +113,13 @@ impl Tree {
         out.push_str(&self.array.to_string());
         out.push('\n');
         let last = self.children.len().saturating_sub(1);
-        for (pos, (idx, child)) in self.children.iter().enumerate() {
+        for (pos, (name, child)) in self.children.iter().enumerate() {
             let (branch, extend) = if pos == last {
                 ("└─", "   ")
             } else {
                 ("├─", "│  ")
             };
-            out.push_str(&format!("{prefix}{branch}({idx}) "));
+            out.push_str(&format!("{prefix}{branch}{name}: "));
             child.render(out, &format!("{prefix}{extend}"));
         }
     }
@@ -164,11 +168,11 @@ impl Derivation {
                 *next += 1;
                 number
             });
-            format!("({number})")
+            format!("D{number}")
         };
 
         match number {
-            Some(number) => out.push_str(&format!("({number}) {}\n", self.label)),
+            Some(number) => out.push_str(&format!("D{number}: {}\n", self.label)),
             None => out.push_str(&format!("[{}]\n", self.label)),
         }
         self.start.render(out, "");
@@ -214,7 +218,7 @@ enum FrameKind {
     /// A child slot the parent asked for with `ExecuteSlot`.
     Slot {
         parent: ArrayRef,
-        slot_idx: usize,
+        name: String,
     },
     /// A builder driven by `AppendChild`; closed by `builder finish`.
     Builder,
@@ -240,6 +244,11 @@ impl Frame {
             pending_refs: Vec::new(),
         }
     }
+}
+
+/// The name of `parent`'s slot `idx`, e.g. `codes` or `values`.
+fn slot(parent: &ArrayRef, idx: usize) -> String {
+    parent.slot_name(idx)
 }
 
 fn build(trace: &TraceDisplay) -> (Vec<Derivation>, Vec<usize>) {
@@ -380,8 +389,8 @@ impl Builder {
         let Some(mut popped) = self.frames.pop() else {
             return (None, Vec::new());
         };
-        let (parent, slot_idx) = match &popped.kind {
-            FrameKind::Slot { parent, slot_idx } => (parent.clone(), *slot_idx),
+        let (parent, name) = match &popped.kind {
+            FrameKind::Slot { parent, name } => (parent.clone(), name.clone()),
             _ => return (None, Vec::new()),
         };
         let id = popped
@@ -398,7 +407,7 @@ impl Builder {
         match output {
             Some(output) => {
                 self.set_current(&parent);
-                self.step(format!("slot {slot_idx}"), output, refs);
+                self.step(format!("{name} reduced"), output, refs);
                 (None, Vec::new())
             }
             None => (Some(parent), refs),
@@ -444,9 +453,13 @@ impl Builder {
                 slot_idx,
                 input,
                 output,
-            } => self.note(format!(
-                "optimize_recursive slot {slot_idx}: {input} -> {output}"
-            )),
+            } => {
+                let name = self
+                    .recording()
+                    .and_then(|frame| frame.current.as_ref())
+                    .map_or_else(|| slot_idx.to_string(), |parent| slot(parent, *slot_idx));
+                self.note(format!("optimize_recursive {name}: {input} -> {output}"));
+            }
             TraceEvent::ReduceAttempt { rule, outcome, .. } => {
                 self.note(format!("x reduce {rule}: {outcome}"));
             }
@@ -454,22 +467,28 @@ impl Builder {
                 self.step(format!("reduce {rule}"), &output.0, Vec::new());
             }
             TraceEvent::ParentReduceAttempt {
+                parent,
                 slot_idx,
                 source,
                 rule,
                 outcome,
                 ..
             } => self.note(format!(
-                "x reduce_parent {source}:{rule} slot={slot_idx}: {outcome}"
+                "x reduce_parent {source}:{rule} from {}: {outcome}",
+                slot(&parent.0, *slot_idx)
             )),
             TraceEvent::ParentReduceApplied {
+                parent,
                 slot_idx,
                 source,
                 rule,
                 output,
                 ..
             } => self.step(
-                format!("reduce_parent {source}:{rule} slot={slot_idx}"),
+                format!(
+                    "reduce_parent {source}:{rule} from {}",
+                    slot(&parent.0, *slot_idx)
+                ),
                 &output.0,
                 Vec::new(),
             ),
@@ -484,16 +503,19 @@ impl Builder {
             }
             TraceEvent::ExecuteParentAttempt {
                 phase,
+                parent,
                 slot_idx,
                 source,
                 kernel,
                 outcome,
                 ..
             } => self.note(format!(
-                "x {phase} {source}:{kernel} slot={slot_idx}: {outcome}"
+                "x {phase} {source}:{kernel} from {}: {outcome}",
+                slot(&parent.0, *slot_idx)
             )),
             TraceEvent::ExecuteParentApplied {
                 phase,
+                parent,
                 slot_idx,
                 source,
                 kernel,
@@ -512,7 +534,10 @@ impl Builder {
                     refs = slot_refs;
                 }
                 self.step(
-                    format!("{phase} {source}:{kernel} slot={slot_idx}"),
+                    format!(
+                        "{phase} {source}:{kernel} from {}",
+                        slot(&parent.0, *slot_idx)
+                    ),
                     &output.0,
                     refs,
                 );
@@ -541,15 +566,18 @@ impl Builder {
                 parent,
                 child,
             } => match *step {
-                "ExecuteSlot" => self.open(
-                    FrameKind::Slot {
-                        parent: parent.0.clone(),
-                        slot_idx: *slot_idx,
-                    },
-                    format!("slot {slot_idx} of {parent}"),
-                    &child.0,
-                ),
-                _ => self.note(format!("append slot {slot_idx}: {child}")),
+                "ExecuteSlot" => {
+                    let name = slot(&parent.0, *slot_idx);
+                    self.open(
+                        FrameKind::Slot {
+                            parent: parent.0.clone(),
+                            name: name.clone(),
+                        },
+                        format!("{name} of {parent}"),
+                        &child.0,
+                    );
+                }
+                _ => self.note(format!("append {}: {child}", slot(&parent.0, *slot_idx))),
             },
             TraceEvent::BuilderEvent { action, array, .. } => match *action {
                 "start" => self.frames.push(Frame::new(FrameKind::Builder, None, None)),
