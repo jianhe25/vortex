@@ -5,7 +5,7 @@ mod array;
 pub use array::BitPackedArrayExt;
 pub use array::BitPackedArraySlotsExt;
 pub use array::BitPackedData;
-pub use array::BitPackedParts;
+pub use array::BitPackedDataParts;
 pub use array::BitPackedSlots;
 pub use array::bitpack_compress;
 pub use array::bitpack_decompress;
@@ -24,6 +24,3 @@ pub use vtable::BitPackedArray;
 pub(crate) fn initialize(session: &vortex_session::VortexSession) {
     vtable::initialize(session);
 }
-
-#[cfg(test)]
-mod block_offsets_tests;

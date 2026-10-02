@@ -34,6 +34,9 @@ pub mod bitpack_compress;
 pub mod bitpack_decompress;
 pub mod unpack_iter;
 
+#[cfg(test)]
+mod tests;
+
 use crate::BitPackedArray;
 use crate::FL_CHUNK_SIZE;
 use crate::bitpack_compress::bitpack_encode;
@@ -185,7 +188,7 @@ where
 }
 
 /// The packed payload and children extracted from a [`BitPackedArray`].
-pub struct BitPackedParts {
+pub struct BitPackedDataParts {
     /// The position of the first logical value within the first packed block.
     pub offset: u16,
     /// Byte boundaries of the packed blocks, including the trailing end boundary.
