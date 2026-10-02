@@ -104,6 +104,20 @@ impl Dataset {
         }
     }
 
+    /// Long enough to share leading codes with every match, so LIKE compares those codes as
+    /// bytes instead of running the prefix DFA.
+    fn long_prefix_pattern(&self) -> &'static str {
+        match self {
+            Self::Urls => "https://github.com/%",
+            Self::Cb => "https://www.google.com/catalog/%",
+            Self::Log => "203.0.113.50 - - [15/Mar/2024:10:%",
+            Self::Json => r#"{"id":5000%"#,
+            Self::Path => "/home/user/target/release/%",
+            Self::Email => "john.doe12%",
+            Self::Rare => "xyzzyxyzzy%",
+        }
+    }
+
     fn contains_pattern(&self) -> &'static str {
         match self {
             Self::Urls => "%google%",
@@ -138,6 +152,14 @@ fn bench_like(bencher: Bencher, fsst: &FSSTArray, pattern: &str) {
 ])]
 fn fsst_prefix(bencher: Bencher, dataset: &Dataset) {
     bench_like(bencher, dataset.fsst_array(), dataset.prefix_pattern());
+}
+
+#[divan::bench(args = [
+    Dataset::Urls, Dataset::Cb, Dataset::Log, Dataset::Json,
+    Dataset::Path, Dataset::Email, Dataset::Rare,
+])]
+fn fsst_prefix_long(bencher: Bencher, dataset: &Dataset) {
+    bench_like(bencher, dataset.fsst_array(), dataset.long_prefix_pattern());
 }
 
 #[divan::bench(args = [

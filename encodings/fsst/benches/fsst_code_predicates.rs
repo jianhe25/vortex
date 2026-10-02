@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Equality and prefix predicates evaluated on FSST codes, comparing the kernels against
-//! alternative strategies on the same data.
+//! Equality against a constant evaluated on FSST codes, comparing the registered compare kernel
+//! against alternative strategies on the same data: the codes routed through the VarBin compare,
+//! two direct loops that differ only in whether the uncompressed lengths are read to reject rows,
+//! and decompressing first. Each runs with the uncompressed lengths stored plain and bit-packed.
 //!
-//! Equality: the registered compare kernel, the codes routed through the VarBin compare, and two
-//! direct loops that differ only in whether the uncompressed lengths are read to reject rows.
-//! Each runs with the uncompressed lengths stored plain and bit-packed.
-//!
-//! Prefix: the registered LIKE kernel on short and long prefixes. Short prefixes run the DFA over
-//! the codes; long ones compare the codes every matching row opens with as raw bytes.
+//! Prefix (`LIKE 'prefix%'`) strategies are covered by the `fsst_like` bench.
 
 #![expect(clippy::unwrap_used)]
 
@@ -28,8 +25,6 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::IntegerPType;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::scalar::Scalar;
-use vortex_array::scalar_fn::fns::like::Like;
-use vortex_array::scalar_fn::fns::like::LikeOptions;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::ByteBuffer;
@@ -38,12 +33,7 @@ use vortex_fsst::FSST;
 use vortex_fsst::FSSTArray;
 use vortex_fsst::FSSTArrayExt;
 use vortex_fsst::FSSTArraySlotsExt;
-use vortex_fsst::test_utils::make_fsst_clickbench_urls;
-use vortex_fsst::test_utils::make_fsst_emails;
-use vortex_fsst::test_utils::make_fsst_file_paths;
-use vortex_fsst::test_utils::make_fsst_json_strings;
-use vortex_fsst::test_utils::make_fsst_log_lines;
-use vortex_fsst::test_utils::make_fsst_short_urls;
+use vortex_fsst::test_utils::NUM_STRINGS;
 use vortex_fsst::test_utils::make_fsst_urls;
 use vortex_session::VortexSession;
 
@@ -60,7 +50,7 @@ static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session
 });
 
-const N: usize = 1_000_000;
+const N: usize = NUM_STRINGS;
 
 fn with_bitpacked_lengths(fsst: &FSSTArray) -> FSSTArray {
     let mut ctx = SESSION.create_execution_ctx();
@@ -252,138 +242,4 @@ fn eq_decompress(bencher: Bencher, lengths: Lengths) {
                 .execute::<BoolArray>(ctx)
                 .unwrap()
         });
-}
-
-// ---------------------------------------------------------------------------
-// Prefix
-// ---------------------------------------------------------------------------
-
-static PREFIX_URLS: LazyLock<FSSTArray> =
-    LazyLock::new(|| make_fsst_short_urls(N, &mut SESSION.create_execution_ctx()));
-static PREFIX_CB: LazyLock<FSSTArray> =
-    LazyLock::new(|| make_fsst_clickbench_urls(N, &mut SESSION.create_execution_ctx()));
-static PREFIX_LOG: LazyLock<FSSTArray> =
-    LazyLock::new(|| make_fsst_log_lines(N, &mut SESSION.create_execution_ctx()));
-static PREFIX_JSON: LazyLock<FSSTArray> =
-    LazyLock::new(|| make_fsst_json_strings(N, &mut SESSION.create_execution_ctx()));
-static PREFIX_PATH: LazyLock<FSSTArray> =
-    LazyLock::new(|| make_fsst_file_paths(N, &mut SESSION.create_execution_ctx()));
-static PREFIX_EMAIL: LazyLock<FSSTArray> =
-    LazyLock::new(|| make_fsst_emails(N, &mut SESSION.create_execution_ctx()));
-
-#[derive(Clone, Copy)]
-enum Dataset {
-    Urls,
-    Cb,
-    Log,
-    Json,
-    Path,
-    Email,
-}
-
-impl Dataset {
-    fn array(self) -> &'static FSSTArray {
-        match self {
-            Self::Urls => &PREFIX_URLS,
-            Self::Cb => &PREFIX_CB,
-            Self::Log => &PREFIX_LOG,
-            Self::Json => &PREFIX_JSON,
-            Self::Path => &PREFIX_PATH,
-            Self::Email => &PREFIX_EMAIL,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Case {
-    name: &'static str,
-    dataset: Dataset,
-    prefix: &'static str,
-}
-
-impl fmt::Display for Case {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name)
-    }
-}
-
-const CASES: &[Case] = &[
-    Case {
-        name: "urls_short",
-        dataset: Dataset::Urls,
-        prefix: "https",
-    },
-    Case {
-        name: "urls_long",
-        dataset: Dataset::Urls,
-        prefix: "https://github.com/",
-    },
-    Case {
-        name: "cb_short",
-        dataset: Dataset::Cb,
-        prefix: "https://www.",
-    },
-    Case {
-        name: "cb_long",
-        dataset: Dataset::Cb,
-        prefix: "https://www.google.com/catalog/",
-    },
-    Case {
-        name: "log_short",
-        dataset: Dataset::Log,
-        prefix: "192.168",
-    },
-    Case {
-        name: "log_long",
-        dataset: Dataset::Log,
-        prefix: "203.0.113.50 - - [15/Mar/2024:10:",
-    },
-    Case {
-        name: "json_short",
-        dataset: Dataset::Json,
-        prefix: r#"{"id"#,
-    },
-    Case {
-        name: "json_long",
-        dataset: Dataset::Json,
-        prefix: r#"{"id":5000"#,
-    },
-    Case {
-        name: "path_short",
-        dataset: Dataset::Path,
-        prefix: "/home",
-    },
-    Case {
-        name: "path_long",
-        dataset: Dataset::Path,
-        prefix: "/home/user/target/release/",
-    },
-    Case {
-        name: "email_short",
-        dataset: Dataset::Email,
-        prefix: "john",
-    },
-    Case {
-        name: "email_long",
-        dataset: Dataset::Email,
-        prefix: "john.doe@",
-    },
-];
-
-fn like_prefix(fsst: &FSSTArray, prefix: &str, ctx: &mut vortex_array::ExecutionCtx) -> BoolArray {
-    let pattern = ConstantArray::new(format!("{prefix}%"), fsst.len()).into_array();
-    Like::try_new(fsst.clone().into_array(), pattern, LikeOptions::default())
-        .unwrap()
-        .into_array()
-        .execute::<BoolArray>(ctx)
-        .unwrap()
-}
-
-/// The registered LIKE kernel.
-#[divan::bench(args = CASES)]
-fn prefix_like(bencher: Bencher, case: &Case) {
-    let fsst = case.dataset.array();
-    bencher
-        .with_inputs(|| SESSION.create_execution_ctx())
-        .bench_refs(|ctx| like_prefix(fsst, case.prefix, ctx));
 }
