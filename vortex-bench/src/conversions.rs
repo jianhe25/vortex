@@ -34,7 +34,7 @@ use vortex::array::arrays::Struct;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::VarBinViewArray;
 use vortex::array::arrays::struct_::StructArrayExt;
-use vortex::array::builders::builder_with_capacity;
+use vortex::array::builders::builder_with_capacity_in;
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::array::stream::ArrayStreamExt;
 use vortex::compressor::BtrBlocksCompressorBuilder;
@@ -154,13 +154,11 @@ pub async fn parquet_to_vortex_chunks_with_batch_size(
 fn record_batch_to_vortex(batch: RecordBatch) -> VortexResult<ArrayRef> {
     let schema = batch.schema();
     let chunk = SESSION.arrow().from_arrow_record_batch(batch, &schema)?;
-    let mut builder = builder_with_capacity(chunk.dtype(), chunk.len());
+    let mut ctx = VortexSession::default().create_execution_ctx();
+    let mut builder = builder_with_capacity_in(chunk.dtype(), chunk.len(), ctx.allocator());
 
     // Canonicalize the chunk.
-    chunk.append_to_builder(
-        builder.as_mut(),
-        &mut VortexSession::default().create_execution_ctx(),
-    )?;
+    chunk.append_to_builder(builder.as_mut(), &mut ctx)?;
 
     Ok(builder.finish())
 }
@@ -247,10 +245,11 @@ fn write_options_for(
         return compaction.apply_options(SESSION.write_options());
     }
 
-    let mut builder = WriteStrategyBuilder::default();
+    let mut builder = WriteStrategyBuilder::from_session(&SESSION);
     if matches!(compaction, CompactionStrategy::Compact) {
-        builder =
-            builder.with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact());
+        builder = builder.with_btrblocks_builder(
+            BtrBlocksCompressorBuilder::from_session(&SESSION).with_compact(),
+        );
     }
     for name in binary_fields {
         builder = builder.with_field_writer(FieldPath::from_name(name), no_dict_layout());
@@ -262,7 +261,7 @@ fn write_options_for(
 fn no_dict_layout() -> Arc<dyn LayoutStrategy> {
     Arc::new(CompressingStrategy::new(
         ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
-        BtrBlocksCompressorBuilder::default().build(),
+        BtrBlocksCompressorBuilder::from_session(&SESSION).build(),
     ))
 }
 

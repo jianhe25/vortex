@@ -320,7 +320,11 @@ pub fn execute_via_chunks(
     let len = array.len();
     let validity_mask = array.validity()?.execute_mask(len, ctx)?;
     match_each_native_ptype!(array.dtype().as_ptype(), |T| {
-        let mut builder = PrimitiveBuilder::<T>::with_capacity(array.dtype().nullability(), len);
+        let mut builder = PrimitiveBuilder::<T>::with_capacity_in(
+            array.dtype().nullability(),
+            len,
+            ctx.allocator(),
+        );
         let mut uninit_range = builder.uninit_range(len);
         // SAFETY: every value slot is initialized by the chunk stream below, which covers
         // exactly 0..len (checked in debug builds).

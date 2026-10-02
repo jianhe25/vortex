@@ -5,11 +5,10 @@
 
 //! A library for working with custom aligned buffers of sized values.
 //!
-//! The `vortex-buffer` crate is built around `bytes::Bytes` and therefore supports zero-copy
-//! cloning and slicing, but differs in that it can define and maintain a custom alignment.
+//! The `vortex-buffer` crate supports zero-copy cloning and slicing with a custom allocator and
+//! runtime alignment.
 //!
-//! * `Buffer<T>` and `BufferMut<T>` provide immutable and mutable wrappers around `bytes::Bytes`
-//!   and `bytes::BytesMut` respectively.
+//! * `Buffer<T>` and `BufferMut<T>` provide immutable and mutable typed buffers.
 //! * `ByteBuffer` and `ByteBufferMut` are type aliases for `u8` buffers.
 //! * `BufferString` is a wrapper around a `ByteBuffer` that enforces utf-8 encoding.
 //! * `ConstBuffer<T, const A: usize>` provides similar functionality to `Buffer<T>` except with a
@@ -47,21 +46,23 @@
 //! `arrow_buffer::OffsetBuffer`.
 
 pub use alignment::*;
+pub use allocation::*;
 pub use bit::*;
 pub use buffer::*;
 pub use buffer_mut::*;
 pub use bytes::*;
-pub use r#const::*;
+pub use const_::*;
 pub use dispatch::*;
 pub use string::*;
 mod alignment;
+mod allocation;
 #[cfg(feature = "arrow")]
 mod arrow;
 mod bit;
 mod buffer;
 mod buffer_mut;
 mod bytes;
-mod r#const;
+mod const_;
 mod debug;
 mod dispatch;
 mod macros;

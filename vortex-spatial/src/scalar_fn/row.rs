@@ -11,9 +11,12 @@ use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
+use vortex_array::memory::BufferAllocatorRef;
 use vortex_array::scalar_fn::unstable::row::InputElement;
 use vortex_array::scalar_fn::unstable::row::OutputSink;
+use vortex_array::scalar_fn::unstable::row::Preinitialized;
 use vortex_array::scalar_fn::unstable::row::RowVisitor;
+use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
@@ -66,6 +69,7 @@ pub(crate) struct GeometryRow;
 // below that length is valid for both checked and unchecked access.
 unsafe impl InputElement for GeometryRow {
     type Column = Vec<Geometry<f64>>;
+    type Constant = Geometry<f64>;
     type View<'a> = &'a [Geometry<f64>];
     type Elem<'a> = &'a Geometry<f64>;
 
@@ -88,8 +92,25 @@ unsafe impl InputElement for GeometryRow {
         geometries(&array, ctx)
     }
 
+    fn decode_constant(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self::Constant> {
+        let mut geometries = Self::decode(array.slice(0..1)?, ctx)?;
+        vortex_ensure!(
+            geometries.len() == 1,
+            "a geometry batch constant must decode to one value, got {}",
+            geometries.len(),
+        );
+
+        Ok(geometries
+            .pop()
+            .vortex_expect("the geometry batch constant length was validated"))
+    }
+
     fn get(column: &Self::Column, index: usize) -> &Geometry<f64> {
         &column[index]
+    }
+
+    fn get_constant(constant: &Self::Constant) -> &Geometry<f64> {
+        constant
     }
 
     fn view(column: &Self::Column) -> Self::View<'_> {
@@ -116,6 +137,7 @@ unsafe impl InputElement for GeometryRow {
 /// Row output for native 2-D polygons.
 pub(crate) struct PolygonSink {
     polygons: Vec<GeoPolygon<f64>>,
+    allocator: BufferAllocatorRef,
 }
 
 fn empty_polygon() -> GeoPolygon<f64> {
@@ -123,38 +145,40 @@ fn empty_polygon() -> GeoPolygon<f64> {
 }
 
 // SAFETY: `with_capacity` creates one initialized polygon per output row, and `Rows` is the
-// corresponding mutable slice. Every in-bounds index therefore names one distinct initialized
-// polygon. The sink remains safe to finish or drop after any row prefix.
+// corresponding mutable slice, marked `Preinitialized` so the default skipped-row initializer
+// leaves it untouched. Every in-bounds index therefore names one distinct initialized polygon.
+// The sink remains safe to finish or drop after any row prefix.
 unsafe impl OutputSink for PolygonSink {
     type Params = ();
-    type Rows<'a> = &'a mut [GeoPolygon<f64>];
+    type Rows<'a> = Preinitialized<&'a mut [GeoPolygon<f64>]>;
     type Row<'a> = &'a mut GeoPolygon<f64>;
     type WriteToken = ();
-
-    fn skipped_rows_initializer() -> Option<for<'a> fn(&mut Self::Rows<'a>)> {
-        Some(|_| {})
-    }
 
     fn storage_dtype((): &Self::Params) -> DType {
         polygon_storage_dtype(Dimension::Xy, Nullability::NonNullable)
     }
 
-    fn with_capacity(rows: usize, (): &Self::Params) -> VortexResult<Self> {
+    fn with_capacity(
+        rows: usize,
+        (): &Self::Params,
+        allocator: &BufferAllocatorRef,
+    ) -> VortexResult<Self> {
         Ok(Self {
             polygons: vec![empty_polygon(); rows],
+            allocator: allocator.clone(),
         })
     }
 
     fn rows(&mut self) -> Self::Rows<'_> {
-        self.polygons.as_mut_slice()
+        Preinitialized(self.polygons.as_mut_slice())
     }
 
     unsafe fn row_unchecked<'a>(rows: &'a mut Self::Rows<'_>, index: usize) -> Self::Row<'a> {
         // SAFETY: required by this method's contract.
-        unsafe { rows.get_unchecked_mut(index) }
+        unsafe { rows.0.get_unchecked_mut(index) }
     }
 
     unsafe fn finish(self) -> VortexResult<ArrayRef> {
-        build_polygon_storage(&self.polygons)
+        build_polygon_storage(&self.polygons, &self.allocator)
     }
 }

@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 60
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=bench-dedicated/family=c6id.8xlarge/tag=build-{1}{2}', github.run_id, inputs.benchmark_id, github.event.pull_request.head.repo.fork == false && '/extras=s3-cache' || '')
+          && format('runs-on={0}/runner=bench-dedicated/family=c8gd.8xlarge/image=ubuntu24-full-arm64-pre-v2/tag=build-{1}{2}', github.run_id, inputs.benchmark_id, github.event.pull_request.head.repo.fork == false && '/extras=s3-cache' || '')
           || 'ubuntu-latest' }}
     steps:
       - uses: runs-on/action@v2
@@ -43,7 +43,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
-      - uses: ./.github/actions/setup-rust
+      - uses: ./.github/actions/setup-prebuild
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           enable-sccache: ${{ github.event.pull_request.head.repo.fork == false && 'true' || 'false' }}
@@ -53,7 +53,7 @@ jobs:
           RUSTFLAGS: "-C target-cpu=native -C force-frame-pointers=yes"
         run: |
           cargo build --package ${{ inputs.benchmark_id }} --profile release_debug \
-            --features ${{ inputs.with_lance && 'lance,' || '' }}unstable_encodings
+            ${{ inputs.with_lance && '--features lance' || '' }}
       - name: Pre-upload benchmark debuginfo to Polar Signals
         if: github.event.pull_request.head.repo.fork == false
         uses: ./.github/actions/upload-parca-debuginfo
@@ -75,7 +75,7 @@ jobs:
     timeout-minutes: 120
     runs-on: >-
       ${{ github.repository == 'vortex-data/vortex'
-          && format('runs-on={0}/runner=bench-dedicated/family=c6id.metal/tag={1}{2}', github.run_id, inputs.benchmark_id, github.event.pull_request.head.repo.fork == false && '/extras=s3-cache' || '')
+          && format('runs-on={0}/runner=bench-dedicated/family=c8gd.metal-24xl/image=ubuntu24-full-arm64-pre-v2/tag={1}{2}', github.run_id, inputs.benchmark_id, github.event.pull_request.head.repo.fork == false && '/extras=s3-cache' || '')
           || 'ubuntu-latest' }}
     steps:
       # `extras=s3-cache` points ACTIONS_RESULTS_URL at the RunsOn artifact proxy, but only
@@ -130,7 +130,6 @@ jobs:
         shell: bash
         env:
           RUST_BACKTRACE: full
-          VORTEX_EXPERIMENTAL_PATCHED_ARRAY: "1"
           FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
         run: |
           python3 scripts/random-access-split.py
@@ -140,7 +139,6 @@ jobs:
         shell: bash
         env:
           RUST_BACKTRACE: full
-          VORTEX_EXPERIMENTAL_PATCHED_ARRAY: "1"
           FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
         run: |
           python3 scripts/compress-split.py
@@ -150,14 +148,13 @@ jobs:
         shell: bash
         env:
           RUST_BACKTRACE: full
-          VORTEX_EXPERIMENTAL_PATCHED_ARRAY: "1"
           FLAT_LAYOUT_INLINE_ARRAY_NODE: "1"
         run: |
           python3 scripts/string-split.py
 
       - name: Setup AWS CLI
         if: github.event.pull_request.head.repo.fork == false
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6
         with:
           role-to-assume: arn:aws:iam::245040174862:role/GitHubBenchmarkRole
           aws-region: us-east-1

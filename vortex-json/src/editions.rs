@@ -3,14 +3,23 @@
 
 //! The `json` edition family.
 //!
-//! JSON support is opt-in: a reader without this crate cannot resolve `vortex.json`, so the dtype
-//! lives in its own family rather than in `core`. [`crate::initialize`] registers and enables the
-//! edition together with the dtype plugin.
+//! JSON support is opt-in. [`crate::initialize`] registers and enables the edition together with
+//! the dtype plugin.
 
 use vortex_edition::Edition;
 use vortex_edition::EditionDeclaration;
+use vortex_edition::EditionFamily;
 use vortex_edition::EditionId;
 use vortex_edition::EditionMember;
+
+/// The `json` family: the JSON extension dtype.
+pub static FAMILY: EditionFamily = EditionFamily {
+    name: "json",
+    origin: "vortex-json",
+    doc: "The JSON extension dtype. JSON support is opt-in: a reader built without \
+`vortex-json` cannot resolve `vortex.json`, so the dtype is versioned independently of \
+`core` and a session enables this family only by initializing the crate.",
+};
 
 /// The August 2026 draft edition of the `json` family.
 pub const JSON_2026_08: EditionId = EditionId::new("json", 2026, 8, 0);
@@ -23,7 +32,7 @@ pub const JSON_2026_08: EditionId = EditionId::new("json", 2026, 8, 0);
 pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
         id: JSON_2026_08,
-        min_vortex_version: None,
+        min_library_version: None,
     },
     added: &[EditionMember::dtype(&"vortex.json")],
 };
@@ -31,9 +40,9 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
 #[cfg(test)]
 mod tests {
     use vortex_edition::ComponentKind;
-    use vortex_edition::EditionError;
     use vortex_edition::EditionSessionExt;
     use vortex_edition::test_harness::validate_edition;
+    use vortex_error::VortexResult;
 
     use super::*;
 
@@ -44,7 +53,7 @@ mod tests {
     }
 
     #[test]
-    fn json_edition_is_valid() -> Result<(), EditionError> {
+    fn json_edition_is_valid() -> VortexResult<()> {
         let session = json_session();
         validate_edition(&session.editions(), &JSON_2026_08)
     }

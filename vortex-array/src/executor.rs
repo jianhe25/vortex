@@ -17,6 +17,7 @@ use std::fmt;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::OnceLock;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicUsize;
 #[cfg(debug_assertions)]
@@ -38,7 +39,7 @@ use crate::builders::ArrayBuilder;
 use crate::builders::builder_with_capacity_in;
 use crate::dtype::DType;
 use crate::matcher::Matcher;
-use crate::memory::HostAllocatorRef;
+use crate::memory::BufferAllocatorRef;
 use crate::memory::MemorySessionExt;
 use crate::optimizer::ArrayOptimizer;
 use crate::optimizer::kernels::ArrayKernelsExt;
@@ -267,8 +268,8 @@ impl ArrayRef {
 
             // Step 2c: stream-to-canonical shortcut. When the whole encoding tree supports
             // chunked decompression (the capability cascades: each encoding only advertises
-            // support when the children it streams from do) and is at least two streaming
-            // levels deep, decompress blocks straight into the canonical builder while each
+            // support when the children it streams from do) and its streaming chain is deep
+            // enough to pay off, decompress blocks straight into the canonical builder while each
             // block is L1-resident, instead of materializing a full intermediate per level.
             if current_builder.is_none()
                 && crate::chunk_iter::should_execute_via_chunks(&current_array)
@@ -311,9 +312,9 @@ impl ArrayRef {
                     if current_builder.is_none() {
                         trace_op!(record_builder_start(&array));
                         current_builder = Some(builder_with_capacity_in(
-                            ctx.allocator(),
                             array.dtype(),
                             array.len(),
+                            ctx.allocator(),
                         ));
                     }
                     let (parent, child) = unsafe { array.take_slot_unchecked(i) }?;
@@ -369,6 +370,8 @@ struct StackFrame {
 #[derive(Debug, Clone)]
 pub struct ExecutionCtx {
     session: VortexSession,
+    // OnceLock avoids cloning the session allocator when a context does not allocate.
+    allocator: OnceLock<BufferAllocatorRef>,
     execute_parent_kernels: Arc<ParentExecutionKernels>,
     #[cfg(debug_assertions)]
     id: usize,
@@ -386,6 +389,7 @@ impl ExecutionCtx {
         let execute_parent_kernels = session.kernels().execute_parent_snapshot();
         Self {
             session,
+            allocator: OnceLock::new(),
             execute_parent_kernels,
             #[cfg(debug_assertions)]
             id: {
@@ -402,9 +406,15 @@ impl ExecutionCtx {
         &self.session
     }
 
-    /// Get the session-scoped host allocator for this execution context.
-    pub fn allocator(&self) -> HostAllocatorRef {
-        self.session.allocator()
+    /// Get the allocator for this execution context.
+    pub fn allocator(&self) -> &BufferAllocatorRef {
+        self.allocator.get_or_init(|| self.session.allocator())
+    }
+
+    /// Set the allocator for this execution context.
+    pub fn with_allocator(mut self, allocator: BufferAllocatorRef) -> Self {
+        self.allocator = OnceLock::from(allocator);
+        self
     }
 
     /// Log an execution step at the current depth.
@@ -550,7 +560,7 @@ impl Executable for ArrayRef {
             ExecutionStep::AppendChild(_) => {
                 // Single-step: build the entire parent via the builder path.
                 trace_op!(record_builder_start(&array));
-                let builder = builder_with_capacity_in(ctx.allocator(), array.dtype(), array.len());
+                let builder = builder_with_capacity_in(array.dtype(), array.len(), ctx.allocator());
                 let mut builder = execute_into_builder(array, builder, ctx)?;
                 let output = builder.finish();
                 trace_op!(record_builder_finish(&output));
@@ -945,6 +955,8 @@ impl VortexSessionExecute for VortexSession {
 
 #[cfg(test)]
 mod tests {
+    use static_assertions::assert_impl_all;
+    use vortex_session::SessionExt;
     use vortex_session::VortexSession;
 
     use super::*;
@@ -952,9 +964,14 @@ mod tests {
     use crate::VortexSessionExecute;
     use crate::arrays::Bool;
     use crate::arrays::Primitive;
+    use crate::memory::BufferAllocatorRef;
+    use crate::memory::MemorySession;
+    use crate::memory::MemorySessionExt;
     use crate::optimizer::kernels::ExecuteParentFn;
     use crate::optimizer::kernels::KernelSession;
     use crate::optimizer::kernels::execute_parent_key;
+
+    assert_impl_all!(ExecutionCtx: Send, Sync);
 
     fn noop_execute_parent(
         _child: &ArrayRef,
@@ -992,5 +1009,28 @@ mod tests {
 
         let after_registration = session.create_execution_ctx();
         assert!(after_registration.execute_parent_kernels.contains_key(&key));
+    }
+
+    #[test]
+    fn execution_ctx_allocator_override() {
+        let first = BufferAllocatorRef::new(vortex_buffer::StaticBufferAllocator);
+        let second = BufferAllocatorRef::new(vortex_buffer::StaticBufferAllocator);
+        let third = BufferAllocatorRef::new(vortex_buffer::StaticBufferAllocator);
+        let session = VortexSession::empty()
+            .with::<MemorySession>()
+            .with_allocator(first.clone());
+        let ctx = session.create_execution_ctx();
+
+        session
+            .get_mut::<MemorySession>()
+            .set_allocator(third.clone());
+
+        assert!(session.allocator().ptr_eq(&third));
+        assert!(ctx.allocator().ptr_eq(&third));
+
+        let ctx = ctx.with_allocator(second.clone());
+        session.get_mut::<MemorySession>().set_allocator(first);
+
+        assert!(ctx.allocator().ptr_eq(&second));
     }
 }

@@ -7,23 +7,24 @@ use std::fmt::Formatter;
 use prost::Message;
 use vortex_error::VortexResult;
 use vortex_error::vortex_err;
-use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
+use crate::IntoArray;
+use crate::arrays::Constant;
+use crate::arrays::ConstantArray;
 use crate::arrays::ScalarFnArray;
 use crate::arrays::StructArray;
 use crate::arrays::struct_::StructArrayExt;
 use crate::builtins::ArrayBuiltins;
-use crate::builtins::ExprBuiltins;
 use crate::dtype::DType;
 use crate::dtype::FieldName;
 use crate::dtype::Nullability;
-use crate::expr::Expression;
 use crate::expr::display::ExprDisplay;
-use crate::expr::lit;
+use crate::proto::expr as pb;
+use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
 use crate::scalar_fn::EmptyOptions;
@@ -126,7 +127,30 @@ impl ScalarFnVTable for GetItem {
         args: &dyn ExecutionArgs,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let input = args.get(0)?.execute::<StructArray>(ctx)?;
+        let input = args.get(0)?;
+        if let Some(constant) = input.as_opt::<Constant>() {
+            let dtype = self.return_dtype(field_name, &[input.dtype().clone()])?;
+            let scalar = if constant.scalar().is_null() {
+                Scalar::null(dtype)
+            } else {
+                constant
+                    .scalar()
+                    .as_struct()
+                    .field(field_name)
+                    .ok_or_else(|| {
+                        vortex_err!(
+                            "Field '{}' missing from constant struct array {}",
+                            field_name,
+                            input.dtype()
+                        )
+                    })?
+                    .cast(&dtype)?
+            };
+
+            return Ok(ConstantArray::new(scalar, input.len()).into_array());
+        }
+
+        let input = input.execute::<StructArray>(ctx)?;
         let field = input.unmasked_field_by_name(field_name).cloned()?;
 
         match input.dtype().nullability() {
@@ -157,44 +181,6 @@ impl ScalarFnVTable for GetItem {
         Ok(None)
     }
 
-    fn simplify_untyped(
-        &self,
-        field_name: &FieldName,
-        expr: &Expression,
-    ) -> VortexResult<Option<Expression>> {
-        let child = expr.child(0);
-
-        // If the child is a Pack expression, we can directly return the corresponding child.
-        if let Some(pack) = child.as_opt::<Pack>() {
-            let idx = pack
-                .names
-                .iter()
-                .position(|name| name == field_name)
-                .ok_or_else(|| {
-                    vortex_err!(
-                        "Cannot find field {} in pack fields {:?}",
-                        field_name,
-                        pack.names
-                    )
-                })?;
-
-            let mut field = child.child(idx).clone();
-
-            // It's useful to simplify this node without type info, but we need to make sure
-            // the nullability is correct. We cannot cast since we don't have the dtype info here,
-            // so instead we insert a Mask expression that we know converts a child's dtype to
-            // nullable.
-            if pack.nullability.is_nullable() {
-                // Mask with an all-true array to ensure the field DType is nullable.
-                field = field.mask(lit(true))?;
-            }
-
-            return Ok(Some(field));
-        }
-
-        Ok(None)
-    }
-
     fn is_strict(&self, _field_name: &FieldName) -> bool {
         true
     }
@@ -210,8 +196,19 @@ mod tests {
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
 
+    use super::GetItem;
+    use crate::ArrayRef;
     use crate::IntoArray;
+    use crate::VortexSessionExecute;
+    use crate::arrays::Constant;
+    use crate::arrays::ConstantArray;
+    use crate::arrays::Filter;
+    use crate::arrays::Primitive;
+    use crate::arrays::ScalarFn;
+    use crate::arrays::Slice;
+    use crate::builtins::ArrayBuiltins;
     use crate::dtype::DType;
+    use crate::dtype::FieldName;
     use crate::dtype::FieldNames;
     use crate::dtype::Nullability;
     use crate::dtype::Nullability::NonNullable;
@@ -222,6 +219,7 @@ mod tests {
     use crate::expr::lit;
     use crate::expr::pack;
     use crate::expr::root;
+    use crate::scalar::Scalar;
     use crate::scalar_fn::fns::get_item::StructArray;
     use crate::validity::Validity;
 
@@ -292,16 +290,91 @@ mod tests {
     }
 
     #[test]
+    fn execute_constant_struct_stays_constant() -> VortexResult<()> {
+        let field_count = 128usize;
+        let selected_idx = 97i32;
+        let names = (0..field_count)
+            .map(|idx| FieldName::from(format!("f{idx}")))
+            .collect::<Vec<_>>();
+        let dtypes = vec![DType::Primitive(PType::I32, NonNullable); field_count];
+        let fields = StructFields::new(FieldNames::from(names), dtypes);
+        let scalar = Scalar::struct_(
+            DType::Struct(fields, NonNullable),
+            (0..128).map(|idx| Scalar::primitive(idx, NonNullable)),
+        );
+        let array = ConstantArray::new(scalar, 1_000_000).into_array();
+        let mut ctx = crate::array_session().create_execution_ctx();
+
+        let item: ArrayRef = GetItem::try_new(array, "f97")?
+            .into_array()
+            .execute(&mut ctx)?;
+
+        let constant = item.as_::<Constant>();
+        assert_eq!(constant.len(), 1_000_000);
+        assert_eq!(
+            constant.scalar(),
+            &Scalar::primitive(selected_idx, NonNullable)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn get_item_pushes_through_filter() -> VortexResult<()> {
+        use vortex_mask::Mask;
+
+        let filtered = test_array()
+            .into_array()
+            .filter(Mask::from_iter([true, false, true]))?;
+
+        let item = filtered.get_item("a")?;
+
+        assert!(item.is::<Filter>());
+        assert!(!item.is::<ScalarFn>());
+        Ok(())
+    }
+
+    #[test]
+    fn get_item_pushes_through_slice() -> VortexResult<()> {
+        let sliced = test_array().into_array().slice(1..3)?;
+
+        let item = sliced.get_item("a")?;
+
+        assert!(item.is::<Primitive>());
+        assert!(!item.is::<Slice>());
+        assert!(!item.is::<ScalarFn>());
+        Ok(())
+    }
+
+    #[test]
+    fn get_item_pushes_through_masked() -> VortexResult<()> {
+        let masked = test_array()
+            .into_array()
+            .mask(Validity::from_iter([true, false, true]).to_array(3))?;
+
+        let item = masked.get_item("a")?;
+
+        assert!(item.is::<Primitive>());
+        assert_eq!(
+            item.dtype(),
+            &DType::Primitive(PType::I32, Nullability::Nullable)
+        );
+        assert!(!item.is::<ScalarFn>());
+        Ok(())
+    }
+
+    #[test]
     fn test_pack_get_item_rule() {
         // Create: pack(a: lit(1), b: lit(2)).get_item("b")
         let pack_expr = pack([("a", lit(1)), ("b", lit(2))], NonNullable);
         let get_item_expr = get_item("b", pack_expr);
 
+        let dtype = DType::Struct(StructFields::empty(), NonNullable);
         let result = get_item_expr
-            .optimize_recursive(&DType::Struct(StructFields::empty(), NonNullable))
+            .bind(&dtype)
+            .and_then(|expr| expr.optimize_recursive())
             .unwrap();
 
-        assert_eq!(result, lit(2));
+        assert_eq!(result, lit(2).bind(&dtype).unwrap());
     }
 
     #[test]
@@ -314,8 +387,8 @@ mod tests {
 
         let dtype = DType::Primitive(PType::I32, NonNullable);
 
-        let result = get_z.optimize_recursive(&dtype).unwrap();
-        assert_eq!(result, lit(4));
+        let result = get_z.bind(&dtype).unwrap().optimize_recursive().unwrap();
+        assert_eq!(result, lit(4).bind(&dtype).unwrap());
     }
 
     #[test]
@@ -334,8 +407,12 @@ mod tests {
 
         let dtype = DType::Primitive(PType::I32, NonNullable);
 
-        let result = get_final.optimize_recursive(&dtype).unwrap();
-        assert_eq!(result, lit(42));
+        let result = get_final
+            .bind(&dtype)
+            .unwrap()
+            .optimize_recursive()
+            .unwrap();
+        assert_eq!(result, lit(42).bind(&dtype).unwrap());
     }
 
     #[test]
@@ -349,8 +426,12 @@ mod tests {
 
         let dtype = DType::Primitive(PType::I32, NonNullable);
 
-        let result = get_result.optimize_recursive(&dtype).unwrap();
-        let expected = checked_add(lit(1), lit(10));
+        let result = get_result
+            .bind(&dtype)
+            .unwrap()
+            .optimize_recursive()
+            .unwrap();
+        let expected = checked_add(lit(1), lit(10)).bind(&dtype).unwrap();
         assert_eq!(&result, &expected);
     }
 

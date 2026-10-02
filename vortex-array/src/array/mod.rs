@@ -30,6 +30,8 @@ pub use erased::*;
 
 mod plugin;
 pub use plugin::*;
+mod probe;
+pub use probe::*;
 
 mod foreign;
 pub(crate) use foreign::*;
@@ -231,15 +233,41 @@ pub(crate) trait DynArrayData: 'static + private::Sealed + Send + Sync + Debug {
         sink: &mut dyn crate::chunk_iter::ChunkSink,
     ) -> VortexResult<()>;
 
-    /// Execute the scalar at the given index.
+    /// Read the scalar at `index`, including its nullness, retaining nothing.
     ///
-    /// This method panics if the index is out of bounds for the array.
-    fn execute_scalar(
+    /// Caller must guarantee `index < len`.
+    ///
+    /// Kept apart from [`Self::probe_scalar_retained`] so this entry is a bare trampoline into
+    /// the encoding: sharing one function made the one-off path pay the retained branch's
+    /// register saves before its tail call.
+    fn probe_scalar_once(
         &self,
         this: &ArrayRef,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar>;
+
+    /// Read the scalar at `index`, including its nullness, keeping preparation in `state`.
+    ///
+    /// Caller must guarantee `index < len`.
+    fn probe_scalar_retained(
+        &self,
+        this: &ArrayRef,
+        index: usize,
+        state: &mut Option<Box<dyn Any>>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar>;
+
+    /// Whether the row at `index` is valid, using the validity kept in `state`.
+    ///
+    /// Caller must guarantee `index < len`.
+    fn probe_is_valid_retained(
+        &self,
+        this: &ArrayRef,
+        index: usize,
+        state: &mut Option<Box<dyn Any>>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<bool>;
 }
 
 /// Trait for converting a type into a Vortex [`ArrayRef`].
@@ -425,11 +453,16 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
             this.encoding_id(),
             reduced.encoding_id()
         );
+        // Rules may reduce to a non-nullable constant
         vortex_ensure!(
-            reduced.dtype() == this.dtype(),
-            "Reduced array dtype mismatch from {} to {}",
+            reduced.dtype() == this.dtype()
+                || (reduced.dtype().eq_ignore_nullability(this.dtype())
+                    && !reduced.dtype().is_nullable()),
+            "Reduced array dtype mismatch from {} ({}) to {} ({})",
             this.encoding_id(),
-            reduced.encoding_id()
+            this.dtype(),
+            reduced.encoding_id(),
+            reduced.dtype()
         );
         Ok(Some(reduced))
     }
@@ -502,6 +535,7 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
     }
 
     fn supports_decompress_chunks(&self, this: &ArrayRef) -> bool {
+        // SAFETY: this adapter belongs to the ArrayData<V> stored in `this`.
         let view = unsafe { ArrayView::new_unchecked(this, &self.data) };
         V::supports_decompress_chunks(view)
     }
@@ -512,18 +546,47 @@ impl<V: VTable> DynArrayData for ArrayData<V> {
         ctx: &mut ExecutionCtx,
         sink: &mut dyn crate::chunk_iter::ChunkSink,
     ) -> VortexResult<()> {
+        // SAFETY: this adapter belongs to the ArrayData<V> stored in `this`.
         let view = unsafe { ArrayView::new_unchecked(this, &self.data) };
         V::decompress_chunks(view, ctx, sink)
     }
 
-    fn execute_scalar(
+    fn probe_scalar_once(
         &self,
         this: &ArrayRef,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
+        // SAFETY: this adapter belongs to the ArrayData<V> stored in `this`.
         let view = unsafe { ArrayView::new_unchecked(this, &self.data) };
-        <V::OperationsVTable as OperationsVTable<V>>::scalar_at(view, index, ctx)
+        <V::OperationsVTable as OperationsVTable<V>>::probe_scalar(
+            &mut ProbeState::once(view),
+            index,
+            ctx,
+        )
+    }
+
+    fn probe_scalar_retained(
+        &self,
+        this: &ArrayRef,
+        index: usize,
+        state: &mut Option<Box<dyn Any>>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Scalar> {
+        // SAFETY: this adapter belongs to the ArrayData<V> stored in `this`.
+        let view = unsafe { ArrayView::new_unchecked(this, &self.data) };
+        let mut state = ProbeState::repeated(view, repeated_state(state)?);
+        <V::OperationsVTable as OperationsVTable<V>>::probe_scalar(&mut state, index, ctx)
+    }
+
+    fn probe_is_valid_retained(
+        &self,
+        this: &ArrayRef,
+        index: usize,
+        state: &mut Option<Box<dyn Any>>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<bool> {
+        repeated_state::<EncodingProbeState<V>>(state)?.is_valid(this, index, ctx)
     }
 }
 

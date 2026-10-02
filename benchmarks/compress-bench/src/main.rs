@@ -28,6 +28,7 @@ use vortex_bench::LogFormat;
 use vortex_bench::Target;
 use vortex_bench::compress::CompressMeasurements;
 use vortex_bench::compress::CompressOp;
+use vortex_bench::compress::Compressed;
 use vortex_bench::compress::Compressor;
 use vortex_bench::compress::benchmark_compress;
 use vortex_bench::compress::benchmark_decompress;
@@ -184,19 +185,19 @@ impl BenchMode {
 }
 
 /// Get a compressor for the given format.
-fn get_compressor(format: Format, mode: BenchMode) -> Box<dyn Compressor> {
+fn get_compressor(format: Format, mode: BenchMode) -> anyhow::Result<Box<dyn Compressor>> {
     if let BenchMode::Gpu(options) = mode {
         return gpu_compressor(format, options);
     }
 
-    match format {
+    Ok(match format {
         Format::ArrowIpc => Box::new(ArrowIpcCompressor),
         Format::OnDiskVortex => Box::new(VortexCompressor),
         Format::Parquet => Box::new(ParquetCompressor::new()),
         #[cfg(feature = "lance")]
         Format::Lance => Box::new(LanceCompressor),
-        _ => unimplemented!("Compress bench not implemented for {format}"),
-    }
+        _ => anyhow::bail!("Compress bench not implemented for {format}"),
+    })
 }
 
 /// The benchmark ID used for output path.
@@ -441,19 +442,22 @@ async fn run_benchmark_for_dataset(
     let mut v3_records: Vec<v3::V3Record> = Vec::new();
 
     for format in formats {
-        let compressor = get_compressor(*format, mode);
+        let compressor = get_compressor(*format, mode)?;
+        // Read the source once per format; every compression iteration starts from it.
+        let input = compressor
+            .load(&parquet_path)
+            .await
+            .with_context(|| format!("loading {bench_name} for {format}"))?;
+        // Compressed output shared by both ops, so decompression never compresses again.
+        let mut compressed: Option<Compressed> = None;
 
         for op in ops {
             let time = match op {
                 CompressOp::Compress => {
-                    let result = benchmark_compress(
-                        compressor.as_ref(),
-                        &parquet_path,
-                        iterations,
-                        bench_name,
-                    )
-                    .await
-                    .with_context(|| format!("compressing {bench_name} as {format}"))?;
+                    let result =
+                        benchmark_compress(compressor.as_ref(), &input, iterations, bench_name)
+                            .await
+                            .with_context(|| format!("compressing {bench_name} as {format}"))?;
                     compressed_sizes.insert(*format, result.compressed_size);
                     let all_runs_ns: Vec<u64> = result
                         .all_runs
@@ -476,12 +480,22 @@ async fn run_benchmark_for_dataset(
                     ));
                     ratios.extend(result.ratios);
                     timings.push(result.timing);
+                    compressed = Some(result.compressed);
                     result.time
                 }
                 CompressOp::Decompress => {
+                    let input = match &compressed {
+                        Some(input) => input,
+                        None => compressed.insert(
+                            compressor
+                                .compress(&input)
+                                .await
+                                .with_context(|| format!("compressing {bench_name} as {format}"))?,
+                        ),
+                    };
                     let result = benchmark_decompress(
                         compressor.as_ref(),
-                        &parquet_path,
+                        input,
                         iterations,
                         &decompress_name,
                     )

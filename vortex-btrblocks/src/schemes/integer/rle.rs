@@ -16,11 +16,7 @@ use vortex_compressor::scheme::CompressionEstimate;
 use vortex_compressor::scheme::DeferredEstimate;
 use vortex_compressor::scheme::DescendantExclusion;
 use vortex_compressor::scheme::EstimateVerdict;
-#[cfg(feature = "unstable_encodings")]
-use vortex_compressor::scheme::SchemeId;
 use vortex_error::VortexResult;
-#[cfg(feature = "unstable_encodings")]
-use vortex_fastlanes::Delta;
 use vortex_fastlanes::RLE;
 use vortex_fastlanes::RLEArrayExt;
 use vortex_fastlanes::RLEArraySlotsExt;
@@ -60,39 +56,20 @@ pub(crate) fn rle_compress(
         exec_ctx,
     )?;
 
-    // Delta is an unstable encoding, once we deem it stable we can switch over to this always.
-    #[cfg(feature = "unstable_encodings")]
-    let compressed_indices = {
-        let rle_indices_primitive = rle_array
-            .indices()
-            .clone()
-            .execute::<PrimitiveArray>(exec_ctx)?
-            .narrow(exec_ctx)?;
-        try_compress_delta(
-            compressor,
-            &rle_indices_primitive.into_array(),
-            &compress_ctx,
-            scheme.id(),
-            1,
-            exec_ctx,
-        )?
-    };
-
-    #[cfg(not(feature = "unstable_encodings"))]
-    let compressed_indices = {
-        let rle_indices_primitive = rle_array
-            .indices()
-            .clone()
-            .execute::<PrimitiveArray>(exec_ctx)?
-            .narrow(exec_ctx)?;
-        compressor.compress_child(
-            &rle_indices_primitive.into_array(),
-            &compress_ctx,
-            scheme.id(),
-            1,
-            exec_ctx,
-        )?
-    };
+    // TODO(joe): re-apply Delta to these monotone indices once the compressor can say whether a
+    // scheme is eligible for a given child; applying it by hand bypassed the exclusion rules.
+    let rle_indices_primitive = rle_array
+        .indices()
+        .clone()
+        .execute::<PrimitiveArray>(exec_ctx)?
+        .narrow(exec_ctx)?;
+    let compressed_indices = compressor.compress_child(
+        &rle_indices_primitive.into_array(),
+        &compress_ctx,
+        scheme.id(),
+        1,
+        exec_ctx,
+    )?;
 
     let rle_offsets_primitive = rle_array
         .values_idx_offsets()
@@ -118,36 +95,6 @@ pub(crate) fn rle_compress(
         )
         .into_array())
     }
-}
-
-#[cfg(feature = "unstable_encodings")]
-pub(crate) fn try_compress_delta(
-    compressor: &CascadingCompressor,
-    child: &ArrayRef,
-    parent_ctx: &CompressorContext,
-    parent_id: SchemeId,
-    child_index: usize,
-    exec_ctx: &mut ExecutionCtx,
-) -> VortexResult<ArrayRef> {
-    let child_primitive = child.clone().execute::<PrimitiveArray>(exec_ctx)?;
-    let (bases, deltas) = vortex_fastlanes::delta_compress(&child_primitive, exec_ctx)?;
-
-    let compressed_bases = compressor.compress_child(
-        &bases.into_array(),
-        parent_ctx,
-        parent_id,
-        child_index,
-        exec_ctx,
-    )?;
-    let compressed_deltas = compressor.compress_child(
-        &deltas.into_array(),
-        parent_ctx,
-        parent_id,
-        child_index,
-        exec_ctx,
-    )?;
-
-    Delta::try_new(compressed_bases, compressed_deltas, 0, child.len()).map(IntoArray::into_array)
 }
 
 impl Scheme for IntRLEScheme {

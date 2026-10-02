@@ -1,0 +1,682 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+use std::iter;
+use std::mem;
+use std::mem::MaybeUninit;
+use std::ops::Range;
+
+use fastlanes::BitPacking;
+use fastlanes::FoR;
+use itertools::Itertools;
+use num_traits::AsPrimitive;
+use num_traits::PrimInt;
+use num_traits::WrappingAdd;
+use vortex_array::ArrayView;
+use vortex_array::ExecutionCtx;
+use vortex_array::arrays::Constant;
+use vortex_array::arrays::Primitive;
+use vortex_array::arrays::PrimitiveArray;
+use vortex_array::builders::PrimitiveBuilder;
+use vortex_array::builders::UninitRange;
+use vortex_array::chunk_iter::ChunkMut;
+use vortex_array::chunk_iter::ChunkSink;
+use vortex_array::dtype::NativePType;
+use vortex_array::dtype::PhysicalPType;
+use vortex_array::match_each_integer_ptype;
+use vortex_array::match_each_unsigned_integer_ptype;
+use vortex_array::patches::Patches;
+use vortex_array::scalar::Scalar;
+use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
+use vortex_buffer::BufferMut;
+use vortex_error::VortexExpect;
+use vortex_error::VortexResult;
+use vortex_error::vortex_err;
+
+use crate::BitPacked;
+use crate::BitPackedArrayExt;
+use crate::FL_CHUNK_SIZE;
+use crate::FoRArray;
+use crate::bitpacking::chunked_decompress;
+use crate::for_::array::FoRArrayExt;
+use crate::for_::array::FoRArraySlotsExt;
+use crate::unpack_iter::for_each_packed_chunk;
+
+pub fn decompress(array: &FoRArray, ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
+    match array.constant_reference() {
+        Some(reference) => decompress_one_ref(array, &reference, ctx),
+        None => decompress_many_refs(array, ctx),
+    }
+}
+
+/// Decompress an array whose chunks all share `reference`.
+fn decompress_one_ref(
+    array: &FoRArray,
+    reference: &Scalar,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    // Try to do fused unpack.
+    if let Some(bp) = array.encoded().as_opt::<BitPacked>() {
+        return fused_decompress(array, bp, ctx);
+    }
+
+    add_reference(array, reference)
+}
+
+/// Unpack a BitPacked child and add the constant reference in one pass.
+pub(crate) fn fused_decompress(
+    for_: &FoRArray,
+    bp: ArrayView<'_, BitPacked>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    match_each_integer_ptype!(for_.ptype(), |T| {
+        fused_decompress_typed::<T>(for_, bp, ctx)
+    })
+}
+
+fn fused_decompress_typed<
+    T: PhysicalPType<Physical: FoR + BitPacking> + AsPrimitive<T::Physical> + WrappingAdd,
+>(
+    for_: &FoRArray,
+    bp: ArrayView<'_, BitPacked>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    let ref_ = for_
+        .constant_reference()
+        .ok_or_else(|| vortex_err!("fused FoR decompression requires a constant reference"))?
+        .as_primitive()
+        .as_::<T>()
+        .vortex_expect("cannot be null");
+
+    fused_unpack(for_, bp, |_| ref_, ctx)
+}
+
+/// Decode `encoded`, then add `reference` to every value.
+fn add_reference(array: &FoRArray, reference: &Scalar) -> VortexResult<PrimitiveArray> {
+    match_each_integer_ptype!(array.ptype(), |T| {
+        add_reference_typed::<T>(array, reference)
+    })
+}
+
+fn add_reference_typed<T: NativePType + WrappingAdd + PrimInt>(
+    array: &FoRArray,
+    reference: &Scalar,
+) -> VortexResult<PrimitiveArray> {
+    let encoded = array.encoded().as_::<Primitive>().into_owned();
+    let min = reference
+        .as_primitive()
+        .typed_value::<T>()
+        .vortex_expect("reference must be non-null");
+    if min == T::zero() {
+        return Ok(encoded);
+    }
+    let validity = encoded.validity()?;
+    Ok(PrimitiveArray::new(
+        decompress_primitive(encoded.into_buffer::<T>(), min),
+        validity,
+    ))
+}
+
+fn decompress_primitive<T: NativePType + WrappingAdd + PrimInt>(
+    values: Buffer<T>,
+    min: T,
+) -> Buffer<T> {
+    values
+        .map_each_in_place(move |v| v.wrapping_add(&min))
+        .freeze()
+}
+
+/// Decompress an array whose chunks have different references.
+fn decompress_many_refs(array: &FoRArray, ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
+    // Try to do fused unpack. BitPacked chunks line up with FoR chunks when the offsets match.
+    if let Some(bp) = array.encoded().as_opt::<BitPacked>()
+        && bp.offset() == array.offset()
+    {
+        return fused_decompress_many_refs(array, bp, ctx);
+    }
+
+    add_references(array, ctx)
+}
+
+/// Decode `encoded`, then add each chunk's reference in place.
+fn add_references(array: &FoRArray, ctx: &mut ExecutionCtx) -> VortexResult<PrimitiveArray> {
+    match_each_integer_ptype!(array.ptype(), |T| { add_references_typed::<T>(array, ctx) })
+}
+
+fn add_references_typed<T: NativePType + WrappingAdd + PrimInt>(
+    array: &FoRArray,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    let encoded = array.encoded().as_::<Primitive>().into_owned();
+    if encoded.is_empty() {
+        return Ok(encoded);
+    }
+    let validity = encoded.validity()?;
+    let references = array.references().as_::<Primitive>().into_owned();
+    let references = references.as_slice::<T>();
+
+    // The first chunk may be partial when the array was sliced.
+    let first_len = (FL_CHUNK_SIZE - usize::from(array.offset())).min(array.len());
+    let values = match encoded.into_buffer::<T>().try_into_mut() {
+        // Try to add references in place if we hold only strong reference.
+        Ok(mut values) => {
+            add_references_in_place(&mut values, first_len, references);
+            values
+        }
+        // Otherwise add the references and encoded values in a new buffer.
+        Err(encoded) => {
+            add_references_copied(&encoded, first_len, references, ctx.allocator().clone())
+        }
+    };
+    Ok(PrimitiveArray::new(values.freeze(), validity))
+}
+
+/// Add each chunk's reference to `values`, whose first chunk holds `first_len` values.
+fn add_references_in_place<T: NativePType + WrappingAdd>(
+    values: &mut [T],
+    first_len: usize,
+    references: &[T],
+) {
+    for (chunk, &reference) in chunks_mut(values, first_len).zip_eq(references) {
+        for value in chunk {
+            *value = value.wrapping_add(&reference);
+        }
+    }
+}
+
+/// Copy `encoded`, whose first chunk holds `first_len` values, into a new buffer, adding each
+/// chunk's reference on the way.
+fn add_references_copied<T: NativePType + WrappingAdd>(
+    encoded: &[T],
+    first_len: usize,
+    references: &[T],
+    allocator: BufferAllocatorRef,
+) -> BufferMut<T> {
+    let len = encoded.len();
+    let mut values = BufferMut::<T>::with_capacity_in(len, allocator);
+    let (first, rest) = encoded.split_at(first_len);
+    let inputs = iter::once(first).chain(rest.chunks(FL_CHUNK_SIZE));
+    let outputs = chunks_mut(&mut values.spare_capacity_mut()[..len], first_len);
+    for ((output, input), &reference) in outputs.zip(inputs).zip_eq(references) {
+        for (output, value) in output.iter_mut().zip(input) {
+            output.write(value.wrapping_add(&reference));
+        }
+    }
+    // SAFETY: the loop above initialized every value.
+    unsafe { values.set_len(len) };
+    values
+}
+
+/// Split `values` into FoR chunks, the first of which holds `first_len` values.
+fn chunks_mut<V>(values: &mut [V], first_len: usize) -> impl Iterator<Item = &mut [V]> {
+    let (first, rest) = values.split_at_mut(first_len);
+    iter::once(first).chain(rest.chunks_mut(FL_CHUNK_SIZE))
+}
+
+/// Unpack each BitPacked chunk and add its chunk's reference in one pass.
+fn fused_decompress_many_refs(
+    for_: &FoRArray,
+    bp: ArrayView<'_, BitPacked>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    match_each_integer_ptype!(for_.ptype(), |T| {
+        fused_decompress_many_refs_typed::<T>(for_, bp, ctx)
+    })
+}
+
+fn fused_decompress_many_refs_typed<
+    T: PhysicalPType<Physical: FoR + BitPacking> + AsPrimitive<T::Physical> + WrappingAdd,
+>(
+    for_: &FoRArray,
+    bp: ArrayView<'_, BitPacked>,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    let references = for_.references().as_::<Primitive>().into_owned();
+    let references = references.as_slice::<T>();
+    fused_unpack(for_, bp, |chunk| references[chunk], ctx)
+}
+
+/// Unpack each BitPacked chunk and add its reference in one pass.
+///
+/// `chunk_reference` maps the index of a chunk, counted from the first chunk of `bp`, to its
+/// reference.
+fn fused_unpack<
+    T: PhysicalPType<Physical: FoR + BitPacking> + AsPrimitive<T::Physical> + WrappingAdd,
+>(
+    for_: &FoRArray,
+    bp: ArrayView<'_, BitPacked>,
+    chunk_reference: impl Fn(usize) -> T,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<PrimitiveArray> {
+    let len = bp.len();
+    let mut builder =
+        PrimitiveBuilder::<T>::with_capacity_in(for_.dtype().nullability(), len, ctx.allocator());
+    let mut uninit_range = builder.uninit_range(len);
+    unsafe {
+        // Append a dense null Mask.
+        uninit_range.append_mask(&bp.validity()?.execute_mask(len, ctx)?);
+    }
+
+    // SAFETY: `unpack_chunks` initializes every value in this range.
+    let output = unsafe { uninit_range.slice_uninit_mut(0, len) };
+    unpack_chunks(bp, &chunk_reference, output)?;
+
+    if let Some(patches) = bp.patches() {
+        let offset = usize::from(bp.offset());
+        apply_patches(&mut uninit_range, &patches, offset, &chunk_reference, ctx)?;
+    }
+
+    // SAFETY: We have set a correct validity mask via `append_mask` with `len` values and
+    // initialized every value in `unpack_chunks`.
+    unsafe {
+        uninit_range.finish();
+    }
+
+    Ok(builder.finish_into_primitive())
+}
+
+/// Unpack each chunk of `bp` into `output` and add the chunk's reference.
+///
+/// Full chunks unpack straight into `output`. A partial first or last chunk unpacks into a scratch
+/// chunk, and only its values in `output` are copied over.
+fn unpack_chunks<
+    T: PhysicalPType<Physical: FoR + BitPacking> + AsPrimitive<T::Physical> + WrappingAdd,
+>(
+    bp: ArrayView<'_, BitPacked>,
+    chunk_reference: impl Fn(usize) -> T,
+    output: &mut [MaybeUninit<T>],
+) -> VortexResult<()> {
+    let offset = usize::from(bp.offset());
+    let bit_width = bp.bit_width() as usize;
+    // SAFETY: `T::Physical` is `T` with the same size and alignment, and the unpack is the same
+    // wrapping addition in two's complement whichever signedness `T` has.
+    let output =
+        unsafe { mem::transmute::<&mut [MaybeUninit<T>], &mut [MaybeUninit<T::Physical>]>(output) };
+    let mut scratch = [const { MaybeUninit::<T::Physical>::uninit() }; FL_CHUNK_SIZE];
+    for_each_packed_chunk::<T, _>(
+        bp.packed_slice::<T::Physical>(),
+        bit_width,
+        offset,
+        bp.len(),
+        |packed, range| {
+            let reference = chunk_reference(range.start / FL_CHUNK_SIZE).as_();
+            // `range` counts from the start of the first chunk, and the output starts at `offset`.
+            let skip = offset.saturating_sub(range.start);
+            let dst = &mut output[range.start + skip - offset..range.end - offset];
+            if dst.len() == FL_CHUNK_SIZE {
+                // SAFETY: `packed` holds one chunk at `bit_width` and `dst` has room for a chunk.
+                unsafe { unfor_pack_into(bit_width, packed, reference, dst) };
+            } else {
+                // SAFETY: as above, with `scratch` as the destination.
+                unsafe { unfor_pack_into(bit_width, packed, reference, &mut scratch) };
+                dst.copy_from_slice(&scratch[skip..range.len()]);
+            }
+        },
+    )
+}
+
+/// Unpack one chunk into `dst` and add `reference` to every value.
+///
+/// # Safety
+///
+/// `packed` must hold one chunk at `bit_width`, and `dst` must have room for a full chunk.
+#[inline]
+unsafe fn unfor_pack_into<T: FoR>(
+    bit_width: usize,
+    packed: &[T],
+    reference: T,
+    dst: &mut [MaybeUninit<T>],
+) {
+    // SAFETY: the caller guarantees the sizes, and the unpack initializes every value of `dst`.
+    unsafe {
+        T::unchecked_unfor_pack(
+            bit_width,
+            packed,
+            reference,
+            mem::transmute::<&mut [MaybeUninit<T>], &mut [T]>(dst),
+        );
+    }
+}
+
+/// Write each patch value plus the reference of the chunk it falls in.
+///
+/// `offset` is the position of the first value within the first chunk, as in `fused_unpack`.
+fn apply_patches<T: NativePType + WrappingAdd>(
+    uninit_range: &mut UninitRange<T>,
+    patches: &Patches,
+    offset: usize,
+    chunk_reference: impl Fn(usize) -> T,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<()> {
+    assert_eq!(patches.array_len(), uninit_range.len());
+
+    let indices = patches.indices().clone().execute::<PrimitiveArray>(ctx)?;
+    let values = patches.values().clone().execute::<PrimitiveArray>(ctx)?;
+
+    assert!(values.all_valid(ctx)?, "Patch values must be all valid");
+
+    let values = values.as_slice::<T>();
+    match_each_unsigned_integer_ptype!(indices.ptype(), |P| {
+        for (&index, &value) in indices.as_slice::<P>().iter().zip_eq(values) {
+            let index = <P as AsPrimitive<usize>>::as_(index) - patches.offset();
+            let reference = chunk_reference((offset + index) / FL_CHUNK_SIZE);
+            uninit_range.set_value(index, value.wrapping_add(&reference));
+        }
+    });
+    Ok(())
+}
+
+/// Whether [`decompress_chunks`] can stream: either the fused unpack applies to a [`BitPacked`]
+/// child, or the encoded child streams and each chunk gets its references added on the way up.
+pub(crate) fn supports_decompress_chunks(array: ArrayView<'_, crate::FoR>) -> bool {
+    let fused = array.encoded().as_opt::<BitPacked>().is_some_and(|bp| {
+        array.references().is::<Constant>() || bp.offset() == array.offset()
+    });
+    fused || array.encoded().supports_decompress_chunks()
+}
+
+/// Stream the decompressed values of a FoR array through `sink`, one FastLanes chunk at a time.
+///
+/// Over a [`BitPacked`] child whose chunks line up with the FoR chunks, each chunk unpacks through
+/// the fused kernel that adds the reference, exactly like [`decompress`], so there is no extra pass.
+/// Over any other streaming child, each chunk it streams up has its references added in place
+/// while L1-resident and is forwarded to `sink`.
+pub(crate) fn decompress_chunks(
+    array: ArrayView<'_, crate::FoR>,
+    ctx: &mut ExecutionCtx,
+    sink: &mut dyn ChunkSink,
+) -> VortexResult<()> {
+    match_each_integer_ptype!(array.ptype(), |T| {
+        decompress_chunks_typed::<T>(array, ctx, sink)
+    })
+}
+
+fn decompress_chunks_typed<
+    T: PhysicalPType<Physical: FoR + BitPacking> + AsPrimitive<T::Physical> + WrappingAdd + PrimInt,
+>(
+    array: ArrayView<'_, crate::FoR>,
+    ctx: &mut ExecutionCtx,
+    sink: &mut dyn ChunkSink,
+) -> VortexResult<()> {
+    let offset = usize::from(array.offset());
+    let encoded = array.encoded();
+
+    if let Some(reference) = array.constant_reference() {
+        let reference = reference
+            .as_primitive()
+            .as_::<T>()
+            .vortex_expect("reference must be non-null");
+        if let Some(bp) = encoded.as_opt::<BitPacked>() {
+            return fused_decompress_chunks(bp, |_| reference, ctx, sink);
+        }
+        if reference == T::zero() {
+            return encoded.decompress_chunks(ctx, sink);
+        }
+        let mut adapter = AddReferenceSink {
+            chunk_reference: |_| reference,
+            offset,
+            inner: sink,
+        };
+        return encoded.decompress_chunks(ctx, &mut adapter);
+    }
+
+    // One reference per chunk: a small child, materialized once like patches are.
+    let references = array.references().clone().execute::<PrimitiveArray>(ctx)?;
+    let references = references.as_slice::<T>();
+    if let Some(bp) = encoded.as_opt::<BitPacked>()
+        && bp.offset() == array.offset()
+    {
+        return fused_decompress_chunks(bp, |chunk| references[chunk], ctx, sink);
+    }
+    let mut adapter = AddReferenceSink {
+        chunk_reference: |chunk| references[chunk],
+        offset,
+        inner: sink,
+    };
+    encoded.decompress_chunks(ctx, &mut adapter)
+}
+
+/// Unpack each chunk of `bp` into an L1-resident scratch chunk with its reference added by the
+/// fused kernel, patch it in place, and hand it to `sink`.
+///
+/// `chunk_reference` maps the index of a chunk, counted from the first chunk of `bp`, to its
+/// reference.
+fn fused_decompress_chunks<
+    T: PhysicalPType<Physical: FoR + BitPacking> + AsPrimitive<T::Physical> + WrappingAdd,
+>(
+    bp: ArrayView<'_, BitPacked>,
+    chunk_reference: impl Fn(usize) -> T,
+    ctx: &mut ExecutionCtx,
+    sink: &mut dyn ChunkSink,
+) -> VortexResult<()> {
+    let len = bp.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let offset = usize::from(bp.offset());
+    let bit_width = bp.bit_width() as usize;
+
+    let patches = match bp.patches() {
+        None => Vec::new(),
+        Some(patches) => chunked_decompress::build_patch_list(&patches, ctx, |row, value: T| {
+            value.wrapping_add(&chunk_reference((offset + row) / FL_CHUNK_SIZE))
+        })?,
+    };
+
+    let mut scratch = [const { MaybeUninit::<T::Physical>::uninit() }; FL_CHUNK_SIZE];
+    let mut patch_cursor = 0;
+    let mut result = Ok(());
+    for_each_packed_chunk::<T, _>(
+        bp.packed_slice::<T::Physical>(),
+        bit_width,
+        offset,
+        len,
+        |packed, range| {
+            if result.is_err() {
+                return;
+            }
+            let reference = chunk_reference(range.start / FL_CHUNK_SIZE).as_();
+            // SAFETY: `packed` holds one chunk at `bit_width` and `scratch` has room for a chunk.
+            unsafe { unfor_pack_into(bit_width, packed, reference, &mut scratch) };
+            // `range` counts from the start of the first chunk, and the rows start at `offset`.
+            let skip = offset.saturating_sub(range.start);
+            let rows = range.start + skip - offset..range.end - offset;
+            // SAFETY: the unpack initialized the whole scratch chunk, `skip + rows.len()` is at
+            // most a chunk, and `T::Physical` is `T` with the same size and alignment.
+            let values = unsafe {
+                std::slice::from_raw_parts_mut(
+                    scratch.as_mut_ptr().add(skip).cast::<T>(),
+                    rows.len(),
+                )
+            };
+            patch_cursor =
+                chunked_decompress::patch_chunk(values, rows.start, &patches, patch_cursor);
+            result = sink.accept(ChunkMut::new(values), rows);
+        },
+    )?;
+    result
+}
+
+/// Adds the FoR references to each chunk a child streams up, in place, before forwarding it.
+struct AddReferenceSink<'a, F> {
+    /// Maps the index of a FoR chunk to its reference.
+    chunk_reference: F,
+    /// The position of the first row within the first FoR chunk.
+    offset: usize,
+    inner: &'a mut dyn ChunkSink,
+}
+
+impl<T, F> ChunkSink for AddReferenceSink<'_, F>
+where
+    T: NativePType + WrappingAdd,
+    F: Fn(usize) -> T,
+{
+    #[inline]
+    fn accept(&mut self, mut chunk: ChunkMut<'_>, rows: Range<usize>) -> VortexResult<()> {
+        let values = chunk.as_slice_mut::<T>();
+        // The child's chunks need not line up with the FoR chunks, so one may span two of them.
+        let mut start = 0;
+        while start < values.len() {
+            let for_chunk = (self.offset + rows.start + start) / FL_CHUNK_SIZE;
+            let end = ((for_chunk + 1) * FL_CHUNK_SIZE - self.offset - rows.start).min(values.len());
+            let reference = (self.chunk_reference)(for_chunk);
+            for value in &mut values[start..end] {
+                *value = value.wrapping_add(&reference);
+            }
+            start = end;
+        }
+        self.inner.accept(chunk, rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::LazyLock;
+
+    use rstest::rstest;
+    use vortex_array::ArrayRef;
+    use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::array_session;
+    use vortex_array::assert_arrays_eq;
+    use vortex_session::VortexSession;
+
+    use super::*;
+    use crate::BitPackedData;
+    use crate::FoR;
+    use crate::FoRData;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = array_session();
+        crate::initialize(&session);
+        session
+    });
+
+    #[test]
+    fn test_decompress() {
+        let mut ctx = SESSION.create_execution_ctx();
+        // Create a range offset by a million.
+        let array = PrimitiveArray::from_iter((0u32..100_000).step_by(1024).map(|v| v + 1_000_000));
+        let compressed = FoRData::encode(array.clone(), &mut ctx).unwrap();
+        assert_arrays_eq!(compressed, array, &mut ctx);
+    }
+
+    #[test]
+    fn test_decompress_fused() {
+        let mut ctx = SESSION.create_execution_ctx();
+        // Create a range offset by a million.
+        let expect = PrimitiveArray::from_iter((0u32..1024).map(|x| x % 7 + 10));
+        let array = PrimitiveArray::from_iter((0u32..1024).map(|x| x % 7));
+        let bp = BitPackedData::encode(&array.into_array(), 3, &mut ctx).unwrap();
+        let compressed = FoR::try_new(bp.into_array(), 10u32.into()).unwrap();
+        assert_arrays_eq!(compressed, expect, &mut ctx);
+    }
+
+    #[test]
+    fn test_decompress_fused_patches() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        // Create a range offset by a million.
+        let expect = PrimitiveArray::from_iter((0u32..1024).map(|x| x % 7 + 10));
+        let array = PrimitiveArray::from_iter((0u32..1024).map(|x| x % 7));
+        let bp = BitPackedData::encode(&array.into_array(), 2, &mut ctx)?;
+        let compressed = FoR::try_new(bp.clone().into_array(), 10u32.into())?;
+        let decompressed = fused_decompress(&compressed, bp.as_view(), &mut ctx)?;
+        assert_arrays_eq!(decompressed, expect, &mut ctx);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decompress_fused_signed_patches() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let expect = PrimitiveArray::from_iter((0i64..1024).map(|x| x % 7 - 1_000_000));
+        let array = PrimitiveArray::from_iter((0i64..1024).map(|x| x % 7));
+        let bp = BitPackedData::encode(&array.into_array(), 2, &mut ctx)?;
+        let compressed = FoR::try_new(bp.clone().into_array(), (-1_000_000i64).into())?;
+        let decompressed = fused_decompress(&compressed, bp.as_view(), &mut ctx)?;
+        assert_arrays_eq!(decompressed, expect, &mut ctx);
+        Ok(())
+    }
+
+    fn stream<T: NativePType>(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Vec<T>> {
+        let mut out = Vec::with_capacity(array.len());
+        array.decompress_chunks(ctx, &mut |chunk: ChunkMut<'_>, _rows: Range<usize>| {
+            out.extend_from_slice(chunk.as_slice::<T>());
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Each chunk sits near its own reference, with outliers that bit-packing at width 6 patches.
+    fn chunked_values() -> PrimitiveArray {
+        PrimitiveArray::from_iter((0..5000i64).map(|i| {
+            let base = (i / 1024) * 1_000_000 - 3_000_000;
+            if i % 701 == 0 { base + 5_000 } else { base + i % 50 }
+        }))
+    }
+
+    /// Bit-pack the encoded child of a chunked FoR array, at offset 0.
+    fn bitpack_encoded(for_: &FoRArray, ctx: &mut ExecutionCtx) -> VortexResult<FoRArray> {
+        let encoded = for_.encoded().clone().execute::<PrimitiveArray>(ctx)?;
+        let bp = BitPackedData::encode(&encoded.into_array(), 6, ctx)?;
+        assert!(bp.patches().is_some());
+        FoR::try_new_chunked(bp.into_array(), for_.references().clone(), for_.offset())
+    }
+
+    /// Per-chunk references stream through the fused unpack over BitPacked and through the
+    /// in-place add over a Primitive child, including slices that start mid-chunk.
+    #[rstest]
+    #[case::whole(0..5000)]
+    #[case::sliced(517..4013)]
+    #[case::within_chunk(1100..1900)]
+    fn stream_chunked_references(
+        #[case] range: Range<usize>,
+        #[values(false, true)] bitpack: bool,
+    ) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = chunked_values();
+        let mut for_ = FoR::encode_chunked(values.clone(), &mut ctx)?;
+        assert!(for_.constant_reference().is_none());
+        if bitpack {
+            for_ = bitpack_encoded(&for_, &mut ctx)?;
+        }
+        let sliced = for_.into_array().slice(range.clone())?;
+        let sliced = sliced.as_::<FoR>();
+        // Slicing a patched BitPacked array stays lazy until executed, which applies its slice
+        // kernel.
+        let encoded = sliced.encoded().clone().execute_until::<BitPacked>(&mut ctx)?;
+        if bitpack {
+            assert_eq!(encoded.as_::<BitPacked>().offset(), sliced.offset());
+        }
+        let array =
+            FoR::try_new_chunked(encoded, sliced.references().clone(), sliced.offset())?.into_array();
+        assert!(array.supports_decompress_chunks());
+
+        let expected = values.into_array().slice(range)?.execute::<PrimitiveArray>(&mut ctx)?;
+        assert_eq!(stream::<i64>(&array, &mut ctx)?, expected.as_slice::<i64>());
+        Ok(())
+    }
+
+    /// When the BitPacked chunks do not line up with the FoR chunks, the child streams on its own
+    /// boundaries and each of its chunks spans two references.
+    #[test]
+    fn stream_misaligned_references() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = chunked_values();
+        let sliced = FoR::encode_chunked(values.clone(), &mut ctx)?
+            .into_array()
+            .slice(300..5000)?;
+        let sliced = sliced.as_::<FoR>();
+        assert_eq!(sliced.offset(), 300);
+        let array = bitpack_encoded(&sliced.into_owned(), &mut ctx)?;
+        let bp = array.encoded().as_::<BitPacked>();
+        assert_ne!(bp.offset(), array.offset());
+
+        let expected = values.into_array().slice(300..5000)?.execute::<PrimitiveArray>(&mut ctx)?;
+        assert_eq!(
+            stream::<i64>(&array.into_array(), &mut ctx)?,
+            expected.as_slice::<i64>()
+        );
+        Ok(())
+    }
+}

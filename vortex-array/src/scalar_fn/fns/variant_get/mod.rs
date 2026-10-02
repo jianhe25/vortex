@@ -9,8 +9,6 @@ use prost::Message;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
-use vortex_proto::expr as pb;
-use vortex_proto::expr::variant_path_element;
 use vortex_session::VortexSession;
 use vortex_session::registry::CachedId;
 use vortex_utils::aliases::StringEscape;
@@ -27,6 +25,8 @@ use crate::dtype::DType;
 use crate::dtype::FieldName;
 use crate::dtype::Nullability;
 use crate::expr::display::ExprDisplay;
+use crate::proto::expr as pb;
+use crate::proto::expr::variant_path_element;
 use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
 use crate::scalar_fn::ChildName;
@@ -144,7 +144,7 @@ impl ScalarFnVTable for VariantGet {
             .map_or(DType::Variant(Nullability::Nullable), DType::as_nullable);
 
         if !dtype.is_variant() {
-            let mut builder = builder_with_capacity_in(ctx.allocator(), &dtype, input.len());
+            let mut builder = builder_with_capacity_in(&dtype, input.len(), ctx.allocator());
             for idx in 0..input.len() {
                 let scalar = input.execute_scalar(idx, ctx)?;
                 let output = variant_get_scalar(&scalar, options, &dtype)?;

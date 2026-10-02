@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::mem::MaybeUninit;
+
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferAllocatorRef;
+use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure_eq;
@@ -9,17 +13,21 @@ use vortex_error::vortex_ensure_eq;
 use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::IntoArray;
+use crate::arrays::Constant;
 use crate::arrays::PrimitiveArray;
 use crate::dtype::DType;
 use crate::dtype::NativePType;
 use crate::dtype::Nullability;
+use crate::scalar::ScalarValue;
 use crate::scalar_fn::unstable::row::InputElement;
+use crate::scalar_fn::unstable::row::OutputBuffer;
 use crate::scalar_fn::unstable::row::OutputElement;
 use crate::validity::Validity;
 
 // SAFETY: the view is a native slice, and its reported length is the slice length.
 unsafe impl<T: NativePType> InputElement for T {
     type Column = Buffer<T>;
+    type Constant = T;
     type View<'a> = &'a [T];
     type Elem<'a> = T;
 
@@ -44,12 +52,34 @@ unsafe impl<T: NativePType> InputElement for T {
         Ok(array.execute::<PrimitiveArray>(ctx)?.into_buffer::<T>())
     }
 
+    fn decode_constant(array: ArrayRef, _ctx: &mut ExecutionCtx) -> VortexResult<Self::Constant> {
+        let Some(constant) = array.as_opt::<Constant>() else {
+            vortex_bail!(
+                "a primitive batch constant must use the Constant encoding, got {}",
+                array.encoding_id()
+            );
+        };
+        let scalar = constant.scalar();
+        let Some(ScalarValue::Primitive(value)) = scalar.value() else {
+            vortex_bail!(
+                "a primitive batch constant must contain a non-null {} value, got {scalar}",
+                T::PTYPE
+            );
+        };
+
+        value.cast::<T>()
+    }
+
     fn can_decode_null_tolerant(_array: &ArrayRef) -> VortexResult<bool> {
         Ok(true)
     }
 
     fn get(column: &Self::Column, index: usize) -> T {
         column[index]
+    }
+
+    fn get_constant(constant: &Self::Constant) -> T {
+        *constant
     }
 
     fn view(column: &Self::Column) -> Self::View<'_> {
@@ -73,11 +103,29 @@ unsafe impl<T: NativePType> InputElement for T {
 }
 
 impl<T: NativePType> OutputElement for T {
+    type Buffer = BufferMut<Self>;
+
     fn element_dtype() -> DType {
         DType::Primitive(T::PTYPE, Nullability::NonNullable)
     }
 
-    fn build(values: Vec<Self>) -> ArrayRef {
-        PrimitiveArray::new(values, Validity::NonNullable).into_array()
+    fn with_capacity(rows: usize, allocator: &BufferAllocatorRef) -> Self::Buffer {
+        allocator.with_capacity(rows)
+    }
+}
+
+// SAFETY: clearing the length preserves the contents and exposes the same allocation each time.
+// Native values require no destruction when a partially initialized buffer is abandoned.
+unsafe impl<T: NativePType> OutputBuffer<T> for BufferMut<T> {
+    fn slots(&mut self) -> &mut [MaybeUninit<T>] {
+        self.clear();
+        self.spare_capacity_mut()
+    }
+
+    unsafe fn finish(mut self, len: usize, _allocator: &BufferAllocatorRef) -> ArrayRef {
+        // SAFETY: the caller initialized the first `len` slots of this buffer's spare capacity.
+        unsafe { self.set_len(len) };
+
+        PrimitiveArray::new(self.freeze(), Validity::NonNullable).into_array()
     }
 }

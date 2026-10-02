@@ -12,13 +12,17 @@
 
 #include "duckdb.h"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/default/default_functions.hpp"
 #include "duckdb/common/insertion_order_preserving_map.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/capi/capi_internal.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/function/partition_stats.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/storage_index.hpp"
 
 using namespace std::string_literals;
 constexpr column_t COLUMN_IDENTIFIER_FILE_INDEX = MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX;
@@ -130,6 +134,51 @@ unique_ptr<MultiFileReader> get_multi_file_reader(const TableFunction &) {
     return make_uniq<VortexMultiFileReader>();
 }
 
+unique_ptr<BaseStatistics> VortexRowGroup::GetColumnStatistics(const StorageIndex &storage_index) {
+    duckdb_column_statistics statistics = {};
+    const idx_t idx = storage_index.GetPrimaryIndex();
+    const void *const ffi_footer_ptr = ffi_footer->DataPtr();
+    if (!duckdb_footer_get_statistics(ffi_footer_ptr, idx, &statistics)) {
+        return {};
+    }
+    return to_duckdb_statistics(statistics);
+}
+
+static vector<PartitionStatistics> get_partition_stats(ClientContext &, GetPartitionStatsInput &input) {
+    const MultiFileBindData &bind_data = input.bind_data->Cast<MultiFileBindData>();
+    VortexBindData &bind = bind_data.bind_data->Cast<VortexBindData>();
+    void *const ffi_bind = bind.ffi_bind_data->DataPtr();
+
+    if (!duckdb_table_function_can_get_partition_stats(ffi_bind)) {
+        return {};
+    }
+
+    vector<OpenFileInfo> files = bind_data.file_list->GetAllFiles();
+    vector<PartitionStatistics> result(files.size());
+    idx_t row_start = 0;
+    uint64_t count = 0;
+    duckdb_vx_error error = nullptr;
+    for (size_t i = 0; i < files.size(); ++i) {
+        const std::string_view path = files[i].path;
+        duckdb_vx_data raw = duckdb_footer_get_cached(ffi_bind, path.data(), path.size(), &count, &error);
+        unique_ptr<CData> cdata(reinterpret_cast<CData *>(raw));
+        if (error) {
+            throw BinderException(IntoErrString(error));
+        }
+        if (!cdata) {
+            return {};
+        }
+
+        PartitionStatistics &stats = result[i];
+        stats.row_start = row_start;
+        stats.count = count;
+        stats.count_type = CountType::COUNT_EXACT;
+        row_start += count;
+        stats.partition_row_group = make_shared_ptr<VortexRowGroup>(std::move(cdata));
+    }
+    return result;
+}
+
 duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter, const std::string &name) {
     MultiFileFunction<VortexReaderInterface> fn(name);
     fn.arguments[0] = parameter;
@@ -139,6 +188,11 @@ duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter
 
     fn.filter_pushdown = true;
     fn.filter_prune = true;
+    // Pushed-down filters, projections and aggregates live in the FFI bind data, which has no
+    // serializer. DuckDB's common-subplan optimizer keys scans on their serialized form, so
+    // without this two scans of the same file with different pushed-down filters look identical
+    // and are merged into one shared CTE, returning the wrong rows for one of them.
+    fn.verify_serialization = false;
 
     fn.pushdown_expression = [](auto &, const auto &, Expression &expression) {
         return duckdb_table_function_pushdown_expression(reinterpret_cast<duckdb_vx_expr>(&expression));
@@ -156,7 +210,30 @@ duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter
     };
 
     fn.statistics = MultiFileFunction<VortexReaderInterface>::MultiFileScanStats;
+    fn.get_partition_stats = get_partition_stats;
     fn.get_multi_file_reader = get_multi_file_reader;
+
+    /**
+     * duckdb's serialization is broken. If you don't set serialize/deserialize
+     * callbacks, duckdb serializes only the internal state which doesn't work
+     * for Vortex if you have filters pushed down. Worse, duckdb uses this
+     * information for CommonSubplanOptimizer which then merges different
+     * Vortex scans (with different filters pushed down) into one scan in tpcds.
+     *
+     * However, this is a regression on q15 and such where we do have
+     * completely equal scans which can't be merged. This is a reasonable price
+     * for correctness.
+     *
+     * Very unexpectedly verify_serialization doesn't do any verification but
+     * disables serialization at all.
+     */
+    fn.verify_serialization = false;
+    fn.serialize = [](auto &, auto, auto &) {
+        throw NotImplementedException("Can't serialize Vortex state");
+    };
+    fn.deserialize = [](auto &, auto &) -> unique_ptr<FunctionData> {
+        throw NotImplementedException("Can't deserialize Vortex state");
+    };
 
     try {
         auto &system_catalog = Catalog::GetSystemCatalog(db);
@@ -167,6 +244,32 @@ duckdb_state register_table_function(DatabaseInstance &db, LogicalType parameter
     } catch (const std::exception &e) {
         ErrorData data(e);
         DUCKDB_LOG_ERROR(db, "Failed to create Vortex table function:\t" + data.Message());
+        return DuckDBError;
+    }
+    return DuckDBSuccess;
+}
+
+extern "C" duckdb_state duckdb_vx_register_version_function(duckdb_database ffi_db, const char *version) {
+    D_ASSERT(ffi_db);
+    D_ASSERT(version);
+    const DatabaseWrapper &wrapper = *reinterpret_cast<DatabaseWrapper *>(ffi_db);
+    DatabaseInstance &db = *wrapper.database->instance;
+
+    const string quoted = KeywordHelper::WriteQuoted(version);
+
+    const DefaultMacro macro {DEFAULT_SCHEMA,
+                              "vortex_version",
+                              {nullptr},
+                              {{nullptr, nullptr}},
+                              quoted.c_str()};
+    try {
+        auto info = DefaultFunctionGenerator::CreateInternalMacroInfo(macro);
+        auto &system_catalog = Catalog::GetSystemCatalog(db);
+        auto data = CatalogTransaction::GetSystemTransaction(db);
+        system_catalog.CreateFunction(data, *info);
+    } catch (const std::exception &e) {
+        ErrorData data(e);
+        DUCKDB_LOG_ERROR(db, "Failed to create the vortex_version macro:\t" + data.Message());
         return DuckDBError;
     }
     return DuckDBSuccess;

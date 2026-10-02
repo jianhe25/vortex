@@ -6,6 +6,7 @@
 use std::sync::LazyLock;
 
 use divan::Bencher;
+use mimalloc::MiMalloc;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -27,6 +28,9 @@ use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_fsst::fsst_compress;
 use vortex_fsst::fsst_train_compressor;
 use vortex_session::VortexSession;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     divan::main();
@@ -152,9 +156,10 @@ fn chunked_canonicalize_into(
     bencher
         .with_inputs(|| (&array, SESSION.create_execution_ctx()))
         .bench_refs(|(array, ctx)| {
-            let mut builder = VarBinViewBuilder::with_capacity(
+            let mut builder = VarBinViewBuilder::with_capacity_in(
                 DType::Binary(Nullability::NonNullable),
                 array.len(),
+                ctx.allocator().clone(),
             );
             array.append_to_builder(&mut builder, ctx).unwrap();
             builder.finish()

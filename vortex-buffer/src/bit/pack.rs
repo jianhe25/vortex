@@ -21,8 +21,9 @@
 //! simple enough that the per-level duplication and its `#[target_feature]` call boundary pay
 //! off.
 //!
-//! The bit-at-a-time loop lives on as [`collect_bool_word_scalar`], used for tail chunks and as
-//! the reference implementation for tests and benchmarks.
+//! The bit-at-a-time loop lives on as [`collect_bool_word_scalar`], the reference implementation
+//! for tests and benchmarks. The word loop packs its tail chunk with [`collect_bool_word_tail`],
+//! its own copy of that loop.
 
 /// Packs up to 64 boolean values into a little-endian `u64` word one bit at a time.
 ///
@@ -56,6 +57,7 @@ where
 /// the wider pack saves — and an indirect call per word is worse still (~4x on cheap
 /// predicates), since an opaque call target blocks fill/pack fusion regardless of how cheap
 /// the kernel *selection* is. For provably cheap predicates, use [`collect_bool_words_multiversioned`].
+#[allow(clippy::inline_always)]
 #[inline(always)]
 pub(crate) fn collect_bool_words_inline<F>(words: &mut [u64], len: usize, f: F)
 where
@@ -150,6 +152,7 @@ where
 ///
 /// Marked `#[inline(always)]` so each `#[target_feature]` wrapper gets its own fully-inlined
 /// copy compiled with that feature set.
+#[allow(clippy::inline_always)]
 #[inline(always)]
 fn collect_bool_words_with<F, P>(words: &mut [u64], len: usize, mut f: F, pack: P)
 where
@@ -170,8 +173,30 @@ where
 
     if remainder != 0 {
         let offset = full * 64;
-        words[full] = collect_bool_word_scalar(remainder, |bit_idx| f(offset + bit_idx));
+        words[full] = collect_bool_word_tail(remainder, |bit_idx| f(offset + bit_idx));
     }
+}
+
+/// Tail chunk of [`collect_bool_words_with`]: a copy of [`collect_bool_word_scalar`] that always
+/// inlines. `len` **must** be at most 64.
+///
+/// The word loop must keep the borrowed callback inline. An out-of-line tail lets the callback
+/// state escape, and the full words packed by the same loop then fail to vectorize.
+/// [`collect_bool_word_scalar`] stays an ordinary `#[inline]` function so that this constraint does
+/// not reach its public callers, which include the scalar benchmark baselines.
+#[expect(clippy::inline_always)]
+#[inline(always)]
+fn collect_bool_word_tail<F>(len: usize, mut f: F) -> u64
+where
+    F: FnMut(usize) -> bool,
+{
+    debug_assert!(len <= 64, "cannot pack {len} bits into a u64 word");
+
+    let mut packed = 0;
+    for bit_idx in 0..len {
+        packed |= (f(bit_idx) as u64) << bit_idx;
+    }
+    packed
 }
 
 /// SSE2 copy of the [`collect_bool_words`](crate::bit::collect_bool_words) word loop.

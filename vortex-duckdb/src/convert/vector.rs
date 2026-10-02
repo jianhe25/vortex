@@ -18,6 +18,7 @@ use vortex::array::dtype::extension::ExtDType;
 use vortex::array::validity::Validity;
 use vortex::buffer::BitBuffer;
 use vortex::buffer::Buffer;
+use vortex::buffer::BufferAllocatorRef;
 use vortex::buffer::BufferMut;
 use vortex::dtype::DType;
 use vortex::dtype::DecimalDType;
@@ -25,12 +26,12 @@ use vortex::dtype::DecimalType;
 use vortex::dtype::FieldNames;
 use vortex::dtype::NativePType;
 use vortex::dtype::Nullability;
+use vortex::encodings::uuid::Uuid;
+use vortex::encodings::uuid::UuidMetadata;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::extension::datetime::TimeUnit;
-use vortex::extension::uuid::Uuid;
-use vortex::extension::uuid::UuidMetadata;
 use vortex::mask::Mask;
 use vortex_spatial::extension::SpatialMetadata;
 use vortex_spatial::extension::WellKnownBinary;
@@ -107,7 +108,8 @@ fn vector_as_string_blob(vector: &VectorRef, len: usize, dtype: DType) -> ArrayR
     let data = vector.as_slice_with_len::<duckdb_string_t>(len);
     let validity = vector.validity_ref(len);
 
-    let mut builder = VarBinViewBuilder::with_capacity(dtype, len);
+    let mut builder =
+        VarBinViewBuilder::with_capacity_in(dtype, len, BufferAllocatorRef::statically_allocated());
 
     for (i, s) in data.iter().enumerate() {
         if validity.is_valid(i) {

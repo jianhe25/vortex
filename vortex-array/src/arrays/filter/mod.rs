@@ -12,6 +12,7 @@ pub use vtable::FilterArray;
 mod chunked_decompress;
 mod execute;
 pub(crate) use execute::buffer::filter_buffer;
+pub(crate) use execute::buffer::prepare_mask_for_reuse;
 pub(crate) use execute::filter_validity;
 
 mod kernel;

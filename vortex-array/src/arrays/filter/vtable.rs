@@ -185,7 +185,7 @@ impl VTable for Filter {
         // TODO(joe): fix the ownership of AnyCanonical
         let child = Canonical::from(array.child().as_::<AnyCanonical>());
         Ok(ExecutionResult::done(
-            execute_filter(child, &mask_values).into_array(),
+            execute_filter(child, &mask_values, ctx.allocator()).into_array(),
         ))
     }
 
@@ -214,6 +214,8 @@ impl VTable for Filter {
     }
 }
 impl OperationsVTable<Filter> for Filter {
+    type ProbeState = ();
+
     fn scalar_at(
         array: ArrayView<'_, Filter>,
         index: usize,

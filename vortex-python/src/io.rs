@@ -313,7 +313,7 @@ impl PyVortexWriteOptions {
     /// >>> vx.io.VortexWriteOptions.default().write(sprl, "chonky.vortex")
     /// >>> import os
     /// >>> os.path.getsize('chonky.vortex')
-    /// 215684
+    /// 215788
     ///
     /// Wow, Vortex manages to use about two bytes per integer! So advanced. So tiny.
     ///
@@ -323,7 +323,7 @@ impl PyVortexWriteOptions {
     ///
     /// >>> vx.io.VortexWriteOptions.compact().write(sprl, "tiny.vortex")
     /// >>> os.path.getsize('tiny.vortex')
-    /// 54888
+    /// 54992
     ///
     /// Random numbers are not (usually) composed of random bytes!
     #[staticmethod]
@@ -378,11 +378,12 @@ impl PyVortexWriteOptions {
     ) -> PyVortexResult<()> {
         let session = session();
         py.detach(|| {
-            let mut strategy = WriteStrategyBuilder::default();
+            let mut compressor = BtrBlocksCompressorBuilder::from_session(session);
             if self.use_compact_encodings {
-                strategy = strategy
-                    .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact());
+                compressor = compressor.with_compact();
             }
+            let strategy =
+                WriteStrategyBuilder::from_session(session).with_btrblocks_builder(compressor);
             let strategy = strategy.build();
             current_runtime().block_on(async move {
                 match resolve_store(path, store.map(|x| x.into_inner()))? {

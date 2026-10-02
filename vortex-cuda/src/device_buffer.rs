@@ -56,7 +56,6 @@ pub struct CudaDeviceBuffer {
     /// reads without copying or repacking.
     zeroed_tail_start: Option<usize>,
 }
-
 mod private {
     use std::fmt::Debug;
     use std::sync::Arc;
@@ -183,6 +182,26 @@ impl CudaDeviceBuffer {
             .vortex_expect("Failed to transmute from CudaViewMut<u8> to CudaViewMut<T>");
         Some(function(&mut values))
     }
+}
+
+/// Include the slice's leading bytes up to an 8-byte boundary, without extending its tail.
+/// CUDA allocations are aligned, so the prefix remains within the backing allocation.
+pub(crate) fn cuda_aligned_bitmap_view(
+    handle: &BufferHandle,
+) -> VortexResult<(CudaView<'_, u8>, usize)> {
+    let device_buffer = handle
+        .as_device_opt()
+        .ok_or_else(|| vortex_err!("Buffer is not on device"))?;
+    let cuda_buf = device_buffer
+        .as_any()
+        .downcast_ref::<CudaDeviceBuffer>()
+        .ok_or_else(|| vortex_err!("expected CudaDeviceBuffer, was {device_buffer:?}"))?;
+    let prefix_bytes = cuda_buf.offset % size_of::<u64>();
+    let view = cuda_buf
+        .allocation
+        .as_bytes_view()
+        .slice(cuda_buf.offset - prefix_bytes..cuda_buf.offset + cuda_buf.len);
+    Ok((view, prefix_bytes))
 }
 
 #[cfg(test)]
@@ -474,7 +493,7 @@ impl DeviceBuffer for CudaDeviceBuffer {
 
     fn aligned(self: Arc<Self>, alignment: Alignment) -> VortexResult<Arc<dyn DeviceBuffer>> {
         let effective_ptr = self.device_ptr + self.offset as u64;
-        if effective_ptr.is_multiple_of(*alignment as u64) {
+        if effective_ptr.is_multiple_of(alignment.as_usize() as u64) {
             Ok(Arc::new(CudaDeviceBuffer {
                 allocation: Arc::clone(&self.allocation),
                 offset: self.offset,

@@ -62,6 +62,9 @@ pub fn write_file_to_bytes(chunk: ArrayRef) -> VortexResult<ByteBuffer> {
 }
 
 /// Write a `.vortex` file using a caller-provided layout strategy (compressor pipeline).
+///
+/// The write is restricted to the default session's enabled editions, so a fixture cannot record
+/// an encoding that carries no read-compatibility guarantee.
 pub fn write_compressed(
     path: &Path,
     chunk: ArrayRef,
@@ -92,6 +95,8 @@ pub fn write_compressed_to_bytes(
 }
 
 /// Write a `.vortex` file into memory using a caller-provided session and layout strategy.
+///
+/// The write is restricted to the session's enabled editions.
 pub fn write_compressed_to_bytes_with_session(
     session: &VortexSession,
     chunk: ArrayRef,

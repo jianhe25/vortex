@@ -21,12 +21,13 @@ use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_array::arrays::fixed_size_list::FixedSizeListArraySlotsExt;
 use vortex_array::arrays::listview::ListViewArraySlotsExt;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::builders::builder_with_capacity;
+use vortex_array::builders::builder_with_capacity_in;
 use vortex_array::dtype::Nullability;
 use vortex_array::match_each_decimal_value_type;
 use vortex_array::validity::Validity;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_mask::AllOr;
 use vortex_mask::Mask;
 
@@ -142,7 +143,7 @@ pub fn mask_canonical_array(
         }
         Canonical::Map(array) => {
             let result_dtype = array.dtype().as_nullable();
-            let mut builder = builder_with_capacity(&result_dtype, array.len());
+            let mut builder = builder_with_capacity_in(&result_dtype, array.len(), ctx.allocator());
             for idx in 0..array.len() {
                 if mask.value(idx) {
                     builder.append_scalar(&array.execute_scalar(idx, ctx)?.cast(&result_dtype)?)?;
@@ -164,7 +165,7 @@ pub fn mask_canonical_array(
             ExtensionArray::new(ext_dtype, masked_storage).into_array()
         }
         Canonical::Union(_) => {
-            todo!("TODO(connor)[Union]: support Union arrays in the mask fuzzer")
+            vortex_bail!("TODO(connor)[Union]: support Union arrays in the mask fuzzer")
         }
         Canonical::Variant(_) => unreachable!("Variant arrays are not fuzzed"),
     })

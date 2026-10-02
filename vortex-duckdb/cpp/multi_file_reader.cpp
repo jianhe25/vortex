@@ -7,6 +7,8 @@
 #include "vortex_duckdb.h"
 #include "vortex.h"
 
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+
 unique_ptr<FunctionData> VortexBindData::Copy() const {
     auto result = make_uniq<VortexBindData>();
     if (ffi_bind_data) {
@@ -150,11 +152,25 @@ VortexReaderInterface::InitializeGlobalState(ClientContext &context,
         column_ids[i] = storage_index;
     }
 
+    // MultiFileGlobalState projection_ids are filled only when this call
+    // returns. Take these from a physical operator.
+    const idx_t *projection_ids = nullptr;
+    size_t projection_ids_count = 0;
+    if (input.op && input.op->type == PhysicalOperatorType::TABLE_SCAN) {
+        const PhysicalTableScan &scan = input.op->Cast<PhysicalTableScan>();
+        if (!scan.projection_ids.empty() && scan.projection_ids.size() != column_ids.size()) {
+            projection_ids = scan.projection_ids.data();
+            projection_ids_count = scan.projection_ids.size();
+        }
+    }
+
     void *const ffi_bind = bind.ffi_bind_data->DataPtr();
     duckdb_vx_tfunc_init_input ffi_input = {
         .bind_data = ffi_bind,
         .column_ids = column_ids.data(),
         .column_ids_count = column_ids.size(),
+        .projection_ids = projection_ids,
+        .projection_ids_count = projection_ids_count,
         .filters = reinterpret_cast<duckdb_vx_table_filter_set>(input.filters.get()),
         .client_context = reinterpret_cast<duckdb_client_context>(&context),
     };
@@ -344,17 +360,7 @@ static unique_ptr<BaseStatistics> base_stats(duckdb_column_statistics &stats, Lo
     return out.ToUnique();
 }
 
-unique_ptr<BaseStatistics> VortexBaseReader::GetStatistics(ClientContext &, const string &name) {
-    D_ASSERT(ffi_bind);
-    duckdb_column_statistics statistics = {};
-    if (!duckdb_reader_get_statistics(ffi_file->DataPtr(),
-                                      ffi_bind,
-                                      name.c_str(),
-                                      name.size(),
-                                      &statistics)) {
-        return {};
-    }
-
+unique_ptr<BaseStatistics> to_duckdb_statistics(duckdb_column_statistics &statistics) {
     using enum LogicalTypeId;
     const unique_ptr<LogicalType> type(reinterpret_cast<LogicalType *>(statistics.type));
     switch (type->id()) {
@@ -370,7 +376,15 @@ unique_ptr<BaseStatistics> VortexBaseReader::GetStatistics(ClientContext &, cons
     case UINTEGER:
     case UBIGINT:
     case UHUGEINT:
-    case HUGEINT: {
+    case HUGEINT:
+    case DATE:
+    case TIME:
+    case TIME_TZ:
+    case TIMESTAMP_SEC:
+    case TIMESTAMP_MS:
+    case TIMESTAMP:
+    case TIMESTAMP_NS:
+    case TIMESTAMP_TZ: {
         return numeric_stats(statistics, *type);
     }
     case VARCHAR:
@@ -393,6 +407,20 @@ unique_ptr<BaseStatistics> VortexBaseReader::GetStatistics(ClientContext &, cons
     default:
         return base_stats(statistics, *type);
     }
+}
+
+unique_ptr<BaseStatistics> VortexBaseReader::GetStatistics(ClientContext &, const string &name) {
+    D_ASSERT(ffi_bind);
+    duckdb_column_statistics statistics = {};
+    if (!duckdb_reader_get_statistics(ffi_file->DataPtr(),
+                                      ffi_bind,
+                                      name.c_str(),
+                                      name.size(),
+                                      &statistics)) {
+        return {};
+    }
+
+    return to_duckdb_statistics(statistics);
 }
 
 double VortexBaseReader::GetProgressInFile(ClientContext &) {

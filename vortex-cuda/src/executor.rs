@@ -40,6 +40,7 @@ use vortex::error::vortex_ensure;
 use vortex::error::vortex_err;
 
 use crate::CudaSession;
+use crate::DictionaryExport;
 use crate::ExportDeviceArray;
 use crate::hybrid_dispatch;
 use crate::kernel::DefaultLaunchStrategy;
@@ -135,6 +136,12 @@ impl CudaExecutionCtx {
         self
     }
 
+    /// Override the dictionary export policy for this context without changing its backing session.
+    pub fn with_dictionary_export(mut self, policy: DictionaryExport) -> Self {
+        self.cuda_session = self.cuda_session.with_dictionary_export(policy);
+        self
+    }
+
     /// Perform an external kernel launch, with events created and logged via the configured
     /// [`LaunchStrategy`].
     ///
@@ -197,7 +204,7 @@ impl CudaExecutionCtx {
     ///
     /// # Arguments
     ///
-    /// * `module_name` - Name of the module (`kernels/{module_name}.ptx`)
+    /// * `module_name` - Kernel source name without the `.cu` extension
     /// * `ptypes` - List of ptype strings for the kernel name
     ///
     /// # Errors
@@ -222,7 +229,7 @@ impl CudaExecutionCtx {
     ///
     /// # Arguments
     ///
-    /// * `module_name` - Name of the module (`kernels/{module_name}.ptx`)
+    /// * `module_name` - Kernel source name without the `.cu` extension
     /// * `type_suffixes` - List of type suffix strings for the kernel name
     ///
     /// # Errors
@@ -313,7 +320,6 @@ impl CudaExecutionCtx {
     }
 
     /// Returns the Vortex session backing this CUDA execution context.
-    #[cfg(feature = "unstable_encodings")]
     pub(crate) fn session(&self) -> &vortex::session::VortexSession {
         self.ctx.session()
     }

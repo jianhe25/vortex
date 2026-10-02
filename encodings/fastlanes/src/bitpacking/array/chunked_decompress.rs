@@ -4,9 +4,11 @@
 //! Streaming chunked decompression for bit-packed arrays.
 //!
 //! This backs [`VTable::decompress_chunks`](vortex_array::vtable::VTable::decompress_chunks) for
-//! [`BitPacked`]: each FastLanes block is unpacked into the decompressor's cache-resident scratch
-//! buffer, patches falling in that block are applied in place, and the block is handed to the
-//! sink — the array is never materialized in full.
+//! [`BitPacked`]: each FastLanes block is unpacked into a cache-resident scratch buffer, patches
+//! falling in that block are applied in place, and the block is handed to the sink, so the array
+//! is never materialized in full.
+
+use std::mem::MaybeUninit;
 
 use num_traits::AsPrimitive;
 use vortex_array::ArrayView;
@@ -15,7 +17,6 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::chunk_iter::ChunkMut;
 use vortex_array::chunk_iter::ChunkSink;
 use vortex_array::dtype::NativePType;
-use vortex_array::dtype::PhysicalPType;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_array::patches::Patches;
@@ -23,16 +24,15 @@ use vortex_error::VortexResult;
 
 use crate::BitPacked;
 use crate::BitPackedArrayExt;
+use crate::FL_CHUNK_SIZE;
 use crate::unpack_iter::BitPacked as BitPackedUnpack;
-use crate::unpack_iter::UnpackStrategy;
-use crate::unpack_iter::UnpackedChunks;
 
 pub(crate) fn decompress_chunks(
     array: ArrayView<'_, BitPacked>,
     ctx: &mut ExecutionCtx,
     sink: &mut dyn ChunkSink,
 ) -> VortexResult<()> {
-    match_each_integer_ptype!(array.as_ref().dtype().as_ptype(), |T| {
+    match_each_integer_ptype!(array.dtype().as_ptype(), |T| {
         decompress_chunks_typed::<T>(array, ctx, sink)
     })
 }
@@ -42,26 +42,36 @@ fn decompress_chunks_typed<T: BitPackedUnpack>(
     ctx: &mut ExecutionCtx,
     sink: &mut dyn ChunkSink,
 ) -> VortexResult<()> {
-    if array.as_ref().is_empty() {
+    if array.is_empty() {
         return Ok(());
     }
 
-    let patch_list = match array.patches() {
+    let patches = match array.patches() {
         None => Vec::new(),
-        Some(patches) => build_patch_list(&patches, ctx, |v: T| v)?,
+        Some(patches) => build_patch_list(&patches, ctx, |_, value: T| value)?,
     };
 
-    let mut chunks = array.unpacked_chunks::<T>()?;
-    stream_unpacked_chunks(&mut chunks, &patch_list, sink)
+    let mut scratch = [const { MaybeUninit::<T>::uninit() }; FL_CHUNK_SIZE];
+    let mut chunks = array.unpacked_chunks::<T>(&mut scratch)?;
+    let mut patch_cursor = 0;
+    let mut result = Ok(());
+    chunks.for_each_unpacked_chunk(|chunk, rows| {
+        if result.is_err() {
+            return;
+        }
+        patch_cursor = patch_chunk(chunk, rows.start, &patches, patch_cursor);
+        result = sink.accept(ChunkMut::new(chunk), rows);
+    });
+    result
 }
 
-/// Materialize sparse patches once as sorted (local row, value) pairs so the per-chunk loop only
-/// advances a cursor, applying `map` to each patch value. This is the only heap state the
+/// Materialize sparse patches once as sorted `(row, value)` pairs, mapping each value through
+/// `map(row, value)`, so the per-chunk loop only advances a cursor. This is the only heap state the
 /// streaming path allocates, and it is proportional to the patch count, not the array length.
 pub(crate) fn build_patch_list<T: NativePType>(
     patches: &Patches,
     ctx: &mut ExecutionCtx,
-    map: impl Fn(T) -> T,
+    map: impl Fn(usize, T) -> T,
 ) -> VortexResult<Vec<(usize, T)>> {
     let indices = patches.indices().clone().execute::<PrimitiveArray>(ctx)?;
     let values = patches.values().clone().execute::<PrimitiveArray>(ctx)?;
@@ -72,34 +82,31 @@ pub(crate) fn build_patch_list<T: NativePType>(
             .as_slice::<P>()
             .iter()
             .zip(values)
-            .map(|(&idx, &v)| (<P as AsPrimitive<usize>>::as_(idx) - offset, map(v)))
+            .map(|(&index, &value)| {
+                let row = <P as AsPrimitive<usize>>::as_(index) - offset;
+                (row, map(row, value))
+            })
             .collect()
     }))
 }
 
-/// Walk every unpacked FastLanes block in order, patch it in place from the pre-built cursor
-/// list, and hand it to the sink. Generic over the [`UnpackStrategy`] so fused strategies (e.g.
-/// FoR's reference-add unpack) stream through the same loop with zero extra passes.
-pub(crate) fn stream_unpacked_chunks<T: PhysicalPType, S: UnpackStrategy<T>>(
-    chunks: &mut UnpackedChunks<T, S>,
-    patch_list: &[(usize, T)],
-    sink: &mut dyn ChunkSink,
-) -> VortexResult<()> {
-    let mut patch_cursor = 0usize;
-    let mut result = Ok(());
-    chunks.for_each_unpacked_chunk(|chunk, range| {
-        if result.is_err() {
-            return;
-        }
-        while let Some(&(row, value)) = patch_list.get(patch_cursor)
-            && row < range.end
-        {
-            chunk[row - range.start] = value;
-            patch_cursor += 1;
-        }
-        result = sink.accept(ChunkMut::new(chunk), range);
-    });
-    result
+/// Overwrite the rows of `chunk`, which starts at row `start`, that `patches` covers, beginning
+/// at `cursor`, and return the advanced cursor.
+#[inline]
+pub(crate) fn patch_chunk<T: Copy>(
+    chunk: &mut [T],
+    start: usize,
+    patches: &[(usize, T)],
+    mut cursor: usize,
+) -> usize {
+    let end = start + chunk.len();
+    while let Some(&(row, value)) = patches.get(cursor)
+        && row < end
+    {
+        chunk[row - start] = value;
+        cursor += 1;
+    }
+    cursor
 }
 
 #[cfg(test)]
@@ -199,8 +206,8 @@ mod tests {
         assert_chunks_match_execute::<i64>(for_array.into_array())
     }
 
-    /// An unsigned reference over a BitPacked child takes the fused `FoRStrategy` streaming
-    /// path (reference folded into the unpack kernel), including patch handling.
+    /// FoR over a BitPacked child streams through the fused unpack kernel that adds the
+    /// reference, including patch handling.
     #[test]
     fn for_over_bitpacked_fused_chunks_with_patches() -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
@@ -257,8 +264,8 @@ mod executor_tests {
         let mut array =
             bitpack_encode(&PrimitiveArray::new(values, validity), 10, None, ctx)?.into_array();
         for _ in 0..depth {
-            // A signed reference keeps every level on the generic streaming composition rather
-            // than the fused FoR+BitPacked kernel.
+            // The innermost level fuses with the BitPacked unpack; every level above it adds its
+            // reference to the chunks streamed up from below.
             array = FoR::try_new(array, Scalar::from(-1_000i32))?.into_array();
         }
         Ok(array)
