@@ -13,6 +13,7 @@ use vortex_array::arrays::filter::FilterKernel;
 use vortex_array::arrays::primitive::PrimitiveArrayExt;
 use vortex_array::dtype::NativePType;
 use vortex_array::match_each_unsigned_integer_ptype;
+use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
@@ -23,12 +24,16 @@ use crate::delta::array::DeltaArrayExt;
 use crate::delta::array::DeltaArraySlotsExt;
 use crate::delta::array::delta_decompress::decode_chunk;
 
-/// Above this density, decoding the whole array and filtering the result is as fast as decoding
-/// chunk by chunk and gathering, and the generic path is simpler.
-const MAX_FUSED_DENSITY: f64 = 0.5;
+/// When a mask touches at least this fraction of the chunks and selects at least
+/// [`FALLBACK_MIN_DENSITY`] of the values, decoding everything and filtering the result with the
+/// generic bulk filter is faster than decoding chunk by chunk and gathering. Both thresholds come
+/// from benchmarking run, cluster, strided and uniform random masks over 32- and 64-bit values.
+const FALLBACK_MIN_TOUCHED: f64 = 0.9;
+const FALLBACK_MIN_DENSITY: f64 = 0.15;
 
 /// Gathers the selected values one chunk at a time, decoding only the chunks that hold a selected
-/// value and never materializing the full decoded array.
+/// value and never materializing the full decoded array. Masks that select a large share of
+/// values from nearly every chunk keep the decode-then-filter path.
 impl FilterKernel for Delta {
     fn filter(
         array: ArrayView<'_, Self>,
@@ -38,7 +43,13 @@ impl FilterKernel for Delta {
         let Mask::Values(values) = mask else {
             return Ok(None);
         };
-        if values.density() > MAX_FUSED_DENSITY {
+        let bits = values.bit_buffer();
+        let offset = array.offset();
+        let total_chunks = (offset + array.len()).div_ceil(1024);
+        let touched = touched_chunks(bits, offset);
+        if touched as f64 >= FALLBACK_MIN_TOUCHED * total_chunks as f64
+            && values.density() >= FALLBACK_MIN_DENSITY
+        {
             return Ok(None);
         }
 
@@ -46,17 +57,40 @@ impl FilterKernel for Delta {
         let validity = array.validity()?.filter(mask)?;
         let filtered = match_each_unsigned_integer_ptype!(ptype.to_unsigned(), |U| {
             const LANES: usize = U::LANES;
-            let buffer = gather::<U, LANES>(array, values.slices(), values.true_count(), ctx)?;
+            let buffer = gather::<U, LANES>(array, bits, values.true_count(), ctx)?;
             PrimitiveArray::new(buffer, validity)
         });
         Ok(Some(filtered.reinterpret_cast(ptype).into_array()))
     }
 }
 
-/// Copy each selected run out of the chunks it spans, decoding every touched chunk once.
+/// Count the chunks that hold at least one selected value. `offset` is the array's position in
+/// its first physical chunk.
+fn touched_chunks(bits: &BitBuffer, offset: usize) -> usize {
+    let mut count = 0;
+    let mut last_counted = None;
+    for (index, word) in bits.chunks().iter_padded().enumerate() {
+        if word == 0 {
+            continue;
+        }
+        let base = offset + index * 64;
+        let first = (base + word.trailing_zeros() as usize) / 1024;
+        let last = (base + 63 - word.leading_zeros() as usize) / 1024;
+        for chunk in first..=last {
+            if last_counted.is_none_or(|counted| chunk > counted) {
+                count += 1;
+                last_counted = Some(chunk);
+            }
+        }
+    }
+    count
+}
+
+/// Walk the mask 64 bits at a time: skip empty words, copy full words in bulk, and pick out the
+/// set bits of partial words. Each touched chunk is decoded once.
 fn gather<U, const LANES: usize>(
     array: ArrayView<'_, Delta>,
-    slices: &[(usize, usize)],
+    bits: &BitBuffer,
     true_count: usize,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Buffer<U>>
@@ -73,28 +107,72 @@ where
         .clone()
         .execute::<PrimitiveArray>(ctx)?
         .reinterpret_cast(U::PTYPE);
-    let (bases, deltas) = (bases.as_slice::<U>(), deltas.as_slice::<U>());
+    let mut chunks = DecodedChunk::<U, LANES>::new(bases.as_slice::<U>(), deltas.as_slice::<U>());
 
     let offset = array.offset();
     let mut output = BufferMut::<U>::with_capacity(true_count);
-    let mut transposed = [U::default(); 1024];
-    let mut values = [U::default(); 1024];
-    let mut decoded_chunk = None;
-    // Slices are sorted and disjoint, so each chunk is decoded at most once.
-    for &(start, end) in slices {
-        let (mut position, end) = (offset + start, offset + end);
-        while position < end {
-            let chunk = position / 1024;
-            if decoded_chunk != Some(chunk) {
-                decode_chunk::<U, LANES>(bases, deltas, chunk, &mut transposed, &mut values);
-                decoded_chunk = Some(chunk);
+    for (index, mut word) in bits.chunks().iter_padded().enumerate() {
+        if word == 0 {
+            continue;
+        }
+        let base = offset + index * 64;
+        if word == u64::MAX {
+            // A full word may straddle a chunk boundary, so copy it in up to two parts.
+            let (mut position, end) = (base, base + 64);
+            while position < end {
+                let chunk = position / 1024;
+                let chunk_end = end.min((chunk + 1) * 1024);
+                output.extend_from_slice(&chunks.get(chunk)[position % 1024..chunk_end - chunk * 1024]);
+                position = chunk_end;
             }
-            let chunk_end = end.min((chunk + 1) * 1024);
-            output.extend_from_slice(&values[position % 1024..chunk_end - chunk * 1024]);
-            position = chunk_end;
+        } else {
+            while word != 0 {
+                let position = base + word.trailing_zeros() as usize;
+                output.push(chunks.get(position / 1024)[position % 1024]);
+                word &= word - 1;
+            }
         }
     }
     Ok(output.freeze())
+}
+
+/// The most recently decoded chunk, so consecutive reads from one chunk decode it once.
+struct DecodedChunk<'a, U, const LANES: usize> {
+    bases: &'a [U],
+    deltas: &'a [U],
+    chunk: Option<usize>,
+    transposed: [U; 1024],
+    values: [U; 1024],
+}
+
+impl<'a, U, const LANES: usize> DecodedChunk<'a, U, LANES>
+where
+    U: NativePType + FastLanesDelta + Transpose,
+{
+    fn new(bases: &'a [U], deltas: &'a [U]) -> Self {
+        Self {
+            bases,
+            deltas,
+            chunk: None,
+            transposed: [U::default(); 1024],
+            values: [U::default(); 1024],
+        }
+    }
+
+    #[inline]
+    fn get(&mut self, chunk: usize) -> &[U; 1024] {
+        if self.chunk != Some(chunk) {
+            decode_chunk::<U, LANES>(
+                self.bases,
+                self.deltas,
+                chunk,
+                &mut self.transposed,
+                &mut self.values,
+            );
+            self.chunk = Some(chunk);
+        }
+        &self.values
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +200,8 @@ mod tests {
     #[case::sparse_scattered(Mask::from_indices(3000, (0..3000).step_by(97)))]
     #[case::one_run(Mask::from_slices(3000, vec![(1020, 1100)]))]
     #[case::last_chunk(Mask::from_indices(3000, [2047, 2048, 2999]))]
+    #[case::full_words_across_chunks(Mask::from_slices(3000, vec![(960, 1150), (2000, 2100)]))]
+    #[case::dense_falls_back(Mask::from_indices(3000, (0..3000).step_by(2)))]
     fn filter_matches_decoded(#[case] mask: Mask) -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
         let primitive = PrimitiveArray::from_option_iter(
