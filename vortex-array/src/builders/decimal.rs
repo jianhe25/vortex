@@ -404,7 +404,7 @@ mod tests {
         let mut builder = builder_with_capacity_in(
             &DType::Decimal(decimal_dtype, Nullability::Nullable),
             array.len(),
-            &BufferAllocatorRef::static_ref(),
+            BufferAllocatorRef::static_ref(),
         );
         array
             .into_array()
