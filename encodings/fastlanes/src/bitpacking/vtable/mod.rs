@@ -249,8 +249,9 @@ impl BitPacked {
 
     /// Construct a bit-packed array from packed data and explicit block byte boundaries.
     ///
-    /// `block_offsets` must be non-nullable `u64` with one boundary per block and a trailing end
-    /// boundary. Each block's bit width is derived from the distance between its boundaries.
+    /// `block_offsets` must be non-nullable unsigned integers with one boundary per block and a
+    /// trailing end boundary. Each block's bit width is derived from the distance between its
+    /// boundaries.
     pub fn try_new_with_block_offsets(
         packed: BufferHandle,
         ptype: PType,

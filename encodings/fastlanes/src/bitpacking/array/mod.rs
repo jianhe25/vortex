@@ -18,6 +18,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
+use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_array::patches::PatchSlotIndices;
 use vortex_array::patches::Patches;
 use vortex_array::patches::PatchesData;
@@ -52,7 +53,8 @@ pub struct BitPackedSlots {
     /// The validity bitmap indicating which elements are non-null.
     #[slot(3)]
     pub validity_child: Option<ArrayRef>,
-    /// Non-nullable `u64` byte boundaries of the packed blocks, including one trailing boundary.
+    /// Byte boundaries of the packed blocks as non-nullable unsigned integers, including one
+    /// trailing boundary.
     /// Block `i` is packed at `(block_offsets[i + 1] - block_offsets[i]) / 128` bits. When every
     /// block has the same width, this is a [`SequenceArray`](vortex_sequence::SequenceArray) with
     /// step `128 * bit_width`.
@@ -65,10 +67,6 @@ pub(crate) const PATCH_SLOTS: PatchSlotIndices = PatchSlotIndices {
     values: BitPackedSlots::PATCH_VALUES,
     chunk_offsets: BitPackedSlots::PATCH_CHUNK_OFFSETS,
 };
-
-/// Non-nullable byte boundaries for the packed chunks.
-pub(crate) const BLOCK_OFFSETS_DTYPE: DType =
-    DType::Primitive(PType::U64, Nullability::NonNullable);
 
 /// Byte boundaries for `num_chunks` chunks that are all packed at `bit_width`.
 pub(crate) fn block_offsets_from_constant_bit_width(
@@ -110,8 +108,8 @@ pub(crate) fn validate_block_offsets(
     packed_len: usize,
 ) -> VortexResult<()> {
     vortex_ensure!(
-        offsets.dtype() == &BLOCK_OFFSETS_DTYPE,
-        "Expected non-nullable u64 block offsets, got {}",
+        offsets.dtype().is_unsigned_int() && !offsets.dtype().is_nullable(),
+        "Expected non-nullable unsigned integer block offsets, got {}",
         offsets.dtype()
     );
     vortex_ensure!(
@@ -135,17 +133,19 @@ pub(crate) fn validate_block_offsets(
     } else if let Some(primitive) = offsets.as_opt::<Primitive>()
         && primitive.buffer_handle().is_on_host()
     {
-        let boundaries = primitive.as_slice::<u64>();
-        for pair in boundaries.windows(2) {
-            let size = pair[1].checked_sub(pair[0]);
-            vortex_ensure!(
-                size.is_some_and(|size| size % 128 == 0 && size / 128 <= max_bit_width),
-                "Block boundaries {} and {} do not hold a supported bit width for {ptype}",
-                pair[0],
-                pair[1]
-            );
-        }
-        let span = boundaries[num_blocks] - boundaries[0];
+        let span = match_each_unsigned_integer_ptype!(primitive.ptype(), |T| {
+            let boundaries = primitive.as_slice::<T>();
+            for pair in boundaries.windows(2) {
+                let size = u64::from(pair[1]).checked_sub(u64::from(pair[0]));
+                vortex_ensure!(
+                    size.is_some_and(|size| size % 128 == 0 && size / 128 <= max_bit_width),
+                    "Block boundaries {} and {} do not hold a supported bit width for {ptype}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            u64::from(boundaries[num_blocks]) - u64::from(boundaries[0])
+        });
         vortex_ensure!(
             span == packed_len as u64,
             "Block offsets span {span} bytes, but the packed buffer has {packed_len}"

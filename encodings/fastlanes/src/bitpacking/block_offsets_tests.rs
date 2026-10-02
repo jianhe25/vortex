@@ -17,6 +17,7 @@ use vortex_array::builders::PrimitiveBuilder;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
+use vortex_array::match_each_unsigned_integer_ptype;
 use vortex_array::scalar_fn::fns::cast::CastKernel;
 use vortex_array::scalar_fn::fns::cast::CastReduce;
 use vortex_array::validity::Validity;
@@ -83,6 +84,67 @@ fn uniform_block_offsets_are_a_sequence() -> VortexResult<()> {
 }
 
 #[rstest]
+fn unsigned_block_offsets_are_supported(
+    #[values(PType::U8, PType::U16, PType::U32, PType::U64)] ptype: PType,
+    #[values(false, true)] materialized: bool,
+) -> VortexResult<()> {
+    let offsets = if materialized {
+        match_each_unsigned_integer_ptype!(ptype, |T| {
+            PrimitiveArray::from_iter([127 as T, 255 as T]).into_array()
+        })
+    } else {
+        Sequence::try_new(127u64.into(), 128u64.into(), ptype, Nullability::NonNullable, 2)?
+            .into_array()
+    };
+    let array = BitPacked::try_new_with_block_offsets(
+        BufferHandle::new_host(ByteBuffer::zeroed(128)),
+        PType::U32,
+        Validity::NonNullable,
+        None,
+        offsets.clone(),
+        1024,
+        0,
+    )?;
+    assert!(ArrayRef::ptr_eq(&offsets, array.block_offsets()));
+    if materialized {
+        assert_eq!(array.constant_bit_width_opt(), None);
+    } else {
+        assert_eq!(array.constant_bit_width()?, 1);
+        assert_arrays_eq!(
+            array,
+            PrimitiveArray::from_iter([0u32; 1024]),
+            &mut SESSION.create_execution_ctx()
+        );
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::unaligned([0, 127])]
+#[case::decreasing([128, 0])]
+#[case::wrong_span([0, 0])]
+fn invalid_unsigned_block_offsets_are_rejected(
+    #[case] boundaries: [u8; 2],
+    #[values(PType::U8, PType::U16, PType::U32, PType::U64)] ptype: PType,
+) {
+    let offsets = match_each_unsigned_integer_ptype!(ptype, |T| {
+        PrimitiveArray::from_iter(boundaries.map(T::from)).into_array()
+    });
+    assert!(
+        BitPacked::try_new_with_block_offsets(
+            BufferHandle::new_host(ByteBuffer::zeroed(128)),
+            PType::U32,
+            Validity::NonNullable,
+            None,
+            offsets,
+            1024,
+            0,
+        )
+        .is_err()
+    );
+}
+
+#[rstest]
 #[case::equal_steps(buffer![0u64, 896, 1792, 2688])]
 #[case::different_widths(buffer![0u64, 384, 1408, 2688])]
 fn materialized_block_offsets_have_no_constant_width(
@@ -127,8 +189,11 @@ fn casts_with_materialized_block_offsets_decline(
 #[case::unaligned_block(Ok(buffer![0u64, 896, 1791, 2688].into_array()))]
 #[case::decreasing(Ok(buffer![0u64, 896, 768, 2688].into_array()))]
 #[case::span_disagrees_with_packed_len(Ok(buffer![0u64, 768, 1536, 2304].into_array()))]
-#[case::wrong_ptype(Ok(Sequence::try_new_typed(0u32, 896, Nullability::NonNullable, 4)?.into_array()))]
+#[case::signed_sequence(Ok(Sequence::try_new_typed(0i32, 896, Nullability::NonNullable, 4)?.into_array()))]
+#[case::signed_primitive(Ok(buffer![0i32, 896, 1792, 2688].into_array()))]
+#[case::float(Ok(buffer![0f32, 896.0, 1792.0, 2688.0].into_array()))]
 #[case::nullable(Ok(Sequence::try_new_typed(0u64, 896, Nullability::Nullable, 4)?.into_array()))]
+#[case::nullable_primitive(Ok(PrimitiveArray::from_option_iter([Some(0u32), Some(896), Some(1792), Some(2688)]).into_array()))]
 fn invalid_block_offsets_are_rejected(#[case] offsets: VortexResult<ArrayRef>) -> VortexResult<()> {
     assert!(with_block_offsets(&uniform()?, offsets?).is_err());
     Ok(())
