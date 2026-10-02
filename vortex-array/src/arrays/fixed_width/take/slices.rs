@@ -59,11 +59,8 @@ fn copy_slices<T: Copy>(
     output_len
         .checked_mul(size_of::<T>())
         .ok_or_else(|| vortex_err!("PiecewiseSequenceArray output length overflows usize"))?;
-    let mut result = BufferMut::<T>::with_capacity_aligned_in(
-        output_len,
-        values.alignment(),
-        allocator.clone(),
-    );
+    let mut result =
+        BufferMut::<T>::with_capacity_aligned_in(output_len, values.alignment(), allocator.clone());
     let spare = &mut result.spare_capacity_mut()[..output_len];
     let mut cursor = 0usize;
     let record_count = values.len();
