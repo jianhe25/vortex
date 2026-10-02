@@ -160,17 +160,35 @@ fn utf8_lt<const N: usize>(bencher: Bencher, mode: Sortedness) {
 #[divan::bench(args = CONSUMERS, consts = [8_192, 1_048_576])]
 fn i64_lt_sorted_consume<const N: usize>(bencher: Bencher, consumer: Consumer) {
     let array = mark(ints(N).into_array(), Sortedness::Sorted);
-    bench_consume(bencher, array, Scalar::from(needle(N)), Operator::Lt, consumer);
+    bench_consume(
+        bencher,
+        array,
+        Scalar::from(needle(N)),
+        Operator::Lt,
+        consumer,
+    );
 }
 
 #[divan::bench(args = CONSUMERS, consts = [8_192, 1_048_576])]
 fn i64_eq_sorted_consume<const N: usize>(bencher: Bencher, consumer: Consumer) {
     let array = mark(ints(N).into_array(), Sortedness::Sorted);
-    bench_consume(bencher, array, Scalar::from(needle(N) - 1), Operator::Eq, consumer);
+    bench_consume(
+        bencher,
+        array,
+        Scalar::from(needle(N) - 1),
+        Operator::Eq,
+        consumer,
+    );
 }
 
 #[divan::bench(args = CONSUMERS, consts = [8_192, 1_048_576])]
 fn i64_lt_unsorted_consume<const N: usize>(bencher: Bencher, consumer: Consumer) {
     let array = mark(ints(N).into_array(), Sortedness::Unknown);
-    bench_consume(bencher, array, Scalar::from(needle(N)), Operator::Lt, consumer);
+    bench_consume(
+        bencher,
+        array,
+        Scalar::from(needle(N)),
+        Operator::Lt,
+        consumer,
+    );
 }

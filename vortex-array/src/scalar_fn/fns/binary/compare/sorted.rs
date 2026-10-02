@@ -25,6 +25,7 @@ use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::BoolArray;
 use crate::arrays::Constant;
+use crate::arrays::ConstantArray;
 use crate::arrays::Primitive;
 use crate::arrays::VarBinView;
 use crate::dtype::DType;
@@ -101,6 +102,14 @@ pub(crate) fn compare_sorted_constant(
         _ => return Ok(None),
     };
 
+    if let Some(value) = bounds.constant(op, len) {
+        let scalar = match value {
+            Some(value) => Scalar::bool(value, nullability),
+            None => Scalar::null(DType::Bool(nullability)),
+        };
+        return Ok(Some(ConstantArray::new(scalar, len).into_array()));
+    }
+
     let bits = bounds.select(op, len, ctx.allocator());
     let validity = compare_validity(array.validity()?, constant_validity, nullability)?;
     Ok(Some(BoolArray::try_new(bits, validity)?.into_array()))
@@ -113,10 +122,10 @@ pub(crate) fn compare_sorted_constant(
 /// search avoids.
 fn cached_sortedness(array: &ArrayRef) -> Option<bool> {
     let stats = array.statistics();
-    if let Precision::Exact(true) = stats.get_as::<bool>(Stat::IsStrictSorted) {
+    if stats.get_as::<bool>(Stat::IsStrictSorted) == Precision::Exact(true) {
         return Some(true);
     }
-    if let Precision::Exact(true) = stats.get_as::<bool>(Stat::IsSorted) {
+    if stats.get_as::<bool>(Stat::IsSorted) == Precision::Exact(true) {
         return Some(false);
     }
     None
@@ -178,11 +187,7 @@ fn scalar_bounds(
             .execute_scalar(idx, ctx)?
             .partial_cmp(constant)
             .ok_or_else(|| {
-                vortex_err!(
-                    "Cannot compare {} with {}",
-                    array.dtype(),
-                    constant.dtype()
-                )
+                vortex_err!("Cannot compare {} with {}", array.dtype(), constant.dtype())
             })
     })
 }
@@ -221,22 +226,44 @@ impl SortedBounds {
         })
     }
 
-    /// The comparison result bits. Null positions are left unset; the result validity masks them.
-    fn select(self, op: CompareOperator, len: usize, allocator: &BufferAllocatorRef) -> BitBuffer {
+    /// The `(unset, set)` run-length pairs of the result bits, in ascending order. Null positions
+    /// are left unset; the result validity masks them.
+    fn runs(self, op: CompareOperator, len: usize) -> [(usize, usize); 2] {
         let Self {
             nulls,
             lower,
             upper,
         } = self;
-        // Each operator selects ranges in ascending order: (unset, set) pairs of run lengths.
-        let runs: [(usize, usize); 2] = match op {
+        match op {
             CompareOperator::Lt => [(nulls, lower - nulls), (0, 0)],
             CompareOperator::Lte => [(nulls, upper - nulls), (0, 0)],
             CompareOperator::Gt => [(upper, len - upper), (0, 0)],
             CompareOperator::Gte => [(lower, len - lower), (0, 0)],
             CompareOperator::Eq => [(lower, upper - lower), (0, 0)],
             CompareOperator::NotEq => [(nulls, lower - nulls), (upper - lower, len - upper)],
-        };
+        }
+    }
+
+    /// The result value when it is the same at every position: `Some(None)` if every value is
+    /// null, `Some(Some(b))` if every value is `b`, and `None` if the result varies.
+    fn constant(self, op: CompareOperator, len: usize) -> Option<Option<bool>> {
+        if self.nulls == len {
+            return Some(None);
+        }
+        if self.nulls > 0 {
+            return None;
+        }
+        let set: usize = self.runs(op, len).iter().map(|(_, set)| set).sum();
+        match set {
+            0 => Some(Some(false)),
+            set if set == len => Some(Some(true)),
+            _ => None,
+        }
+    }
+
+    /// The comparison result bits.
+    fn select(self, op: CompareOperator, len: usize, allocator: &BufferAllocatorRef) -> BitBuffer {
+        let runs = self.runs(op, len);
 
         let mut bits = BitBufferMut::with_capacity_in(len, allocator.clone());
         for (unset, set) in runs {
@@ -315,7 +342,11 @@ mod tests {
     }
 
     /// Row-wise reference result: compare each scalar against the constant.
-    fn expected(array: &ArrayRef, constant: &Scalar, op: CompareOperator) -> VortexResult<BoolArray> {
+    fn expected(
+        array: &ArrayRef,
+        constant: &Scalar,
+        op: CompareOperator,
+    ) -> VortexResult<BoolArray> {
         let mut ctx = array_session().create_execution_ctx();
         let values = (0..array.len())
             .map(|idx| {
@@ -362,7 +393,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::below(-5)]
+    #[case::below(0)]
     #[case::first(1)]
     #[case::present(5)]
     #[case::gap(4)]
@@ -412,7 +443,13 @@ mod tests {
     #[case::strict(true)]
     fn strings(#[case] strict: bool) -> VortexResult<()> {
         let values: Vec<Option<&str>> = if strict {
-            vec![None, Some("a"), Some("apple"), Some("banana"), Some("this is a long string")]
+            vec![
+                None,
+                Some("a"),
+                Some("apple"),
+                Some("banana"),
+                Some("this is a long string"),
+            ]
         } else {
             vec![
                 None,
@@ -426,9 +463,54 @@ mod tests {
             ]
         };
         let array = VarBinViewArray::from_iter_nullable_str(values).into_array();
-        for needle in ["", "a", "ab", "apple", "banana", "this is a long string", "zzz"] {
+        for needle in [
+            "",
+            "a",
+            "ab",
+            "apple",
+            "banana",
+            "this is a long string",
+            "zzz",
+        ] {
             check_all_ops(&array, Scalar::from(needle), strict)?;
         }
+        Ok(())
+    }
+
+    /// A result that is the same at every position is returned as a constant, not a bitmap.
+    #[rstest]
+    #[case::all_true(CompareOperator::Lt, 100, Some(true))]
+    #[case::all_false(CompareOperator::Gt, 100, Some(false))]
+    #[case::none_equal(CompareOperator::Eq, 4, Some(false))]
+    #[case::all_not_equal(CompareOperator::NotEq, -1, Some(true))]
+    #[case::mixed(CompareOperator::Lt, 3, None)]
+    fn uniform_result_is_constant(
+        #[case] op: CompareOperator,
+        #[case] needle: i32,
+        #[case] expected: Option<bool>,
+    ) -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let array = buffer![1i32, 2, 3, 5].into_array();
+        mark_sorted(&array, false);
+        let constant = ConstantArray::new(needle, array.len()).into_array();
+        let result = compare_sorted_constant(&array, &constant, op, &mut ctx)?
+            .expect("sorted fast path applies");
+        assert_eq!(
+            result.as_constant().and_then(|s| s.as_bool().value()),
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn all_null_is_null_constant() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let array = PrimitiveArray::from_option_iter([None::<i32>, None]).into_array();
+        mark_sorted(&array, false);
+        let constant = ConstantArray::new(1i32, array.len()).into_array();
+        let result = compare_sorted_constant(&array, &constant, CompareOperator::Lt, &mut ctx)?
+            .expect("sorted fast path applies");
+        assert!(result.as_constant().is_some_and(|s| s.is_null()));
         Ok(())
     }
 
@@ -438,7 +520,9 @@ mod tests {
         let mut ctx = array_session().create_execution_ctx();
         let array = buffer![3i32, 1, 2].into_array();
         let constant = ConstantArray::new(2i32, 3).into_array();
-        assert!(compare_sorted_constant(&array, &constant, CompareOperator::Lt, &mut ctx)?.is_none());
+        assert!(
+            compare_sorted_constant(&array, &constant, CompareOperator::Lt, &mut ctx)?.is_none()
+        );
         Ok(())
     }
 
