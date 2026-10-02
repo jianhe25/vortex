@@ -79,7 +79,10 @@ impl Benchmark for TsmBenchBenchmark {
             .map_err(|_| anyhow::anyhow!("Invalid file URL: {}", self.data_url))?;
         let parquet_dir = base_path.join(Format::Parquet.name());
         if parquet_dir.exists() {
-            info!("TSM-Bench parquet already exists at {}", parquet_dir.display());
+            info!(
+                "TSM-Bench parquet already exists at {}",
+                parquet_dir.display()
+            );
             return Ok(());
         }
 
@@ -212,10 +215,13 @@ fn convert_csv_to_parquet(csv_path: &Path, parquet_path: &Path) -> anyhow::Resul
 }
 
 fn csv_to_parquet_sql(csv_path: &Path, parquet_path: &Path) -> String {
-    let columns = ["'time': 'TIMESTAMP'".to_string(), "'id_station': 'VARCHAR'".to_string()]
-        .into_iter()
-        .chain((0..N_SENSORS).map(|idx| format!("'s{idx}': 'DOUBLE'")))
-        .join(", ");
+    let columns = [
+        "'time': 'TIMESTAMP'".to_string(),
+        "'id_station': 'VARCHAR'".to_string(),
+    ]
+    .into_iter()
+    .chain((0..N_SENSORS).map(|idx| format!("'s{idx}': 'DOUBLE'")))
+    .join(", ");
     format!(
         "COPY (SELECT * FROM read_csv({csv}, header = true, columns = {{{columns}}})) \
          TO {parquet} (FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 3);",
