@@ -9,6 +9,9 @@
 //! - **Prefix**: `'prefix%'`  — matches strings starting with a literal prefix.
 //! - **Contains**: `'%needle%'` — matches strings containing a literal substring.
 //!
+//! Prefix patterns whose compressed form shares enough leading codes with every matching row
+//! skip the DFA and compare those codes as raw bytes instead; see [`shared_prefix`].
+//!
 //! Pushdown is intentionally conservative. If the pattern shape is unsupported,
 //! or if the pattern exceeds the DFA's representable state space, construction
 //! returns `None` and the caller must fall back to ordinary decompression-based
@@ -123,15 +126,18 @@
 
 mod flat_contains;
 mod prefix;
+mod shared_prefix;
 #[cfg(test)]
 mod tests;
 
 use std::borrow::Cow;
 
 use flat_contains::FlatContainsDfa;
+use fsst::Compressor;
 use fsst::ESCAPE_CODE;
 use fsst::Symbol;
 use prefix::FlatPrefixDfa;
+use shared_prefix::SharedCodesPrefix;
 use vortex_buffer::BitBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -152,6 +158,7 @@ pub(crate) struct FsstMatcher {
 
 enum MatcherInner {
     MatchAll,
+    SharedCodesPrefix(SharedCodesPrefix),
     Prefix(FlatPrefixDfa),
     Contains(FlatContainsDfa),
 }
@@ -159,23 +166,29 @@ enum MatcherInner {
 impl FsstMatcher {
     /// Try to build a matcher for the given LIKE pattern.
     ///
+    /// `compressor` must be the one the codes were compressed with.
+    ///
     /// Returns `Ok(None)` if the pattern shape is not supported for pushdown
-    /// (e.g. `_` wildcards, multiple non-bookend `%`, `prefix%` longer than
-    /// 253 bytes, or `%needle%` longer than 254 bytes).
-    pub(crate) fn try_new(
-        symbols: &[Symbol],
-        symbol_lengths: &[u8],
-        pattern: &[u8],
-    ) -> VortexResult<Option<Self>> {
+    /// (e.g. `_` wildcards, multiple non-bookend `%`, a `prefix%` longer than
+    /// 253 bytes that shares too few codes with its matches, or `%needle%`
+    /// longer than 254 bytes).
+    pub(crate) fn try_new(compressor: &Compressor, pattern: &[u8]) -> VortexResult<Option<Self>> {
         let Some(like_kind) = LikeKind::parse(pattern) else {
             return Ok(None);
         };
+        let symbols = compressor.symbol_table();
+        let symbol_lengths = compressor.symbol_lengths();
 
         let inner = match like_kind {
             LikeKind::Prefix(pattern) | LikeKind::Contains(pattern) if pattern.is_empty() => {
                 MatcherInner::MatchAll
             }
             LikeKind::Prefix(prefix) => {
+                if let Some(shared) = SharedCodesPrefix::try_new(compressor, prefix.as_ref()) {
+                    return Ok(Some(Self {
+                        inner: MatcherInner::SharedCodesPrefix(shared),
+                    }));
+                }
                 if prefix.len() > FlatPrefixDfa::MAX_PREFIX_LEN {
                     return Ok(None);
                 }
@@ -200,10 +213,37 @@ impl FsstMatcher {
         Ok(Some(Self { inner }))
     }
 
+    /// Match every row of a VarBin-shaped code stream, dispatching on the matcher variant once
+    /// so each variant's matcher inlines into its own row loop.
+    pub(crate) fn scan<T: vortex_array::dtype::IntegerPType>(
+        &self,
+        n: usize,
+        offsets: &[T],
+        all_bytes: &[u8],
+        negated: bool,
+    ) -> BitBuffer {
+        match &self.inner {
+            MatcherInner::MatchAll => dfa_scan_to_bitbuf(n, offsets, all_bytes, negated, |_| true),
+            MatcherInner::SharedCodesPrefix(prefix) => {
+                dfa_scan_to_bitbuf(n, offsets, all_bytes, negated, |codes| {
+                    prefix.matches(codes)
+                })
+            }
+            MatcherInner::Prefix(dfa) => {
+                dfa_scan_to_bitbuf(n, offsets, all_bytes, negated, |codes| dfa.matches(codes))
+            }
+            MatcherInner::Contains(dfa) => {
+                dfa_scan_to_bitbuf(n, offsets, all_bytes, negated, |codes| dfa.matches(codes))
+            }
+        }
+    }
+
     /// Run the matcher on a single FSST-compressed code sequence.
+    #[cfg(test)]
     pub(crate) fn matches(&self, codes: &[u8]) -> bool {
         match &self.inner {
             MatcherInner::MatchAll => true,
+            MatcherInner::SharedCodesPrefix(prefix) => prefix.matches(codes),
             MatcherInner::Prefix(dfa) => dfa.matches(codes),
             MatcherInner::Contains(dfa) => dfa.matches(codes),
         }
@@ -282,7 +322,7 @@ impl<'a> LikeKind<'a> {
 // ---------------------------------------------------------------------------
 
 // TODO: add N-way ILP overrun scan for higher throughput on short strings.
-pub(crate) fn dfa_scan_to_bitbuf<T, F>(
+fn dfa_scan_to_bitbuf<T, F>(
     n: usize,
     offsets: &[T],
     all_bytes: &[u8],

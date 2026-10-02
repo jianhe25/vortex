@@ -8,8 +8,8 @@
 //! direct loops that differ only in whether the uncompressed lengths are read to reject rows.
 //! Each runs with the uncompressed lengths stored plain and bit-packed.
 //!
-//! Prefix: the registered LIKE kernel (DFA over codes) against matching the codes every row
-//! starting with the prefix must share as raw bytes and decoding only the remaining tail.
+//! Prefix: the registered LIKE kernel on short and long prefixes. Short prefixes run the DFA over
+//! the codes; long ones compare the codes every matching row opens with as raw bytes.
 
 #![expect(clippy::unwrap_used)]
 
@@ -17,7 +17,6 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use divan::Bencher;
-use fsst::ESCAPE_CODE;
 use mimalloc::MiMalloc;
 use vortex_array::Canonical;
 use vortex_array::IntoArray;
@@ -25,8 +24,6 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::bool::BoolArrayExt;
-use vortex_array::arrays::varbin::VarBinArraySlotsExt;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::IntegerPType;
 use vortex_array::match_each_integer_ptype;
@@ -373,99 +370,6 @@ const CASES: &[Case] = &[
     },
 ];
 
-/// A prefix matched as the codes every row starting with it shares, then a decoded tail.
-///
-/// FSST picks the code at a position from the (at most 8) bytes starting there, so the codes the
-/// prefix compresses to at positions ending 8 or more bytes before its end open every row that
-/// starts with it. Fewer than 8 prefix bytes remain past them, decoded from the row and compared.
-struct SharedCodesPrefix {
-    shared: Vec<u8>,
-    rest: Vec<u8>,
-    symbols: [[u8; 8]; 256],
-    lengths: [u8; 256],
-}
-
-impl SharedCodesPrefix {
-    fn new(fsst: &FSSTArray, prefix: &[u8]) -> Self {
-        let mut symbols = [[0u8; 8]; 256];
-        let mut lengths = [0u8; 256];
-        for (code, (symbol, &len)) in fsst.symbols().iter().zip(fsst.symbol_lengths()).enumerate() {
-            symbols[code] = symbol.to_u64().to_le_bytes();
-            lengths[code] = len;
-        }
-
-        let codes = fsst.compressor().compress(prefix);
-        let (mut consumed, mut i) = (0, 0);
-        while i < codes.len() && consumed + 8 <= prefix.len() {
-            if codes[i] == ESCAPE_CODE {
-                consumed += 1;
-                i += 2;
-            } else {
-                consumed += lengths[codes[i] as usize] as usize;
-                i += 1;
-            }
-        }
-
-        Self {
-            shared: codes[..i].to_vec(),
-            rest: prefix[consumed..].to_vec(),
-            symbols,
-            lengths,
-        }
-    }
-
-    #[inline]
-    fn matches(&self, row: &[u8]) -> bool {
-        let Some(tail) = row.strip_prefix(self.shared.as_slice()) else {
-            return false;
-        };
-        let mut decoded = [0u8; 16];
-        let (mut n, mut i) = (0, 0);
-        while n < self.rest.len() {
-            let Some(&code) = tail.get(i) else {
-                return false;
-            };
-            if code == ESCAPE_CODE {
-                let Some(&byte) = tail.get(i + 1) else {
-                    return false;
-                };
-                decoded[n] = byte;
-                n += 1;
-                i += 2;
-            } else {
-                decoded[n..n + 8].copy_from_slice(&self.symbols[code as usize]);
-                n += self.lengths[code as usize] as usize;
-                i += 1;
-            }
-        }
-        decoded[..self.rest.len()] == self.rest[..]
-    }
-}
-
-fn shared_codes_scan(fsst: &FSSTArray, matcher: &SharedCodesPrefix) -> BitBuffer {
-    let mut ctx = SESSION.create_execution_ctx();
-    let codes = fsst.codes();
-    let offsets = codes
-        .offsets()
-        .clone()
-        .execute::<PrimitiveArray>(&mut ctx)
-        .unwrap();
-    let bytes = codes.bytes().as_slice();
-    match_each_integer_ptype!(offsets.ptype(), |O| {
-        shared_codes_rows::<O>(offsets.as_slice::<O>(), bytes, matcher)
-    })
-}
-
-fn shared_codes_rows<O: IntegerPType>(
-    offsets: &[O],
-    bytes: &[u8],
-    matcher: &SharedCodesPrefix,
-) -> BitBuffer {
-    BitBuffer::collect_bool(offsets.len() - 1, |i| {
-        matcher.matches(&bytes[offsets[i].as_()..offsets[i + 1].as_()])
-    })
-}
-
 fn like_prefix(fsst: &FSSTArray, prefix: &str, ctx: &mut vortex_array::ExecutionCtx) -> BoolArray {
     let pattern = ConstantArray::new(format!("{prefix}%"), fsst.len()).into_array();
     Like::try_new(fsst.clone().into_array(), pattern, LikeOptions::default())
@@ -475,40 +379,11 @@ fn like_prefix(fsst: &FSSTArray, prefix: &str, ctx: &mut vortex_array::Execution
         .unwrap()
 }
 
-/// The registered LIKE kernel, a DFA over the codes.
+/// The registered LIKE kernel.
 #[divan::bench(args = CASES)]
-fn prefix_dfa(bencher: Bencher, case: &Case) {
+fn prefix_like(bencher: Bencher, case: &Case) {
     let fsst = case.dataset.array();
     bencher
         .with_inputs(|| SESSION.create_execution_ctx())
         .bench_refs(|ctx| like_prefix(fsst, case.prefix, ctx));
-}
-
-/// Shared prefix codes compared as bytes, then only the tail decoded.
-#[divan::bench(args = CASES)]
-fn prefix_shared_codes(bencher: Bencher, case: &Case) {
-    let fsst = case.dataset.array();
-    let matcher = SharedCodesPrefix::new(fsst, case.prefix.as_bytes());
-
-    let expected = like_prefix(fsst, case.prefix, &mut SESSION.create_execution_ctx());
-    let actual = shared_codes_scan(fsst, &matcher);
-    assert_eq!(
-        actual,
-        expected.to_bit_buffer(),
-        "shared-codes prefix disagrees with LIKE for {}",
-        case.name
-    );
-    eprintln!(
-        "{}: {} shared code bytes, {} tail bytes, {} of {} rows match",
-        case.name,
-        matcher.shared.len(),
-        matcher.rest.len(),
-        actual.true_count(),
-        fsst.len()
-    );
-
-    bencher.bench(|| {
-        let matcher = SharedCodesPrefix::new(fsst, case.prefix.as_bytes());
-        shared_codes_scan(fsst, &matcher)
-    });
 }

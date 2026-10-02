@@ -4,8 +4,12 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
+use fsst::Compressor;
 use fsst::ESCAPE_CODE;
 use fsst::Symbol;
+use rand::RngExt;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rstest::rstest;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
@@ -24,6 +28,7 @@ use vortex_session::VortexSession;
 
 use super::FsstMatcher;
 use super::LikeKind;
+use super::MatcherInner;
 use super::flat_contains::FlatContainsDfa;
 use super::prefix::FlatPrefixDfa;
 use crate::FSSTArray;
@@ -41,6 +46,11 @@ fn sym(bytes: &[u8]) -> Symbol {
     let mut buf = [0u8; 8];
     buf[..bytes.len()].copy_from_slice(bytes);
     Symbol::from_slice(&buf)
+}
+
+/// A compressor with an empty symbol table, which escapes every byte.
+fn no_symbols() -> Compressor {
+    Compressor::rebuild_from(&[] as &[Symbol], &[] as &[u8])
 }
 
 fn escaped(bytes: &[u8]) -> Vec<u8> {
@@ -191,7 +201,7 @@ fn test_prefix_dfa_longer() -> VortexResult<()> {
 
 #[test]
 fn test_prefix_pushdown_len_13_with_escapes() {
-    let matcher = FsstMatcher::try_new(&[], &[], b"abcdefghijklm%")
+    let matcher = FsstMatcher::try_new(&no_symbols(), b"abcdefghijklm%")
         .unwrap()
         .unwrap();
 
@@ -203,7 +213,7 @@ fn test_prefix_pushdown_len_13_with_escapes() {
 fn test_prefix_pushdown_len_14_now_handled() {
     // 14-byte prefix is now handled by FlatPrefixDfa (was rejected by shift-packed).
     assert!(
-        FsstMatcher::try_new(&[], &[], b"abcdefghijklmn%")
+        FsstMatcher::try_new(&no_symbols(), b"abcdefghijklmn%")
             .unwrap()
             .is_some()
     );
@@ -213,7 +223,7 @@ fn test_prefix_pushdown_len_14_now_handled() {
 fn test_prefix_pushdown_long_prefix() -> VortexResult<()> {
     let prefix = "a".repeat(FlatPrefixDfa::MAX_PREFIX_LEN);
     let pattern = format!("{prefix}%");
-    let matcher = FsstMatcher::try_new(&[], &[], pattern.as_bytes())?.unwrap();
+    let matcher = FsstMatcher::try_new(&no_symbols(), pattern.as_bytes())?.unwrap();
 
     assert!(matcher.matches(&escaped(prefix.as_bytes())));
 
@@ -225,22 +235,27 @@ fn test_prefix_pushdown_long_prefix() -> VortexResult<()> {
 }
 
 #[test]
-fn test_prefix_pushdown_rejects_len_254() {
+fn test_prefix_pushdown_beyond_dfa_limit_uses_shared_codes() -> VortexResult<()> {
     debug_assert_eq!(FlatPrefixDfa::MAX_PREFIX_LEN, 253);
     let prefix = "a".repeat(254);
     let pattern = format!("{prefix}%");
-    assert!(
-        FsstMatcher::try_new(&[], &[], pattern.as_bytes())
-            .unwrap()
-            .is_none()
-    );
+    let matcher = FsstMatcher::try_new(&no_symbols(), pattern.as_bytes())?.unwrap();
+    assert!(matches!(matcher.inner, MatcherInner::SharedCodesPrefix(_)));
+
+    assert!(matcher.matches(&escaped(prefix.as_bytes())));
+    assert!(!matcher.matches(&escaped(&prefix.as_bytes()[..253])));
+
+    let mut mismatch = prefix.into_bytes();
+    mismatch[253] = b'b';
+    assert!(!matcher.matches(&escaped(&mismatch)));
+    Ok(())
 }
 
 #[test]
 fn test_contains_pushdown_len_254_with_escapes() {
     let needle = "a".repeat(FlatContainsDfa::MAX_NEEDLE_LEN);
     let pattern = format!("%{needle}%");
-    let matcher = FsstMatcher::try_new(&[], &[], pattern.as_bytes())
+    let matcher = FsstMatcher::try_new(&no_symbols(), pattern.as_bytes())
         .unwrap()
         .unwrap();
 
@@ -256,7 +271,7 @@ fn test_contains_pushdown_rejects_len_255() {
     let needle = "a".repeat(FlatContainsDfa::MAX_NEEDLE_LEN + 1);
     let pattern = format!("%{needle}%");
     assert!(
-        FsstMatcher::try_new(&[], &[], pattern.as_bytes())
+        FsstMatcher::try_new(&no_symbols(), pattern.as_bytes())
             .unwrap()
             .is_none()
     );
@@ -360,4 +375,126 @@ fn test_like_edge_cases(
     let mut ctx = SESSION.create_execution_ctx();
     assert_arrays_eq!(&result, &expected_arr, &mut ctx);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared-codes prefix matching
+// ---------------------------------------------------------------------------
+
+fn url_compressor() -> Compressor {
+    let urls = [
+        "https://www.example.com/catalog/electronics/phones",
+        "https://www.example.com/catalog/home/garden",
+        "https://www.example.com/search?q=phones",
+        "https://docs.example.org/guide/getting-started",
+        "http://www.example.com/catalog/electronics/laptops",
+    ];
+    let lines: Vec<&[u8]> = urls
+        .iter()
+        .cycle()
+        .take(500)
+        .map(|u| u.as_bytes())
+        .collect();
+    Compressor::train(&lines)
+}
+
+#[test]
+fn test_prefix_matcher_selection() -> VortexResult<()> {
+    let compressor = url_compressor();
+
+    // Fewer than 8 bytes leave no position with a full symbol window: always the DFA.
+    let short = FsstMatcher::try_new(&compressor, b"https%")?.unwrap();
+    assert!(matches!(short.inner, MatcherInner::Prefix(_)));
+
+    let long = FsstMatcher::try_new(&compressor, b"https://www.example.com/catalog/%")?.unwrap();
+    let MatcherInner::SharedCodesPrefix(shared) = &long.inner else {
+        panic!("expected the shared-codes matcher for a long prefix");
+    };
+    assert!(shared.shared_len() >= 2);
+    Ok(())
+}
+
+#[rstest]
+#[case::urls("https://www.example.com/catalog/")]
+#[case::exact_row("https://www.example.com/search?q=phones")]
+#[case::longer_than_rows("https://www.example.com/catalog/electronics/phones/and/more")]
+#[case::untrained_bytes("https://www.example.com/ñandú/")]
+#[case::near_miss("https://www.example.com/catalog/electronicz")]
+fn test_shared_codes_prefix_like(#[case] prefix: &str) -> VortexResult<()> {
+    let strings = [
+        "https://www.example.com/catalog/electronics/phones",
+        "https://www.example.com/catalog/home/garden",
+        "https://www.example.com/search?q=phones",
+        "https://www.example.com/ñandú/pájaro",
+        "https://www.example.com/catalo",
+        "http://www.example.com/catalog/electronics/laptops",
+        "https://docs.example.org/guide/getting-started",
+        "",
+    ];
+    let opts: Vec<Option<&str>> = strings.iter().map(|s| Some(*s)).collect();
+    let fsst_arr = make_fsst_str(&opts);
+
+    let pattern = format!("{prefix}%");
+    let matcher = FsstMatcher::try_new(fsst_arr.compressor(), pattern.as_bytes())?.unwrap();
+    assert!(matches!(matcher.inner, MatcherInner::SharedCodesPrefix(_)));
+
+    let result = run_like(
+        fsst_arr,
+        ConstantArray::new(pattern.as_str(), opts.len()).into_array(),
+    )?;
+    let expected = BoolArray::from_iter(strings.iter().map(|s| s.starts_with(prefix)));
+    let mut ctx = SESSION.create_execution_ctx();
+    assert_arrays_eq!(&result, &expected, &mut ctx);
+    Ok(())
+}
+
+/// The shared-codes matcher relies on FSST compressing a row that starts with the prefix the
+/// same way it compresses the prefix alone. Check it against `starts_with` on random rows over a
+/// small alphabet, so symbols overlap heavily, with prefixes cut from rows and then perturbed.
+#[test]
+fn test_shared_codes_prefix_matches_starts_with() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let alphabet = b"abcab/.-_";
+    let rows: Vec<Vec<u8>> = (0..400)
+        .map(|_| {
+            let len = rng.random_range(0..48);
+            (0..len)
+                .map(|_| alphabet[rng.random_range(0..alphabet.len())])
+                .collect()
+        })
+        .collect();
+    let lines: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+    let compressor = Compressor::train(&lines);
+    let codes: Vec<Vec<u8>> = rows.iter().map(|row| compressor.compress(row)).collect();
+
+    let mut checked = 0;
+    for _ in 0..300 {
+        let source = &rows[rng.random_range(0..rows.len())];
+        if source.len() < 8 {
+            continue;
+        }
+        let mut prefix = source[..rng.random_range(8..=source.len())].to_vec();
+        if rng.random_bool(0.3) {
+            let at = rng.random_range(0..prefix.len());
+            prefix[at] = alphabet[rng.random_range(0..alphabet.len())];
+        }
+
+        let Some(matcher) = super::SharedCodesPrefix::try_new(&compressor, &prefix) else {
+            continue;
+        };
+        checked += 1;
+        for (row, row_codes) in rows.iter().zip(&codes) {
+            assert_eq!(
+                matcher.matches(row_codes),
+                row.starts_with(&prefix),
+                "prefix {:?} on row {:?}",
+                String::from_utf8_lossy(&prefix),
+                String::from_utf8_lossy(row),
+            );
+        }
+    }
+    assert!(
+        checked > 100,
+        "only {checked} prefixes used the shared-codes matcher"
+    );
 }
