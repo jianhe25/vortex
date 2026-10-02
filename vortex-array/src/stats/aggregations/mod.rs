@@ -104,7 +104,9 @@ impl AggregationsRef<'_> {
 
     /// Remove all cached results without changing the input.
     pub fn clear(&self) {
-        self.aggregations.entries.write().clear();
+        // Custom function destructors can reenter the cache, so release the lock before dropping.
+        let entries = std::mem::take(&mut *self.aggregations.entries.write());
+        drop(entries);
     }
 
     /// Snapshot results without retaining a lock or an input reference.
@@ -142,10 +144,14 @@ impl AggregationsRef<'_> {
     }
 
     pub(crate) fn clear_result(&self, aggregate: &AggregateFnRef) {
-        self.aggregations
-            .entries
-            .write()
-            .retain(|(key, _)| key != aggregate);
+        let removed = {
+            let mut entries = self.aggregations.entries.write();
+            entries
+                .iter()
+                .position(|(key, _)| key == aggregate)
+                .map(|index| entries.remove(index))
+        };
+        drop(removed);
     }
 
     /// Transfer results when the caller preserves logical values, validity, and order.

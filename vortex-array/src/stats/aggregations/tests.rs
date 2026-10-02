@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::sync::Arc;
+use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -125,6 +127,28 @@ fn exact_null_survives_legacy_projection_and_overflow_reconstruction() -> Vortex
 #[derive(Clone)]
 struct TwiceRows {
     calls: Arc<AtomicUsize>,
+    _drop_probe: Option<Arc<CacheDropProbe>>,
+}
+
+struct CacheDropProbe {
+    owner: Weak<ArrayRef>,
+    unlocked: Arc<AtomicBool>,
+}
+
+impl Drop for CacheDropProbe {
+    fn drop(&mut self) {
+        if let Some(array) = self.owner.upgrade() {
+            self.unlocked.store(
+                array
+                    .aggregations()
+                    .aggregations
+                    .entries
+                    .try_write()
+                    .is_some(),
+                Ordering::Relaxed,
+            );
+        }
+    }
 }
 
 impl AggregateFnVTable for TwiceRows {
@@ -221,6 +245,7 @@ fn custom_results_share_clones_and_decline_partial_recovery() -> VortexResult<()
     let calls = Arc::new(AtomicUsize::new(0));
     let vtable = TwiceRows {
         calls: Arc::clone(&calls),
+        _drop_probe: None,
     };
     let aggregate = vtable.bind(EmptyOptions);
     let array = buffer![1u32, 2].into_array();
@@ -270,6 +295,7 @@ fn new_representations_preserve_only_portable_results() -> VortexResult<()> {
     let array = buffer![1u32, 2].into_array();
     let aggregate = TwiceRows {
         calls: Arc::new(AtomicUsize::new(0)),
+        _drop_probe: None,
     }
     .bind(EmptyOptions);
     let session = array_session();
@@ -469,4 +495,44 @@ fn helper_result_reconstructs_typed_state_before_kernel_dispatch() -> VortexResu
     array.aggregations().clear();
     assert!(accumulator.accumulate(&array, &mut ctx).is_err());
     Ok(())
+}
+
+#[rstest]
+#[case::clear_all(false)]
+#[case::clear_one(true)]
+fn cache_removal_drops_custom_functions_after_unlock(#[case] clear_one: bool) {
+    let owner = Arc::new(buffer![1u32, 2].into_array());
+    let unlocked = Arc::new(AtomicBool::new(false));
+    let aggregate = TwiceRows {
+        calls: Arc::new(AtomicUsize::new(0)),
+        _drop_probe: Some(Arc::new(CacheDropProbe {
+            owner: Arc::downgrade(&owner),
+            unlocked: Arc::clone(&unlocked),
+        })),
+    }
+    .bind(EmptyOptions);
+    owner
+        .aggregations()
+        .insert_result(aggregate, Precision::Exact(4u64.into()));
+
+    if clear_one {
+        // An equal request can have a separate vtable allocation from the retained cache key.
+        let request = TwiceRows {
+            calls: Arc::new(AtomicUsize::new(0)),
+            _drop_probe: None,
+        }
+        .bind(EmptyOptions);
+        owner.aggregations().clear_result(&request);
+    } else {
+        owner.aggregations().clear();
+    }
+    assert!(unlocked.load(Ordering::Relaxed));
+    assert!(
+        owner
+            .aggregations()
+            .snapshot_results()
+            .iter()
+            .next()
+            .is_none()
+    );
 }

@@ -27,6 +27,8 @@ use crate::aggregate_fn::fns::min_max::min_max;
 use crate::aggregate_fn::fns::nan_count::nan_count;
 use crate::aggregate_fn::fns::sum::sum;
 use crate::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
+use crate::dtype::DType;
+use crate::dtype::PType;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
@@ -202,8 +204,8 @@ impl StatsSetRef<'_> {
             self.clear(stat);
             return;
         }
-        let dtype = stat
-            .dtype(self.dyn_array_ref.dtype())
+        let dtype = self
+            .legacy_dtype(stat)
             .vortex_expect("legacy statistic does not support array dtype");
         let dtype = if stat.has_same_dtype_as_array() {
             dtype.as_nullable()
@@ -213,6 +215,16 @@ impl StatsSetRef<'_> {
         let result = value.into_scalar(dtype);
         self.aggregations
             .set_result(stat.finalized_aggregate_fn().clone(), result);
+    }
+
+    fn legacy_dtype(&self, stat: Stat) -> Option<DType> {
+        match stat {
+            // Historical count fields exist even when the current aggregate declines this dtype.
+            Stat::NullCount | Stat::NaNCount | Stat::UncompressedSizeInBytes => {
+                Some(PType::U64.into())
+            }
+            _ => stat.dtype(self.dyn_array_ref.dtype()),
+        }
     }
 
     pub fn clear(&self, stat: Stat) {
@@ -263,7 +275,7 @@ impl StatsProvider for StatsSetRef<'_> {
                 if scalar.is_null() {
                     return None;
                 }
-                let dtype = stat.dtype(self.dyn_array_ref.dtype())?;
+                let dtype = self.legacy_dtype(stat)?;
                 Some(if scalar.dtype() == &dtype {
                     scalar
                 } else {
