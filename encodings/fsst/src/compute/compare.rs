@@ -7,14 +7,15 @@ use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
+use vortex_array::dtype::IntegerPType;
+use vortex_array::match_each_integer_ptype;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::binary::CompareKernel;
 use vortex_array::scalar_fn::fns::operators::CompareOperator;
-use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_buffer::BitBuffer;
-use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -90,41 +91,93 @@ fn compare_fsst_constant(
         return Ok(None);
     }
 
-    let compressor = left.compressor();
-    let encoded_buffer = match left.dtype() {
-        DType::Utf8(_) => {
-            let value = right
-                .as_utf8()
-                .value()
-                .vortex_expect("Expected non-null scalar");
-            ByteBuffer::from(compressor.compress(value.as_bytes()))
-        }
-        DType::Binary(_) => {
-            let value = right
-                .as_binary()
-                .value()
-                .vortex_expect("Expected non-null scalar");
-            ByteBuffer::from(compressor.compress(value.as_slice()))
-        }
+    let needle: &[u8] = match right.dtype() {
+        DType::Utf8(_) => right
+            .as_utf8()
+            .value()
+            .vortex_expect("Expected non-null scalar")
+            .as_str()
+            .as_bytes(),
+        DType::Binary(_) => right
+            .as_binary()
+            .value()
+            .vortex_expect("Expected non-null scalar")
+            .as_slice(),
         _ => unreachable!("FSSTArray can only have string or binary data type"),
     };
 
-    let encoded_scalar = Scalar::binary(
-        encoded_buffer,
-        left.dtype().nullability() | right.dtype().nullability(),
-    );
+    // FSST encodes greedily with a fixed symbol table, so a value's codes are a function of the
+    // value alone and two values are equal exactly when their codes are. Compressing the literal
+    // once lets every row be compared in the compressed domain.
+    let encoded_needle = left.compressor().compress(needle);
 
-    let rhs = ConstantArray::new(encoded_scalar, left.len());
-    left.codes()
-        .into_array()
-        .binary(rhs.into_array(), Operator::from(operator))
-        .map(Some)
+    let uncompressed_lengths = left
+        .uncompressed_lengths()
+        .clone()
+        .execute::<PrimitiveArray>(ctx)?;
+    let codes_offsets = left.codes_offsets().clone().execute::<PrimitiveArray>(ctx)?;
+    let codes_bytes = left.codes_bytes().as_slice();
+
+    let eq = match_each_integer_ptype!(uncompressed_lengths.ptype(), |L| {
+        match_each_integer_ptype!(codes_offsets.ptype(), |O| {
+            eq_codes_to_constant::<L, O>(
+                uncompressed_lengths.as_slice::<L>(),
+                codes_offsets.as_slice::<O>(),
+                codes_bytes,
+                needle.len(),
+                &encoded_needle,
+            )
+        })
+    });
+    let buffer = match operator {
+        CompareOperator::Eq => eq,
+        CompareOperator::NotEq => !eq,
+        _ => unreachable!("operator is Eq or NotEq"),
+    };
+
+    Ok(Some(
+        BoolArray::new(
+            buffer,
+            left.array()
+                .validity()?
+                .union_nullability(right.dtype().nullability()),
+        )
+        .into_array(),
+    ))
+}
+
+/// Whether each row equals the literal whose FSST encoding is `encoded_needle`.
+///
+/// Rows whose uncompressed length or code length differ from the literal's are rejected before
+/// any code bytes are read. Null rows carry an uncompressed length of zero and possibly empty
+/// code ranges; their answers are masked out by validity.
+fn eq_codes_to_constant<L: IntegerPType, O: IntegerPType>(
+    uncompressed_lengths: &[L],
+    codes_offsets: &[O],
+    codes_bytes: &[u8],
+    needle_len: usize,
+    encoded_needle: &[u8],
+) -> BitBuffer {
+    BitBuffer::collect_bool(uncompressed_lengths.len(), |idx| {
+        // SAFETY: `collect_bool` yields idx < len, and an FSST array has len + 1 code offsets.
+        let uncompressed_len: usize = unsafe { uncompressed_lengths.get_unchecked(idx) }.as_();
+        if uncompressed_len != needle_len {
+            return false;
+        }
+        let start: usize = unsafe { codes_offsets.get_unchecked(idx) }.as_();
+        let end: usize = unsafe { codes_offsets.get_unchecked(idx + 1) }.as_();
+        end.wrapping_sub(start) == encoded_needle.len()
+            && codes_bytes
+                .get(start..end)
+                .is_some_and(|codes| codes == encoded_needle)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::LazyLock;
 
+    use rstest::rstest;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
@@ -218,6 +271,54 @@ mod tests {
             &BoolArray::from_iter([None::<bool>, None, None, None, None]),
             &mut ctx
         );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::present("abcabc", 0..9)]
+    #[case::same_length_absent("abcabd", 0..9)]
+    #[case::prefix_of_values("abc", 0..9)]
+    #[case::longer_than_values("abcabcabcabcabc", 0..9)]
+    #[case::sliced("abcabc", 3..8)]
+    #[cfg_attr(miri, ignore)]
+    fn test_compare_fsst_eq_matches_uncompressed(
+        #[case] needle: &str,
+        #[case] range: std::ops::Range<usize>,
+    ) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let values = VarBinArray::from_iter(
+            [
+                Some("abcabc"),
+                Some("abcabd"),
+                None,
+                Some("abc"),
+                Some("abcabc"),
+                Some("xyzxyz"),
+                Some("abcabcabc"),
+                Some("abcabc"),
+                Some(""),
+            ],
+            DType::Utf8(Nullability::Nullable),
+        )
+        .into_array();
+        let compressor = fsst_train_compressor(&values, &mut ctx)?;
+        let fsst = fsst_compress(&values, &compressor, &mut ctx)?
+            .into_array()
+            .slice(range.clone())?;
+        let values = values.slice(range)?;
+
+        for op in [Operator::Eq, Operator::NotEq] {
+            let rhs = ConstantArray::new(needle, fsst.len()).into_array();
+            let actual = fsst
+                .clone()
+                .binary(rhs.clone(), op)?
+                .execute::<BoolArray>(&mut ctx)?;
+            let expected = values
+                .clone()
+                .binary(rhs, op)?
+                .execute::<BoolArray>(&mut ctx)?;
+            assert_arrays_eq!(&actual, &expected, &mut ctx);
+        }
         Ok(())
     }
 }
