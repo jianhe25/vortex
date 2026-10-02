@@ -108,7 +108,9 @@ where
     let mut values = [U::zero(); 1024];
     for (chunk, out) in words
         .as_mut_slice()
-        .chunks_exact_mut(WORDS_PER_CHUNK)
+        .as_chunks_mut::<WORDS_PER_CHUNK>()
+        .0
+        .iter_mut()
         .enumerate()
     {
         decode_chunk::<U, LANES>(bases, deltas, chunk, &mut transposed, &mut values);
@@ -127,12 +129,15 @@ where
 
 /// Write one bit per value, least significant bit first, 64 values per word.
 #[inline]
-fn pack<U: Copy>(out: &mut [u64], values: &[U; 1024], predicate: impl Fn(U) -> bool) {
-    for (word, values) in out.iter_mut().zip(values.chunks_exact(64)) {
-        *word = values
-            .iter()
-            .enumerate()
-            .fold(0u64, |word, (bit, &value)| word | (u64::from(predicate(value)) << bit));
+fn pack<U: Copy>(
+    out: &mut [u64; WORDS_PER_CHUNK],
+    values: &[U; 1024],
+    predicate: impl Fn(U) -> bool,
+) {
+    for (word, values) in out.iter_mut().zip(values.as_chunks::<64>().0) {
+        *word = values.iter().enumerate().fold(0u64, |word, (bit, &value)| {
+            word | (u64::from(predicate(value)) << bit)
+        });
     }
 }
 
@@ -179,7 +184,9 @@ mod tests {
         // A threshold that is negative, so the signed path matters.
         let rhs = ConstantArray::new(-5_000i64, primitive.len()).into_array();
 
-        let actual = delta.binary(rhs.clone(), op)?.execute::<BoolArray>(&mut ctx)?;
+        let actual = delta
+            .binary(rhs.clone(), op)?
+            .execute::<BoolArray>(&mut ctx)?;
         let expected = primitive
             .into_array()
             .binary(rhs, op)?
@@ -191,15 +198,16 @@ mod tests {
     #[test]
     fn compare_on_slice_and_nulls() -> VortexResult<()> {
         let mut ctx = SESSION.create_execution_ctx();
-        let primitive = PrimitiveArray::from_option_iter(
-            (0u32..3000).map(|v| (v % 7 != 0).then_some(v * 3)),
-        );
+        let primitive =
+            PrimitiveArray::from_option_iter((0u32..3000).map(|v| (v % 7 != 0).then_some(v * 3)));
         let delta = Delta::try_from_primitive_array(&primitive, &mut ctx)?
             .into_array()
             .slice(1000..2500)?;
         let rhs = ConstantArray::new(5_000u32, delta.len()).into_array();
 
-        let actual = delta.binary(rhs.clone(), Operator::Gte)?.execute::<BoolArray>(&mut ctx)?;
+        let actual = delta
+            .binary(rhs.clone(), Operator::Gte)?
+            .execute::<BoolArray>(&mut ctx)?;
         let expected = primitive
             .into_array()
             .slice(1000..2500)?

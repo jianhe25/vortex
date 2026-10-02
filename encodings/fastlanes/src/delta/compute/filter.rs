@@ -18,6 +18,7 @@ use vortex_buffer::Buffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexResult;
 use vortex_mask::Mask;
+use vortex_mask::MaskValues;
 
 use crate::Delta;
 use crate::delta::array::DeltaArrayExt;
@@ -46,7 +47,7 @@ impl FilterKernel for Delta {
         };
         let bits = values.bit_buffer();
         // A contiguous mask executes as a slice, which decodes only the selected range.
-        if is_contiguous(bits, values.true_count()) {
+        if is_contiguous(values) {
             return Ok(None);
         }
         let offset = array.offset();
@@ -69,10 +70,31 @@ impl FilterKernel for Delta {
     }
 }
 
-fn is_contiguous(bits: &BitBuffer, true_count: usize) -> bool {
-    match (bits.set_indices().next(), bits.last_set_index()) {
-        (Some(first), Some(last)) => last - first + 1 == true_count,
-        _ => true,
+/// Mirrors the filter executor's contiguity probe so declining stays cheap: cached slices or
+/// indices answer directly, and otherwise only the candidate run or the tail after it is scanned.
+fn is_contiguous(values: &MaskValues) -> bool {
+    if let Some(slices) = values.cached_slices() {
+        return slices.len() <= 1;
+    }
+    let true_count = values.true_count();
+    if let Some(indices) = values.cached_indices() {
+        return match (indices.first(), indices.last()) {
+            (Some(first), Some(last)) => last - first + 1 == true_count,
+            _ => true,
+        };
+    }
+    let bits = values.bit_buffer();
+    let Some(start) = bits.set_indices().next() else {
+        return true;
+    };
+    let end = start + true_count;
+    if end > bits.len() {
+        return false;
+    }
+    if end - start <= bits.len() - end {
+        bits.count_range(start, end) == true_count
+    } else {
+        bits.last_set_index() == Some(end - 1)
     }
 }
 
@@ -134,7 +156,9 @@ where
             while position < end {
                 let chunk = position / 1024;
                 let chunk_end = end.min((chunk + 1) * 1024);
-                output.extend_from_slice(&chunks.get(chunk)[position % 1024..chunk_end - chunk * 1024]);
+                output.extend_from_slice(
+                    &chunks.get(chunk)[position % 1024..chunk_end - chunk * 1024],
+                );
                 position = chunk_end;
             }
         } else {
@@ -221,8 +245,13 @@ mod tests {
         );
         let delta = Delta::try_from_primitive_array(&primitive, &mut ctx)?.into_array();
 
-        let actual = delta.filter(mask.clone())?.execute::<PrimitiveArray>(&mut ctx)?;
-        let expected = primitive.into_array().filter(mask)?.execute::<PrimitiveArray>(&mut ctx)?;
+        let actual = delta
+            .filter(mask.clone())?
+            .execute::<PrimitiveArray>(&mut ctx)?;
+        let expected = primitive
+            .into_array()
+            .filter(mask)?
+            .execute::<PrimitiveArray>(&mut ctx)?;
         assert_arrays_eq!(actual, expected, &mut ctx);
         Ok(())
     }
@@ -236,7 +265,9 @@ mod tests {
             .slice(700..2900)?;
         let mask = Mask::from_indices(delta.len(), (0..delta.len()).step_by(13));
 
-        let actual = delta.filter(mask.clone())?.execute::<PrimitiveArray>(&mut ctx)?;
+        let actual = delta
+            .filter(mask.clone())?
+            .execute::<PrimitiveArray>(&mut ctx)?;
         let expected = primitive
             .into_array()
             .slice(700..2900)?
