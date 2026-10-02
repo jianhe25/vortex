@@ -11,6 +11,10 @@ use parking_lot::Mutex;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::VortexSessionExecute;
+use vortex_array::aggregate_fn::Accumulator;
+use vortex_array::aggregate_fn::DynAccumulator;
+use vortex_array::aggregate_fn::NumericalAggregateOpts;
+use vortex_array::aggregate_fn::fns::sum::Sum;
 use vortex_array::aggregate_fn::fns::sum::sum;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -68,6 +72,8 @@ pub fn accumulate_stats(
 /// Accumulates write-time statistics for a single file column.
 struct StatsAccumulator {
     builders: Vec<Box<dyn StatsArrayBuilder>>,
+    /// Keep overflow in the partial state instead of treating its null final as an invalid row.
+    sum: Option<Accumulator<Sum>>,
     length: usize,
 }
 
@@ -76,12 +82,18 @@ impl StatsAccumulator {
         if !supports_file_stats(dtype) {
             return Self {
                 builders: Vec::new(),
+                sum: None,
                 length: 0,
             };
         }
 
+        let sum = (stats.contains(&Stat::Sum) && Stat::Sum.dtype(dtype).is_some()).then(|| {
+            Accumulator::try_new(Sum, NumericalAggregateOpts::skip_nans(), dtype.clone())
+                .vortex_expect("supported Sum dtype must have an accumulator")
+        });
         let builders = stats
             .iter()
+            .filter(|&&stat| stat != Stat::Sum)
             .filter_map(|&stat| {
                 stat.dtype(dtype).map(|stat_dtype| {
                     stats_builder_with_capacity(
@@ -96,11 +108,21 @@ impl StatsAccumulator {
 
         Self {
             builders,
+            sum,
             length: 0,
         }
     }
 
     fn push_chunk(&mut self, array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<()> {
+        if let Some(sum) = &mut self.sum {
+            let mut chunk_sum = Accumulator::try_new(
+                Sum,
+                NumericalAggregateOpts::skip_nans(),
+                array.dtype().clone(),
+            )?;
+            chunk_sum.accumulate(array, ctx)?;
+            sum.merge_from(&mut chunk_sum)?;
+        }
         for builder in &mut self.builders {
             if let Some(value) = array.statistics().compute_stat(builder.stat(), ctx)? {
                 builder.append_scalar(value.cast(&value.dtype().as_nullable())?)?;
@@ -143,6 +165,14 @@ impl StatsAccumulator {
     /// Returns an aggregated stats set for the table.
     fn as_stats_set(&mut self, stats: &[Stat], ctx: &mut ExecutionCtx) -> VortexResult<StatsSet> {
         let mut stats_set = StatsSet::default();
+        if self.length != 0
+            && stats.contains(&Stat::Sum)
+            && let Some(sum) = &self.sum
+            && let Some(value) = sum.final_scalar()?.into_value()
+        {
+            // The legacy stats set cannot store a null, so an overflowed sum remains absent.
+            stats_set.set(Stat::Sum, Precision::Exact(value));
+        }
         let Some(stats_table) = self.as_array(ctx)? else {
             return Ok(stats_set);
         };
@@ -158,7 +188,7 @@ impl StatsAccumulator {
                     // upper bound, so aggregating by skipping nulls would be unsound.
                     continue;
                 }
-                Stat::Min | Stat::Max | Stat::Sum => {
+                Stat::Min | Stat::Max => {
                     if let Some(s) = values.statistics().compute_stat(stat, ctx)?
                         && let Some(v) = s.into_value()
                     {
@@ -178,7 +208,7 @@ impl StatsAccumulator {
                         stats_set.set(stat, Precision::exact(sum_value));
                     }
                 }
-                Stat::IsConstant | Stat::IsSorted | Stat::IsStrictSorted => {}
+                Stat::Sum | Stat::IsConstant | Stat::IsSorted | Stat::IsStrictSorted => {}
             }
         }
         Ok(stats_set)
@@ -531,6 +561,7 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::array_session;
     use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::bool::BoolArrayExt;
     use vortex_array::builders::VarBinViewBuilder;
     use vortex_buffer::BitBuffer;
@@ -633,7 +664,71 @@ mod tests {
             .expect("Must have stats table");
         assert_eq!(
             stats_table.names().as_ref(),
-            &[Stat::Max.name(), Stat::Min.name(), Stat::Sum.name()]
+            &[Stat::Max.name(), Stat::Min.name()]
         );
+    }
+
+    #[rstest]
+    #[case::overflow_then_positive(vec![i64::MAX, 1], vec![2], None)]
+    #[case::overflow_then_zero(vec![i64::MAX, 1], vec![0], None)]
+    #[case::all_chunks_overflow(vec![i64::MAX, 1], vec![i64::MAX, 1], None)]
+    #[case::overflow_across_chunks(vec![i64::MAX], vec![1], None)]
+    #[case::valid_sum(vec![3, 4], vec![5], Some(12))]
+    fn sum_keeps_overflow_across_chunks(
+        #[case] first: Vec<i64>,
+        #[case] second: Vec<i64>,
+        #[case] expected: Option<i64>,
+    ) -> VortexResult<()> {
+        let first = PrimitiveArray::from_iter(first).into_array();
+        let second = PrimitiveArray::from_iter(second).into_array();
+        let mut ctx = array_session().create_execution_ctx();
+        let mut acc = StatsAccumulator::new(first.dtype(), &[Stat::Sum], 64);
+        acc.push_chunk(&first, &mut ctx)?;
+        acc.push_chunk(&second, &mut ctx)?;
+        let stats = acc.as_stats_set(&[Stat::Sum], &mut ctx)?;
+        assert_eq!(
+            stats.get(Stat::Sum),
+            expected.map_or(Precision::Absent, Precision::exact)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sum_keeps_chunk_float_grouping() -> VortexResult<()> {
+        let first = PrimitiveArray::from_iter([1e16f64]).into_array();
+        let second = PrimitiveArray::from_iter([-1e16f64, 1.0]).into_array();
+        let mut ctx = array_session().create_execution_ctx();
+        let mut acc = StatsAccumulator::new(first.dtype(), &[Stat::Sum], 64);
+        acc.push_chunk(&first, &mut ctx)?;
+        acc.push_chunk(&second, &mut ctx)?;
+        let stats = acc.as_stats_set(&[Stat::Sum], &mut ctx)?;
+        assert_eq!(stats.get(Stat::Sum), Precision::exact(0.0f64));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::no_chunks(vec![], None)]
+    #[case::empty_chunk(vec![vec![]], Some(0))]
+    #[case::all_null_chunk(vec![vec![None, None]], Some(0))]
+    #[case::nullable_chunks(vec![vec![None, Some(3)], vec![Some(4), None]], Some(7))]
+    fn sum_distinguishes_missing_input_from_zero(
+        #[case] chunks: Vec<Vec<Option<i64>>>,
+        #[case] expected: Option<i64>,
+    ) -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let dtype = DType::Primitive(PType::I64, Nullability::Nullable);
+        let mut acc = StatsAccumulator::new(&dtype, &[Stat::Sum], 64);
+        for chunk in chunks {
+            acc.push_chunk(
+                &PrimitiveArray::from_option_iter(chunk).into_array(),
+                &mut ctx,
+            )?;
+        }
+        let stats = acc.as_stats_set(&[Stat::Sum], &mut ctx)?;
+        assert_eq!(
+            stats.get(Stat::Sum),
+            expected.map_or(Precision::Absent, Precision::exact)
+        );
+        Ok(())
     }
 }
