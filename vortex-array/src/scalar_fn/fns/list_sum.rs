@@ -332,6 +332,50 @@ mod tests {
         Ok(())
     }
 
+    /// Lists over encoded elements spanning several decode slices sum like the decoded lists.
+    #[rstest]
+    #[case::native(false)]
+    #[case::cast_to_float(true)]
+    fn test_sum_of_lists_over_encoded_elements(#[case] cast_to_float: bool) -> VortexResult<()> {
+        let len = 40_000usize;
+        let values = (0..len).map(|i| (i % 7 != 0).then_some((i % 3) as u64));
+        let decoded = PrimitiveArray::from_option_iter(values).into_array();
+        // A lazy cast keeps the elements encoded until the sum decodes them.
+        let elements = decoded.clone().apply(&cast(
+            root(),
+            DType::Primitive(PType::U32, Nullability::Nullable),
+        ))?;
+        assert!(!elements.is::<crate::arrays::Primitive>());
+        let offsets = [0u32, 3, 3, 9_000, 9_001, 25_000, 40_000];
+        let encoded = ListArray::try_new(
+            elements,
+            PrimitiveArray::from_iter(offsets).into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        let plain = ListArray::try_new(
+            decoded,
+            PrimitiveArray::from_iter(offsets).into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+
+        let expr = if cast_to_float {
+            let float_list = DType::List(
+                Arc::new(DType::Primitive(PType::F64, Nullability::Nullable)),
+                Nullability::NonNullable,
+            );
+            list_sum(cast(root(), float_list))
+        } else {
+            list_sum(root())
+        };
+        let mut ctx = array_session().create_execution_ctx();
+        let expected = plain.apply(&expr)?.execute::<PrimitiveArray>(&mut ctx)?;
+        let actual = encoded.apply(&expr)?;
+        assert_arrays_eq!(actual, expected, &mut ctx);
+        Ok(())
+    }
+
     #[test]
     fn test_nan_skipped_by_default() -> VortexResult<()> {
         let elements = PrimitiveArray::from_iter([1.0f64, f64::NAN, 2.0]);
