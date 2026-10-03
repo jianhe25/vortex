@@ -98,3 +98,36 @@ fn test_filter_primitive_array() {
         &mut array_session().create_execution_ctx(),
     );
 }
+
+#[test]
+fn test_map_each_with_validity() -> vortex_error::VortexResult<()> {
+    let f = |(v, valid): (i32, bool)| if valid { v * 10 } else { -1 };
+    let cases = [
+        (Validity::NonNullable, vec![10, 20, 30, 40]),
+        (Validity::AllValid, vec![10, 20, 30, 40]),
+        (Validity::AllInvalid, vec![-1, -1, -1, -1]),
+        (
+            Validity::Array(BoolArray::from_iter([true, false, false, true]).into_array()),
+            vec![10, -1, -1, 40],
+        ),
+    ];
+    for (validity, expected) in cases {
+        let mut ctx = SESSION.create_execution_ctx();
+        let mapped = PrimitiveArray::new(buffer![1i32, 2, 3, 4], validity)
+            .map_each_with_validity::<i32, i32, _>(&mut ctx, f)?;
+        assert_eq!(mapped.as_slice::<i32>(), expected.as_slice());
+    }
+
+    // An empty input maps to an empty output for every validity variant.
+    for validity in [
+        Validity::NonNullable,
+        Validity::AllValid,
+        Validity::AllInvalid,
+    ] {
+        let mut ctx = SESSION.create_execution_ctx();
+        let mapped = PrimitiveArray::new(vortex_buffer::Buffer::<i32>::empty(), validity)
+            .map_each_with_validity::<i32, i32, _>(&mut ctx, f)?;
+        assert!(mapped.as_slice::<i32>().is_empty());
+    }
+    Ok(())
+}
