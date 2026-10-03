@@ -3,7 +3,7 @@
 
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::iter::repeat;
+use std::iter::repeat_n;
 
 use smallvec::smallvec;
 use vortex_buffer::Alignment;
@@ -496,13 +496,17 @@ impl Array<Primitive> {
         let validity = PrimitiveArrayExt::validity(&self);
         let data = self.into_data();
         let buf_iter = data.to_buffer::<T>().into_iter();
+        // `buf_iter` is an `ExactSizeIterator`, so bound the validity flag to the same length
+        // with `repeat_n` rather than zipping against an infinite `repeat`. Both halves of the
+        // zip then report an exact length.
+        let len = buf_iter.len();
 
         let buffer = match &validity {
             Validity::NonNullable | Validity::AllValid => {
-                Buffer::<R>::from_trusted_len_iter(buf_iter.zip(repeat(true)).map(f))
+                Buffer::<R>::from_trusted_len_iter(buf_iter.zip(repeat_n(true, len)).map(f))
             }
             Validity::AllInvalid => {
-                Buffer::<R>::from_trusted_len_iter(buf_iter.zip(repeat(false)).map(f))
+                Buffer::<R>::from_trusted_len_iter(buf_iter.zip(repeat_n(false, len)).map(f))
             }
             Validity::Array(val) => {
                 let val = val.clone().execute::<BoolArray>(ctx)?.into_bit_buffer();
