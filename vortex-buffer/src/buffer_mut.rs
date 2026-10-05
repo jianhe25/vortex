@@ -781,8 +781,12 @@ impl<T> BufferMut<T> {
         Buffer::from_allocation(self.allocation, offset, self.length, self.alignment)
     }
 
-    /// Map each element of the buffer with a closure.
-    pub fn map_each_in_place<R, F>(self, mut f: F) -> BufferMut<R>
+    /// Map each element of the buffer with a closure, reusing this buffer's allocation.
+    ///
+    /// ## Panics
+    ///
+    /// Panics if `R` is not the same size as `T`, or if `R` has a stricter alignment than `T`.
+    pub fn map_each_in_place<R, F>(mut self, mut f: F) -> BufferMut<R>
     where
         T: Copy,
         F: FnMut(T) -> R,
@@ -792,10 +796,38 @@ impl<T> BufferMut<T> {
             size_of::<R>(),
             "Size of T and R do not match"
         );
-        // SAFETY: we have checked that `size_of::<T>` == `size_of::<R>`.
-        let mut buf: BufferMut<R> = unsafe { std::mem::transmute(self) };
-        buf.iter_mut()
-            .for_each(|item| *item = f(unsafe { std::mem::transmute_copy(item) }));
+        assert!(
+            align_of::<R>() <= align_of::<T>(),
+            "Alignment of R is stricter than alignment of T"
+        );
+
+        let len = self.length;
+        // Take a raw pointer to the element storage while it still holds valid `T`s. The
+        // `&mut [T]` borrow ends with this statement; everything below goes through the raw
+        // pointer, so we never form a reference to a slot whose contents are not a valid
+        // value of the slot's current type.
+        let ptr: *mut T = self.as_mut_slice().as_mut_ptr();
+
+        for i in 0..len {
+            // SAFETY: `i < len`, and the allocation holds `len` elements.
+            let slot = unsafe { ptr.add(i) };
+            // SAFETY: `slot` holds a valid `T`, and `T: Copy`, so reading it out leaves the
+            // bytes in place without creating a second owner of anything that drops.
+            let old = unsafe { slot.read() };
+            // SAFETY: `size_of::<R>() == size_of::<T>()` and `align_of::<R>() <=
+            // align_of::<T>()`, both asserted above, so `slot` is valid and suitably aligned
+            // for a write of `R`. `ptr::write` does not drop the old contents, which is
+            // required here: those bytes are a `T`, not an `R`.
+            unsafe { slot.cast::<R>().write(f(old)) };
+        }
+
+        // SAFETY: every slot in `0..len` now holds a valid `R`. `BufferMut` stores elements as
+        // plain bytes and carries only a `PhantomData<T>` marker, so reinterpreting the
+        // element type is sound once the contents match.
+        //
+        // Note on unwinding: `BufferMut` has no drop glue for its elements, so a panic
+        // escaping `f` frees the allocation without dropping the half-converted contents.
+        let buf: BufferMut<R> = unsafe { std::mem::transmute(self) };
         buf
     }
 
@@ -1326,5 +1358,22 @@ mod tests {
 
         buf[3] = 7;
         assert_eq!(buf.as_slice()[3], 7);
+    }
+
+    #[test]
+    fn map_each_in_place_to_type_with_validity_invariant() {
+        // `2` and `255` are valid `u8`s but not valid `bool`s, so no `&mut bool` may be formed
+        // over a slot before the closure has written a `bool` into it.
+        let buf = buffer_mut![0u8, 1, 2, 255];
+        let mapped = buf.map_each_in_place(|b| b != 0);
+        assert_eq!(mapped.as_slice(), &[false, true, true, true]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Alignment of R is stricter than alignment of T")]
+    fn map_each_in_place_rejects_stricter_alignment() {
+        // `[u8; 4]` and `u32` have the same size, but `u32` needs 4-byte alignment.
+        let buf = buffer_mut![[1u8, 0, 0, 0], [2, 0, 0, 0]];
+        drop(buf.map_each_in_place(u32::from_le_bytes));
     }
 }
