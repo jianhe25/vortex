@@ -43,10 +43,12 @@ impl<T: ArrowNativeType> Buffer<T> {
 
     /// Converts the buffer zero-copy into a `arrow_buffer::OffsetBuffer`.
     ///
-    /// SAFETY: The caller should ensure that the buffer contains monotonically increasing values
-    /// greater than or equal to zero.
+    /// ## Panics
+    ///
+    /// Panics if the buffer is empty, its first offset is negative, or it is not monotonically
+    /// increasing -- the invariants `OffsetBuffer` requires of its contents.
     pub fn into_arrow_offset_buffer(self) -> OffsetBuffer<T> {
-        unsafe { OffsetBuffer::new_unchecked(self.into_arrow_scalar_buffer()) }
+        OffsetBuffer::new(self.into_arrow_scalar_buffer())
     }
 }
 
@@ -121,5 +123,38 @@ mod test {
 
         let round_trip = buf.into_arrow_buffer();
         assert_eq!(round_trip.as_ptr(), arrow.as_ptr());
+    }
+
+    #[test]
+    fn into_arrow_offset_buffer() {
+        let buf = buffer![0i32, 2, 2, 5];
+        let offsets = buf.clone().into_arrow_offset_buffer();
+        assert_eq!(offsets.as_ref(), buf.as_slice(), "Buffer values differ");
+        assert_eq!(offsets.as_ptr(), buf.as_ptr(), "Conversion not zero-copy");
+    }
+
+    #[test]
+    fn into_arrow_offset_buffer_allows_nonzero_start() {
+        // Offsets into a sliced child array need not begin at zero.
+        let offsets = buffer![3i64, 4, 9].into_arrow_offset_buffer();
+        assert_eq!(offsets.as_ref(), &[3, 4, 9]);
+    }
+
+    #[test]
+    #[should_panic(expected = "offsets must be monotonically increasing")]
+    fn into_arrow_offset_buffer_rejects_decreasing_offsets() {
+        drop(buffer![0i32, 5, 3].into_arrow_offset_buffer());
+    }
+
+    #[test]
+    #[should_panic(expected = "offsets must be greater than 0")]
+    fn into_arrow_offset_buffer_rejects_negative_offsets() {
+        drop(buffer![-1i32, 2].into_arrow_offset_buffer());
+    }
+
+    #[test]
+    #[should_panic(expected = "offsets cannot be empty")]
+    fn into_arrow_offset_buffer_rejects_empty() {
+        drop(Buffer::<i32>::empty().into_arrow_offset_buffer());
     }
 }
