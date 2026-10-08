@@ -18,6 +18,8 @@ use vortex_error::vortex_err;
 use crate::ArrayRef;
 use crate::ArraySlots;
 use crate::VortexSessionExecute;
+use crate::aggregate_fn::NumericalAggregateOpts;
+use crate::aggregate_fn::fns::min_max::min_max;
 use crate::array::Array;
 use crate::array::ArrayParts;
 use crate::array::TypedArrayRef;
@@ -184,6 +186,7 @@ impl VarBinData {
     /// - `offsets` must be a non-nullable integer array.
     /// - `offsets` must contain at least 1 element (for empty array, it contains \[0\]).
     /// - All values in `offsets` must be monotonically non-decreasing.
+    /// - All values in `offsets` must be non-negative.
     /// - No offset value may exceed `bytes.len()`.
     ///
     /// ## Type Requirements
@@ -257,19 +260,40 @@ impl VarBinData {
             };
             vortex_ensure!(is_sorted, InvalidArgument: "offsets must be sorted");
 
-            // Sorted offsets are non-negative if the first offset is non-negative.
-            let first_offset = offsets.execute_scalar(0, &mut ctx)?;
+            // Validate that offsets min is non-negative, and max does not exceed the length of
+            // the bytes buffer.
+            let Some(min_max) = min_max(offsets, &mut ctx, NumericalAggregateOpts::default())?
+            else {
+                vortex_bail!(
+                    InvalidArgument: "offsets array with encoding {} must support min_max compute function",
+                    offsets.encoding_id()
+                );
+            };
+
             match_each_integer_ptype!(offsets.dtype().as_ptype(), |P| {
                 #[allow(clippy::absurd_extreme_comparisons, unused_comparisons)]
                 {
-                    let first = first_offset
+                    let max = min_max
+                        .max
                         .as_primitive()
-                        .typed_value::<P>()
-                        .vortex_expect("non-nullable offsets cannot contain null");
+                        .as_::<P>()
+                        .vortex_expect("offsets type must fit offsets values");
+                    let min = min_max
+                        .min
+                        .as_primitive()
+                        .as_::<P>()
+                        .vortex_expect("offsets type must fit offsets values");
 
                     vortex_ensure!(
-                        first >= 0,
-                        InvalidArgument: "first offset {first} must be non-negative"
+                        min >= 0,
+                        InvalidArgument: "offsets minimum {min} outside valid range [0, {max}]"
+                    );
+
+                    // An offset type too narrow for the bytes length cannot exceed it.
+                    vortex_ensure!(
+                        P::try_from(bytes.len()).ok().is_none_or(|bytes_len| max <= bytes_len),
+                        InvalidArgument: "Max offset {max} is beyond the length of the bytes buffer {}",
+                        bytes.len()
                     );
                 }
             });

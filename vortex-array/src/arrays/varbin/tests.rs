@@ -75,6 +75,7 @@ fn test_offsets_tile_utf8_rejects_negative_offsets() {
 #[rstest]
 #[case::decreasing(buffer![0i32, 5, 3].into_array())]
 #[case::negative_first(buffer![-1i32, 2, 3].into_array())]
+#[case::beyond_bytes(buffer![0i32, 2, 6].into_array())]
 fn try_new_rejects_invalid_offsets(#[case] offsets: ArrayRef) {
     let values = Buffer::copy_from("hello".as_bytes());
 
