@@ -98,4 +98,3 @@ fn test_filter_primitive_array() {
         &mut array_session().create_execution_ctx(),
     );
 }
-
