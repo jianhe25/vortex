@@ -184,7 +184,6 @@ impl VarBinData {
     /// - `offsets` must be a non-nullable integer array.
     /// - `offsets` must contain at least 1 element (for empty array, it contains \[0\]).
     /// - All values in `offsets` must be monotonically non-decreasing.
-    /// - The first value in `offsets` must be 0.
     /// - No offset value may exceed `bytes.len()`.
     ///
     /// ## Type Requirements
