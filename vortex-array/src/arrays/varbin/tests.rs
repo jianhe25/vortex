@@ -104,3 +104,19 @@ fn try_new_allows_nonzero_first_offset() -> VortexResult<()> {
     assert_eq!(array.len(), 2);
     Ok(())
 }
+
+#[test]
+fn try_new_rejects_unsorted_utf8_offsets_at_null_row() {
+    // Every non-null string is valid UTF-8, so only the offsets check rejects the null row 3..1.
+    let values = Buffer::copy_from("hello".as_bytes());
+    let offsets = buffer![0i32, 3, 1, 5].into_array();
+
+    let result = VarBinArray::try_new(
+        offsets,
+        values,
+        DType::Utf8(Nullability::Nullable),
+        Validity::from_iter([true, false, true]),
+    );
+
+    assert!(result.is_err());
+}

@@ -17,6 +17,7 @@ use vortex_error::vortex_err;
 
 use crate::ArrayRef;
 use crate::ArraySlots;
+use crate::ExecutionCtx;
 use crate::VortexSessionExecute;
 use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::aggregate_fn::fns::min_max::min_max;
@@ -250,55 +251,6 @@ impl VarBinData {
             InvalidArgument: "Offsets must have at least one element"
         );
 
-        // Offsets on a device cannot be read here, like the UTF-8 check below.
-        if offsets.is_host() {
-            let mut ctx = legacy_session().create_execution_ctx();
-
-            // Offsets must be sorted (but not strictly sorted, empty values are allowed)
-            let Some(is_sorted) = offsets.statistics().compute_is_sorted(&mut ctx) else {
-                vortex_bail!(InvalidArgument: "offsets must report is_sorted statistic");
-            };
-            vortex_ensure!(is_sorted, InvalidArgument: "offsets must be sorted");
-
-            // Validate that offsets min is non-negative, and max does not exceed the length of
-            // the bytes buffer.
-            let Some(min_max) = min_max(offsets, &mut ctx, NumericalAggregateOpts::default())?
-            else {
-                vortex_bail!(
-                    InvalidArgument: "offsets array with encoding {} must support min_max compute function",
-                    offsets.encoding_id()
-                );
-            };
-
-            match_each_integer_ptype!(offsets.dtype().as_ptype(), |P| {
-                #[allow(clippy::absurd_extreme_comparisons, unused_comparisons)]
-                {
-                    let max = min_max
-                        .max
-                        .as_primitive()
-                        .as_::<P>()
-                        .vortex_expect("offsets type must fit offsets values");
-                    let min = min_max
-                        .min
-                        .as_primitive()
-                        .as_::<P>()
-                        .vortex_expect("offsets type must fit offsets values");
-
-                    vortex_ensure!(
-                        min >= 0,
-                        InvalidArgument: "offsets minimum {min} outside valid range [0, {max}]"
-                    );
-
-                    // An offset type too narrow for the bytes length cannot exceed it.
-                    vortex_ensure!(
-                        P::try_from(bytes.len()).ok().is_none_or(|bytes_len| max <= bytes_len),
-                        InvalidArgument: "Max offset {max} is beyond the length of the bytes buffer {}",
-                        bytes.len()
-                    );
-                }
-            });
-        }
-
         // Check validity length
         if let Some(validity_len) = validity.maybe_len() {
             vortex_ensure_eq!(
@@ -308,14 +260,69 @@ impl VarBinData {
             );
         }
 
-        // Validate UTF-8 for Utf8 dtype. Skip when offsets/bytes are not host-resident.
+        // Validate UTF-8 for Utf8 dtype, which also validates the offsets. Skip when offsets/bytes
+        // are not host-resident. Offsets on a device cannot be read here.
         if offsets.is_host()
             && bytes.is_on_host()
             && matches!(dtype, DType::Utf8(_))
             && let Some(bytes) = bytes.as_host_opt()
         {
             Self::validate_utf8(offsets, bytes.as_ref(), validity)?;
+        } else if offsets.is_host() {
+            let mut ctx = legacy_session().create_execution_ctx();
+            Self::validate_offsets(offsets, bytes.len(), &mut ctx)?;
         }
+
+        Ok(())
+    }
+
+    /// Validates that the offsets are sorted, non-negative and do not exceed `bytes_len`.
+    fn validate_offsets(
+        offsets: &ArrayRef,
+        bytes_len: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        // Offsets must be sorted (but not strictly sorted, empty values are allowed)
+        let Some(is_sorted) = offsets.statistics().compute_is_sorted(ctx) else {
+            vortex_bail!(InvalidArgument: "offsets must report is_sorted statistic");
+        };
+        vortex_ensure!(is_sorted, InvalidArgument: "offsets must be sorted");
+
+        // Validate that offsets min is non-negative, and max does not exceed the length of
+        // the bytes buffer.
+        let Some(min_max) = min_max(offsets, ctx, NumericalAggregateOpts::default())? else {
+            vortex_bail!(
+                InvalidArgument: "offsets array with encoding {} must support min_max compute function",
+                offsets.encoding_id()
+            );
+        };
+
+        match_each_integer_ptype!(offsets.dtype().as_ptype(), |P| {
+            #[allow(clippy::absurd_extreme_comparisons, unused_comparisons)]
+            {
+                let max = min_max
+                    .max
+                    .as_primitive()
+                    .as_::<P>()
+                    .vortex_expect("offsets type must fit offsets values");
+                let min = min_max
+                    .min
+                    .as_primitive()
+                    .as_::<P>()
+                    .vortex_expect("offsets type must fit offsets values");
+
+                vortex_ensure!(
+                    min >= 0,
+                    InvalidArgument: "offsets minimum {min} outside valid range [0, {max}]"
+                );
+
+                // An offset type too narrow for the bytes length cannot exceed it.
+                vortex_ensure!(
+                    P::try_from(bytes_len).ok().is_none_or(|len| max <= len),
+                    InvalidArgument: "Max offset {max} is beyond the length of the bytes buffer {bytes_len}"
+                );
+            }
+        });
 
         Ok(())
     }
@@ -368,6 +375,10 @@ impl VarBinData {
             if offsets_tile_utf8(offsets_slice, bytes) {
                 return Ok(());
             }
+
+            // The fast path proves the offsets are valid. The per-string check below skips null
+            // rows, so it cannot find bad offsets at those rows.
+            Self::validate_offsets(offsets, bytes.len(), &mut ctx)?;
 
             // Invalid bytes at a null row fail the check above, so check valid strings one by one.
             for (i, (start, end)) in offsets_slice
