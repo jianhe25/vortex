@@ -50,6 +50,20 @@ impl<T: ArrowNativeType> Buffer<T> {
     pub fn into_arrow_offset_buffer(self) -> OffsetBuffer<T> {
         OffsetBuffer::new(self.into_arrow_scalar_buffer())
     }
+
+    /// Converts the buffer zero-copy into a `arrow_buffer::OffsetBuffer` without validation.
+    ///
+    /// Use this when the offsets were already validated, for example when they come from an
+    /// array whose invariants guarantee valid offsets.
+    ///
+    /// # Safety
+    ///
+    /// The buffer must be non-empty, its first offset must be greater than or equal to zero, and
+    /// it must be monotonically non-decreasing.
+    pub unsafe fn into_arrow_offset_buffer_unchecked(self) -> OffsetBuffer<T> {
+        // SAFETY: the caller guarantees the `OffsetBuffer` invariants.
+        unsafe { OffsetBuffer::new_unchecked(self.into_arrow_scalar_buffer()) }
+    }
 }
 
 impl ByteBuffer {
@@ -129,6 +143,17 @@ mod test {
     fn into_arrow_offset_buffer() {
         let buf = buffer![0i32, 2, 2, 5];
         let offsets = buf.clone().into_arrow_offset_buffer();
+        assert_eq!(offsets.as_ref(), buf.as_slice(), "Buffer values differ");
+        assert_eq!(offsets.as_ptr(), buf.as_ptr(), "Conversion not zero-copy");
+    }
+
+    #[test]
+    fn into_arrow_offset_buffer_unchecked() {
+        let buf = buffer![0i32, 2, 2, 5];
+
+        // SAFETY: the offsets are non-empty, non-negative and monotonically non-decreasing.
+        let offsets = unsafe { buf.clone().into_arrow_offset_buffer_unchecked() };
+
         assert_eq!(offsets.as_ref(), buf.as_slice(), "Buffer values differ");
         assert_eq!(offsets.as_ptr(), buf.as_ptr(), "Conversion not zero-copy");
     }
