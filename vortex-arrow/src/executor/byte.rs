@@ -110,7 +110,7 @@ where
         .into_primitive()
         .to_buffer::<T::Offset>();
 
-    // SAFETY: `VarBinArray` guarantees its offsets are non-empty, start at zero and are
+    // SAFETY: `VarBinArray` guarantees its offsets are non-empty, non-negative and
     // monotonically non-decreasing. The checked cast keeps every value, so the order stays the
     // same.
     let offsets = unsafe { offsets.into_arrow_offset_buffer_unchecked() };

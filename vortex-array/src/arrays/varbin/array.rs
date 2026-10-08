@@ -10,6 +10,7 @@ use vortex_buffer::BufferAllocatorRef;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_ensure_eq;
 use vortex_error::vortex_err;
@@ -214,6 +215,7 @@ impl VarBinData {
     /// Validates the components that would be used to create a `VarBinArray`.
     ///
     /// This function checks all the invariants required by `VarBinArray::new_unchecked`.
+    #[allow(clippy::disallowed_methods)]
     pub fn validate(
         offsets: &ArrayRef,
         bytes: &BufferHandle,
@@ -245,6 +247,34 @@ impl VarBinData {
             !offsets.is_empty(),
             InvalidArgument: "Offsets must have at least one element"
         );
+
+        // Offsets on a device cannot be read here, like the UTF-8 check below.
+        if offsets.is_host() {
+            let mut ctx = legacy_session().create_execution_ctx();
+
+            // Offsets must be sorted (but not strictly sorted, empty values are allowed)
+            let Some(is_sorted) = offsets.statistics().compute_is_sorted(&mut ctx) else {
+                vortex_bail!(InvalidArgument: "offsets must report is_sorted statistic");
+            };
+            vortex_ensure!(is_sorted, InvalidArgument: "offsets must be sorted");
+
+            // Sorted offsets are non-negative if the first offset is non-negative.
+            let first_offset = offsets.execute_scalar(0, &mut ctx)?;
+            match_each_integer_ptype!(offsets.dtype().as_ptype(), |P| {
+                #[allow(clippy::absurd_extreme_comparisons, unused_comparisons)]
+                {
+                    let first = first_offset
+                        .as_primitive()
+                        .typed_value::<P>()
+                        .vortex_expect("non-nullable offsets cannot contain null");
+
+                    vortex_ensure!(
+                        first >= 0,
+                        InvalidArgument: "first offset {first} must be non-negative"
+                    );
+                }
+            });
+        }
 
         // Check validity length
         if let Some(validity_len) = validity.maybe_len() {
